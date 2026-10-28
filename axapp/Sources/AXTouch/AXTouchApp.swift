@@ -162,7 +162,7 @@ final class ControlServer {
             let y = (obj["y"] as? NSNumber)?.doubleValue ?? 0
             return jsonStr(AXBridge.shared.tap(x: CGFloat(x), y: CGFloat(y)))
         case "probe":
-            return jsonStr(AXBridge.shared.probe())
+            return AXBridge.shared.probe()
         case "ping":
             return #"{"ok":true,"pong":true}"#
         default:
