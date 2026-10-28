@@ -1,7 +1,10 @@
 import SwiftUI
 import Foundation
+import Network
 
-/// AX 触控验证：探测 + 真实点击（CreateSystemWide → CopyElementAtPosition → PerformAction）
+/// AX 触控验证 + TCP 控制服务（端口 10010）。
+/// 协议：每行一个 JSON 请求，如 {"cmd":"tap","x":196,"y":420}
+/// 响应：{"ok":true,"err":0} 或 {"ok":false,"error":"..."}
 final class AXBridge {
     static let shared = AXBridge()
 
@@ -38,47 +41,115 @@ final class AXBridge {
 
     /// 在屏幕坐标 (x,y) 处按一下（AXPress）。
     @discardableResult
-    func tap(x: CGFloat, y: CGFloat) -> String {
+    func tap(x: CGFloat, y: CGFloat) -> [String: Any] {
         load()
         guard let createSystemWide, let copyElementAtPosition, let performAction else {
-            return "函数未就绪"
+            return ["ok": false, "error": "函数未就绪: \(loadError)"]
         }
-        guard let sys = createSystemWide() else { return "CreateSystemWide 返回 nil" }
+        guard let sys = createSystemWide() else {
+            return ["ok": false, "error": "CreateSystemWide 返回 nil"]
+        }
         var element: AnyObject?
         let err = copyElementAtPosition(sys, Float(x), Float(y), &element)
         guard err == 0, let el = element else {
-            return "CopyElementAtPosition 失败 err=\(err)"
+            return ["ok": false, "error": "CopyElementAtPosition err=\(err)"]
         }
         let pressErr = performAction(el, "AXPress" as CFString)
-        return "PerformAction err=\(pressErr)"
+        return ["ok": pressErr == 0, "err": pressErr]
     }
 
-    @discardableResult
-    func tapMany(x: CGFloat, y: CGFloat, times: Int) -> String {
-        var results: [String] = []
-        for i in 1...max(1, times) {
-            let r = tap(x: x, y: y)
-            results.append("[\(i)] \(r)")
-            Thread.sleep(forTimeInterval: 0.4)
-        }
-        return results.joined(separator: "\n")
-    }
-
-    func probe() -> String {
+    func probe() -> [String: Any] {
         load()
-        var out = [loadError]
-        let syms = ["AXUIElementCreateSystemWide", "AXUIElementCopyElementAtPosition",
-                    "AXUIElementPerformAction", "AXUIElementCopyAttributeValue", "AXUIElementGetPid"]
+        var out: [String: Any] = ["load": loadError]
         if let h = handle {
-            for s in syms {
-                out.append("\(dlsym(h, s) != nil ? "✅" : "❌") \(s)")
+            var syms: [String: Bool] = [:]
+            for s in ["AXUIElementCreateSystemWide", "AXUIElementCopyElementAtPosition",
+                      "AXUIElementPerformAction", "AXUIElementCopyAttributeValue", "AXUIElementGetPid"] {
+                syms[s] = dlsym(h, s) != nil
+            }
+            out["symbols"] = syms
+        }
+        return out
+    }
+}
+
+/// TCP 控制服务：监听 0.0.0.0:10010，每行一个 JSON 指令。
+final class ControlServer {
+    private var listener: NWListener?
+    private let queue = DispatchQueue(label: "axtouch.control")
+    private var buffer = Data()
+
+    func start(port: UInt16 = 10010) {
+        let params = NWParameters.tcp
+        guard let portVal = NWEndpoint.Port(rawValue: port),
+              let listener = try? NWListener(using: params, on: portVal) else {
+            print("[ControlServer] 监听失败 port=\(port)")
+            return
+        }
+        self.listener = listener
+        listener.newConnectionHandler = { conn in
+            print("[ControlServer] 新连接:", conn.endpoint)
+            conn.start(queue: self.queue)
+            self.handle(conn)
+        }
+        listener.stateUpdateHandler = { state in
+            print("[ControlServer] state: \(state)")
+        }
+        listener.start(queue: queue)
+        print("[ControlServer] listening on 0.0.0.0:\(port)")
+    }
+
+    private func handle(_ conn: NWConnection) {
+        func receive() {
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
+                if let data = data, !data.isEmpty {
+                    self.process(data: data, conn: conn)
+                }
+                if error == nil && !isComplete {
+                    receive()
+                } else {
+                    conn.cancel()
+                }
             }
         }
-        // ObjC 类探测
-        for cls in ["XCUIDevice", "XCTRunnerDaemonSession"] {
-            out.append("\(objc_getClass(cls) != nil ? "✅" : "❌") class \(cls)")
+        receive()
+    }
+
+    private func process(data: Data, conn: NWConnection) {
+        buffer.append(data)
+        while let nl = buffer.firstIndex(of: 0x0A) {
+            let lineData = buffer[buffer.startIndex..<nl]
+            buffer.removeSubrange(buffer.startIndex...nl)
+            guard let line = String(data: lineData, encoding: .utf8), !line.isEmpty else { continue }
+            let response = handleCommand(line)
+            let out = (response + "\n").data(using: .utf8)!
+            conn.send(content: out, completion: .contentProcessed { _ in })
         }
-        return out.joined(separator: "\n")
+    }
+
+    private func handleCommand(_ line: String) -> String {
+        guard let data = line.data(using: .utf8),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let cmd = obj["cmd"] as? String else {
+            return #"{"ok":false,"error":"bad json"}"#
+        }
+        switch cmd {
+        case "tap":
+            let x = (obj["x"] as? NSNumber)?.doubleValue ?? 0
+            let y = (obj["y"] as? NSNumber)?.doubleValue ?? 0
+            return jsonStr(AXBridge.shared.tap(x: CGFloat(x), y: CGFloat(y)))
+        case "probe":
+            return jsonStr(AXBridge.shared.probe())
+        case "ping":
+            return #"{"ok":true,"pong":true}"#
+        default:
+            return #"{"ok":false,"error":"unknown cmd"}"#
+        }
+    }
+
+    private func jsonStr(_ obj: [String: Any]) -> String {
+        let d = try? JSONSerialization.data(withJSONObject: obj)
+        return String(data: d ?? Data("{}".utf8), encoding: .utf8) ?? "{}"
     }
 }
 
@@ -92,35 +163,14 @@ struct AXTouchApp: App {
 }
 
 struct ContentView: View {
-    @State private var log: String = ""
-    @State private var xText = "196"
-    @State private var yText = "420"
+    @State private var log: String = "TCP 服务已启动: 0.0.0.0:10010"
 
     var body: some View {
         VStack(spacing: 12) {
-            Text("AX 触控验证").font(.title2).bold()
-
-            HStack {
-                TextField("x", text: $xText).textFieldStyle(.roundedBorder).frame(width: 80)
-                TextField("y", text: $yText).textFieldStyle(.roundedBorder).frame(width: 80)
-                Button("点 1 下") {
-                    AXBridge.shared.load()
-                    let x = Double(xText) ?? 196, y = Double(yText) ?? 420
-                    log = AXBridge.shared.tap(x: CGFloat(x), y: CGFloat(y))
-                }
-                .buttonStyle(.borderedProminent)
-                Button("连点 5 下") {
-                    AXBridge.shared.load()
-                    let x = Double(xText) ?? 196, y = Double(yText) ?? 420
-                    log = AXBridge.shared.tapMany(x: CGFloat(x), y: CGFloat(y), times: 5)
-                }
-                .buttonStyle(.bordered)
-            }
-
-            Button("探测符号/类") {
-                log = AXBridge.shared.probe()
-            }
-
+            Text("AX 触控 + TCP 控制").font(.title2).bold()
+            Text("PC 连接: 手机IP:10010\n{\"cmd\":\"tap\",\"x\":196,\"y\":420}")
+                .font(.system(size: 11, design: .monospaced))
+                .foregroundColor(.secondary)
             ScrollView {
                 Text(log)
                     .font(.system(size: 11, design: .monospaced))
@@ -129,7 +179,15 @@ struct ContentView: View {
             .frame(maxHeight: .infinity)
             .background(Color.black.opacity(0.85))
             .foregroundColor(.green)
+
+            Button("手动点 (196,420)") {
+                let r = AXBridge.shared.tap(x: 196, y: 420)
+                log = String(describing: r)
+            }
         }
         .padding()
+        .onAppear {
+            ControlServer().start(port: 10010)
+        }
     }
 }
