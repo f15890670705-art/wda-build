@@ -1,0 +1,37 @@
+name: AXTouch
+options:
+  bundleIdPrefix: com.hb.ax
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+
+targets:
+  AXTouch:
+    type: application
+    platform: iOS
+    sources:
+      - path: Sources/AXTouch
+    info:
+      path: Info.plist
+      properties:
+        CFBundleDisplayName: AXTouch
+        CFBundleShortVersionString: "1.0"
+        CFBundleVersion: "1"
+        UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: false
+        UISupportedInterfaceOrientations:
+          - UIInterfaceOrientationPortrait
+        NSLocalNetworkUsageDescription: AXTouch 需要本地网络用于调试
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.hb.axtouch
+        PRODUCT_NAME: AXTouch
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGNING_REQUIRED: NO
+        CODE_SIGN_IDENTITY: ""
+        ENABLE_BITCODE: NO
+        TARGETED_DEVICE_FAMILY: "1,2"
+        SWIFT_VERSION: "5.0"
+        ARCHS: arm64
+        ONLY_ACTIVE_ARCH: NO
