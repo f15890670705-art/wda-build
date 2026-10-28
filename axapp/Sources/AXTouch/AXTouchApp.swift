@@ -58,18 +58,41 @@ final class AXBridge {
         return ["ok": pressErr == 0, "err": pressErr]
     }
 
-    func probe() -> [String: Any] {
-        load()
-        var out: [String: Any] = ["load": loadError]
-        if let h = handle {
-            var syms: [String: Bool] = [:]
-            for s in ["AXUIElementCreateSystemWide", "AXUIElementCopyElementAtPosition",
-                      "AXUIElementPerformAction", "AXUIElementCopyAttributeValue", "AXUIElementGetPid"] {
-                syms[s] = dlsym(h, s) != nil
+    func probe() -> String {
+        var out: [String] = []
+        // 按依赖顺序、RTLD_NOW|GLOBAL（AScript 同款路径），失败打 dlerror 原文
+        let frameworks: [(String, String)] = [
+            ("AXRuntime", "/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime"),
+            ("XCTAutomationSupport", "/System/Library/PrivateFrameworks/XCTAutomationSupport.framework/XCTAutomationSupport"),
+            ("XCTestCore", "/System/Library/PrivateFrameworks/XCTestCore.framework/XCTestCore"),
+            ("XCUIAutomation", "/System/Library/PrivateFrameworks/XCUIAutomation.framework/XCUIAutomation"),
+            ("UITesting", "/System/Library/PrivateFrameworks/UITesting.framework/UITesting"),
+            ("XCTest", "/System/Developer/Library/Frameworks/XCTest.framework/XCTest"),
+        ]
+        out.append("== dlopen (RTLD_NOW|GLOBAL) ==")
+        for (name, path) in frameworks {
+            dlerror()  // 清空旧错误
+            if let h = dlopen(path, RTLD_NOW | RTLD_GLOBAL) {
+                out.append("✅ \(name)")
+            } else if let e = dlerror() {
+                out.append("❌ \(name): \(String(cString: e))")
+            } else {
+                out.append("❌ \(name): 失败(无dlerror)")
             }
-            out["symbols"] = syms
         }
-        return out
+        // ObjC 类存在性（XCUIAutomation 加载成功的话这些类会出现）
+        out.append("== ObjC 类 ==")
+        for cls in ["XCUIDevice", "XCTRunnerDaemonSession", "XCSynthesizedEventRecord", "XCUIApplicationImpl"] {
+            out.append("\(objc_getClass(cls) != nil ? "✅" : "❌") class \(cls)")
+        }
+        // AX 符号
+        if let h = dlopen("/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime", RTLD_NOW) {
+            out.append("== AX 符号 ==")
+            for s in ["AXUIElementCreateSystemWide", "AXUIElementCopyElementAtPosition", "AXUIElementPerformAction"] {
+                out.append("\(dlsym(h, s) != nil ? "✅" : "❌") \(s)")
+            }
+        }
+        return out.joined(separator: "\n")
     }
 }
 
