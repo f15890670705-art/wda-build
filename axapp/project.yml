@@ -11,6 +11,11 @@ targets:
     platform: iOS
     sources:
       - path: Sources/AXTouch
+        excludes:
+          - "Frameworks/**"
+      - path: Sources/AXTouch/Frameworks
+        type: folder
+        buildPhase: resources
     info:
       path: Info.plist
       properties:
@@ -22,10 +27,10 @@ targets:
           UIApplicationSupportsMultipleScenes: false
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait
-        NSLocalNetworkUsageDescription: AXTouch 需要本地网络用于调试
+        NSLocalNetworkUsageDescription: AXTouch needs local network for control
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.hb.axtouch
+        PRODUCT_BUNDLE_IDENTIFIER: com.ascript.webdriveragentrunner.xctrunner
         PRODUCT_NAME: AXTouch
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
@@ -35,3 +40,4 @@ targets:
         SWIFT_VERSION: "5.0"
         ARCHS: arm64
         ONLY_ACTIVE_ARCH: NO
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"
