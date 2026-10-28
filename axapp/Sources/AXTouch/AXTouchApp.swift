@@ -3,158 +3,122 @@ import Foundation
 import Network
 import Darwin
 
-/// 合成版（照 AScript 架构）：
-/// 1. dlopen AXRuntime + XCUIAutomation（多路径多模式，失败记录 dlerror 原文）
-/// 2. 触控优先级：eventSynthesizer（XCUIAutomation）→ AXUIElement(AXPress)
-/// 3. TCP 控制服务 10010：{"cmd":"tap","x":..,"y":..} / {"cmd":"probe"} / {"cmd":"ping"}
-final class AXEngine {
-    static let shared = AXEngine()
+/// 照 AScript 架构：App 内自带整套 XCTest 框架 + WebDriverAgentLib，
+/// 启动时按依赖顺序 dlopen，然后把 WDA 的 HTTP 服务器拉起来（8100），
+/// 让任何 WDA 客户端（包括我们 PC 端）直接连。
+final class WDAHost {
+    static let shared = WDAHost()
+    private(set) var log: [String] = []
+    private var loaded: [String: UnsafeMutableRawPointer] = [:]
+    var serverStarted = false
 
-    private var axHandle: UnsafeMutableRawPointer?
-    private var xcuiHandle: UnsafeMutableRawPointer?
-    private var createSystemWide: (@convention(c) () -> AnyObject?)?
-    private var copyElementAtPosition: (@convention(c) (AnyObject, Float, Float, UnsafeMutablePointer<AnyObject?>?) -> Int32)?
-    private var performAction: (@convention(c) (AnyObject, CFString) -> Int32)?
+    private func append(_ s: String) {
+        log.append(s)
+        print("[WDAHost] \(s)")
+    }
 
-    private(set) var bootLog: [String] = []
-    var xcuiAvailable = false
-    var deviceObj: AnyObject?
-    var synthObj: AnyObject?
+    private var fwDir: String {
+        Bundle.main.bundlePath + "/Frameworks"
+    }
 
-    private func log(_ s: String) { bootLog.append(s) }
+    /// 按依赖顺序加载内嵌框架
+    func loadAll() {
+        guard loaded.isEmpty else { return }
+        // 让内嵌 Frameworks 可被 @rpath 解析
+        setenv("DYLD_FRAMEWORK_PATH", fwDir + ":" + (getenv("DYLD_FRAMEWORK_PATH").map { String(cString: $0) } ?? ""), 1)
+        setenv("DYLD_LIBRARY_PATH", fwDir + ":" + (getenv("DYLD_LIBRARY_PATH").map { String(cString: $0) } ?? ""), 1)
 
-    func boot() {
-        guard axHandle == nil else { return }
-
-        // ---- AXRuntime ----
-        let axPath = "/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime"
-        dlerror()
-        if let h = dlopen(axPath, RTLD_NOW | RTLD_GLOBAL) {
-            axHandle = h
-            log("✅ AXRuntime")
-            createSystemWide = unsafeBitCast(dlsym(h, "AXUIElementCreateSystemWide"), to: (@convention(c) () -> AnyObject?).self)
-            copyElementAtPosition = unsafeBitCast(dlsym(h, "AXUIElementCopyElementAtPosition"), to: (@convention(c) (AnyObject, Float, Float, UnsafeMutablePointer<AnyObject?>?) -> Int32).self)
-            performAction = unsafeBitCast(dlsym(h, "AXUIElementPerformAction"), to: (@convention(c) (AnyObject, CFString) -> Int32).self)
-        } else if let e = dlerror() {
-            log("❌ AXRuntime: \(String(cString: e))")
-        } else {
-            log("❌ AXRuntime")
-        }
-
-        // ---- XCUIAutomation（AScript 同路径，先加载它的依赖）----
-        let deps: [(String, String)] = [
-            ("XCTAutomationSupport", "/System/Library/PrivateFrameworks/XCTAutomationSupport.framework/XCTAutomationSupport"),
-            ("XCTestCore", "/System/Library/PrivateFrameworks/XCTestCore.framework/XCTestCore"),
-            ("XCTestSupport", "/System/Library/PrivateFrameworks/XCTestSupport.framework/XCTestSupport"),
+        let order = [
+            "Testing",
+            "XCTestCore",
+            "XCTAutomationSupport",
+            "XCTest",
+            "XCTestSupport",
+            "XCUIAutomation",
+            "XCUnit",
+            "WebDriverAgentLib",
         ]
-        for (n, p) in deps {
+        for name in order {
+            let path = "\(fwDir)/\(name).framework/\(name)"
             dlerror()
-            if dlopen(p, RTLD_NOW | RTLD_GLOBAL) != nil { log("✅ \(n)") }
-            else if let e = dlerror() { log("⚠️ \(n): \(String(cString: e))") }
-            else { log("⚠️ \(n)") }
-        }
-        dlerror()
-        let xcuiPath = "/System/Library/PrivateFrameworks/XCUIAutomation.framework/XCUIAutomation"
-        if let h = dlopen(xcuiPath, RTLD_NOW | RTLD_GLOBAL) {
-            xcuiHandle = h
-            xcuiAvailable = true
-            log("✅ XCUIAutomation —— eventSynthesizer 路线可用!")
-        } else if let e = dlerror() {
-            xcuiAvailable = false
-            log("❌ XCUIAutomation: \(String(cString: e))")
-        } else {
-            xcuiAvailable = false
-            log("❌ XCUIAutomation")
-        }
-
-        // ---- XCUIDevice.sharedDevice().eventSynthesizer ----
-        if xcuiAvailable, let cls = objc_getClass("XCUIDevice") {
-            if let dev = (cls as AnyObject).perform(NSSelectorFromString("sharedDevice"))?.takeRetainedValue() {
-                deviceObj = dev
-                if let es = dev.perform(NSSelectorFromString("eventSynthesizer"))?.takeUnretainedValue() {
-                    synthObj = es
-                    log("✅ eventSynthesizer 就绪: \(es)")
-                } else {
-                    log("❌ eventSynthesizer 为 nil")
-                }
+            if let h = dlopen(path, RTLD_NOW | RTLD_GLOBAL) {
+                loaded[name] = h
+                append("✅ \(name)")
+            } else if let e = dlerror() {
+                append("❌ \(name): \(String(cString: e))")
             } else {
-                log("❌ sharedDevice 为 nil")
+                append("❌ \(name)")
             }
+        }
+        // Swift 支持库
+        let swiftLib = "\(fwDir)/libXCTestSwiftSupport.dylib"
+        if dlopen(swiftLib, RTLD_NOW | RTLD_GLOBAL) != nil {
+            append("✅ libXCTestSwiftSupport")
+        } else {
+            append("⚠️ libXCTestSwiftSupport")
         }
     }
 
-    /// 合成点击。优先 XCUIAutomation eventSynthesizer，失败回退 AX。
-    func tap(x: Double, y: Double) -> [String: Any] {
-        boot()
-        // 1) eventSynthesizer 路线
-        if let es = synthObj {
-            let sel = NSSelectorFromString("pressAtPoint:radius:orientation:touchNumber:")
-            if es.responds(to: sel) {
-                let imp = es.method(for: sel)
-                typealias Fn = @convention(c) (AnyObject, Selector, CGPoint, CGFloat, Int, Int) -> Void
-                let fn = unsafeBitCast(imp, to: Fn.self)
-                fn(es, sel, CGPoint(x: x, y: y), 0, 1, 1)
-                // press 即按下+抬起（XCTest 语义里 press 是完整点击）
-                return ["ok": true, "via": "eventSynthesizer"]
-            }
-            let sel2 = NSSelectorFromString("pressAtPoint:radius:orientation:")
-            if es.responds(to: sel2) {
-                let imp = es.method(for: sel2)
-                typealias Fn2 = @convention(c) (AnyObject, Selector, CGPoint, CGFloat, Int) -> Void
-                let fn = unsafeBitCast(imp, to: Fn2.self)
-                fn(es, sel2, CGPoint(x: x, y: y), 0, 1)
-                return ["ok": true, "via": "eventSynthesizer"]
-            }
+    /// 启动 WDA 的 HTTP server（FBWebServer.startHTTPServer）
+    func startServer() {
+        loadAll()
+        guard objc_getClass("FBWebServer") != nil else {
+            append("❌ FBWebServer 类不存在（WebDriverAgentLib 未加载成功）")
+            return
         }
-        // 2) AX 路线
-        guard let createSystemWide, let copyElementAtPosition, let performAction else {
-            return ["ok": false, "error": "无可用触控路线"]
+        setenv("USE_PORT", "8100", 1)
+        setenv("MJPEG_SERVER_PORT", "9100", 1)
+
+        guard let cls = objc_getClass("FBWebServer") as? NSObject.Type else { return }
+        let server = cls.init()
+        if server.responds(to: NSSelectorFromString("startHTTPServer")) {
+            server.perform(NSSelectorFromString("startHTTPServer"))
+            serverStarted = true
+            append("✅ 已调用 FBWebServer.startHTTPServer（8100）")
+        } else {
+            append("❌ FBWebServer 无 startHTTPServer")
+            let methods = { () -> [String] in
+                var out: [String] = []
+                var count: UInt32 = 0
+                if let mlist = class_copyMethodList(objc_getClass("FBWebServer"), &count) {
+                    for i in 0..<Int(count) {
+                        out.append(NSStringFromSelector(method_getName(mlist[i])))
+                    }
+                    free(mlist)
+                }
+                return out
+            }()
+            append("可用方法: \(methods.joined(separator: ", "))")
         }
-        guard let sys = createSystemWide() else {
-            return ["ok": false, "error": "CreateSystemWide nil"]
-        }
-        var element: AnyObject?
-        let err = copyElementAtPosition(sys, Float(x), Float(y), &element)
-        guard err == 0, let el = element else {
-            return ["ok": false, "error": "AX CopyElementAtPosition err=\(err) (-25200=权限拒绝)"]
-        }
-        let pressErr = performAction(el, "AXPress" as CFString)
-        return ["ok": pressErr == 0, "via": "AX", "err": pressErr]
     }
 
-    func probeDict() -> [String: Any] {
-        boot()
-        var out: [String: Any] = [
-            "xcuiAvailable": xcuiAvailable,
-            "eventSynthesizer": synthObj != nil,
-            "bootLog": bootLog,
-        ]
-        if let h = axHandle {
-            var syms: [String: Bool] = [:]
-            for s in ["AXUIElementCreateSystemWide", "AXUIElementCopyElementAtPosition", "AXUIElementPerformAction"] {
-                syms[s] = dlsym(h, s) != nil
-            }
-            out["axSymbols"] = syms
+    func probe() -> [String: Any] {
+        loadAll()
+        var out: [String: Any] = ["log": log, "serverStarted": serverStarted]
+        var cls: [String: Bool] = [:]
+        for c in ["FBWebServer", "FBApplication", "FBXCTestDaemonsProxy", "XCUIDevice", "XCTRunnerDaemonSession", "XCUIApplication"] {
+            cls[c] = objc_getClass(c) != nil
         }
+        out["classes"] = cls
         return out
     }
 }
 
-/// TCP 控制服务：0.0.0.0:10010，行协议 JSON。
+/// TCP 控制服务：0.0.0.0:10010
 final class ControlServer {
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "axtouch.control")
     private var buffer = Data()
 
     func start(port: UInt16 = 10010) {
-        let params = NWParameters.tcp
-        guard let p = NWEndpoint.Port(rawValue: port), let l = try? NWListener(using: params, on: p) else { return }
+        guard let p = NWEndpoint.Port(rawValue: port), let l = try? NWListener(using: .tcp, on: p) else { return }
         listener = l
         l.newConnectionHandler = { conn in
             conn.start(queue: self.queue)
             self.handle(conn)
         }
         l.start(queue: queue)
+        print("[ControlServer] listening \(port)")
     }
 
     private func handle(_ conn: NWConnection) {
@@ -173,30 +137,29 @@ final class ControlServer {
             let lineData = buffer[buffer.startIndex..<nl]
             buffer.removeSubrange(buffer.startIndex...nl)
             guard let line = String(data: lineData, encoding: .utf8), !line.isEmpty else { continue }
-            let resp: String
-            if let obj = try? JSONSerialization.jsonObject(with: line.data(using: .utf8) ?? Data()) as? [String: Any],
+            var resp = "{\"ok\":false}"
+            if let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                let cmd = obj["cmd"] as? String {
                 switch cmd {
-                case "tap":
-                    let x = (obj["x"] as? NSNumber)?.doubleValue ?? 0
-                    let y = (obj["y"] as? NSNumber)?.doubleValue ?? 0
-                    resp = jsonStr(AXEngine.shared.tap(x: x, y: y))
                 case "probe":
-                    resp = jsonStr(AXEngine.shared.probeDict())
+                    let d = try? JSONSerialization.data(withJSONObject: WDAHost.shared.probe())
+                    resp = String(data: d ?? Data("{}".utf8), encoding: .utf8) ?? "{}"
+                case "startserver":
+                    WDAHost.shared.startServer()
+                    Thread.sleep(forTimeInterval: 2)
+                    resp = "{\"ok\":true,\"log\":\(jsonArr(WDAHost.shared.log))}"
                 case "ping":
-                    resp = #"{"ok":true,"pong":true}"#
+                    resp = "{\"ok\":true,\"pong\":true}"
                 default:
-                    resp = #"{"ok":false,"error":"unknown cmd"}"#
+                    resp = "{\"ok\":false,\"error\":\"unknown\"}"
                 }
-            } else {
-                resp = #"{"ok":false,"error":"bad json"}"#
             }
             conn.send(content: (resp + "\n").data(using: .utf8), completion: .contentProcessed { _ in })
         }
     }
 
-    private func jsonStr(_ obj: [String: Any]) -> String {
-        String(data: (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8), encoding: .utf8) ?? "{}"
+    private func jsonArr(_ a: [String]) -> String {
+        (try? String(data: JSONSerialization.data(withJSONObject: a), encoding: .utf8)) ?? "[]"
     }
 }
 
@@ -208,14 +171,11 @@ struct AXTouchApp: App {
 }
 
 struct ContentView: View {
-    @State private var log: String = "启动中…"
+    @State private var log = "启动中…"
 
     var body: some View {
         VStack(spacing: 10) {
-            Text("AXTouch 触控引擎").font(.title2).bold()
-            Text("TCP 0.0.0.0:10010\n{\"cmd\":\"tap\",\"x\":196,\"y\":420}")
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundColor(.secondary)
+            Text("WDA 宿主").font(.title2).bold()
             ScrollView {
                 Text(log)
                     .font(.system(size: 10, design: .monospaced))
@@ -226,11 +186,13 @@ struct ContentView: View {
             .background(Color.black.opacity(0.85))
             .foregroundColor(.green)
             HStack {
-                Button("引擎状态") { AXEngine.shared.boot(); log = AXEngine.shared.bootLog.joined(separator: "\n") }
-                    .buttonStyle(.bordered)
-                Button("测试点击") {
-                    let r = AXEngine.shared.tap(x: 196, y: 420)
-                    log = String(describing: r)
+                Button("加载框架") {
+                    WDAHost.shared.loadAll()
+                    log = WDAHost.shared.log.joined(separator: "\n")
+                }
+                Button("启动 WDA 服务") {
+                    WDAHost.shared.startServer()
+                    log = WDAHost.shared.log.joined(separator: "\n")
                 }
                 .buttonStyle(.borderedProminent)
             }
@@ -238,9 +200,9 @@ struct ContentView: View {
         .padding()
         .onAppear {
             ControlServer().start(port: 10010)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-                AXEngine.shared.boot()
-                log = AXEngine.shared.bootLog.joined(separator: "\n")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                WDAHost.shared.loadAll()
+                log = WDAHost.shared.log.joined(separator: "\n")
             }
         }
     }
