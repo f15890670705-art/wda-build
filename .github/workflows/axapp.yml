@@ -1,0 +1,27 @@
+name: axapp
+on:
+  workflow_dispatch: {}
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install xcodegen
+        run: brew install xcodegen
+      - name: Generate project
+        working-directory: axapp
+        run: xcodegen generate
+      - name: Build
+        working-directory: axapp
+        run: |
+          xcodebuild -project AXTouch.xcodeproj -scheme AXTouch \
+            -sdk iphoneos -configuration Release -derivedDataPath dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
+            ARCHS=arm64 build | tail -25
+          mkdir -p Payload
+          cp -R dd/Build/Products/Release-iphoneos/AXTouch.app Payload/
+          zip -qry AXTouch.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: axapp-ipa
+          path: axapp/AXTouch.ipa
