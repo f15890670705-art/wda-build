@@ -69,7 +69,10 @@ final class WDAHost {
         setenv("USE_PORT", "8100", 1)
         setenv("MJPEG_SERVER_PORT", "9100", 1)
 
-        guard let cls = objc_getClass("FBWebServer") as? NSObject.Type else { return }
+        guard let cls = NSClassFromString("FBWebServer") as? NSObject.Type else {
+            append("❌ FBWebServer 无法实例化")
+            return
+        }
         let server = cls.init()
         if server.responds(to: NSSelectorFromString("startHTTPServer")) {
             server.perform(NSSelectorFromString("startHTTPServer"))
