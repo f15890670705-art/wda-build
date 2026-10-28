@@ -1,93 +1,84 @@
 import SwiftUI
 import Foundation
 
-/// 复刻 AScript 的思路：
-/// 1) dlopen 系统私有框架 AXRuntime + XCUIAutomation + XCTest
-/// 2) 尝试 XCUIDevice → eventSynthesizer / XCTRunnerDaemonSession.shared
-/// 3) 尝试 AXUIElement 系统级点击
-/// 全部结果打在界面上，用于判定哪条路在 iOS 17.2.1 普通签名下可行。
+/// AX 触控验证：探测 + 真实点击（CreateSystemWide → CopyElementAtPosition → PerformAction）
 final class AXBridge {
     static let shared = AXBridge()
 
-    var logLines: [String] = []
+    private typealias CreateSystemWideFn = @convention(c) () -> AnyObject?
+    private typealias CopyElementAtPositionFn = @convention(c) (AnyObject, Float, Float, UnsafeMutablePointer<AnyObject?>?) -> Int32
+    private typealias PerformActionFn = @convention(c) (AnyObject, CFString) -> Int32
 
-    private func log(_ s: String) {
-        logLines.append(s)
+    private var handle: UnsafeMutableRawPointer?
+    private var createSystemWide: CreateSystemWideFn?
+    private var copyElementAtPosition: CopyElementAtPositionFn?
+    private var performAction: PerformActionFn?
+
+    private(set) var loadError: String = "未加载"
+
+    func load() {
+        guard handle == nil else { return }
+        let p = "/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime"
+        guard let h = dlopen(p, RTLD_NOW) else {
+            loadError = "dlopen 失败"
+            return
+        }
+        handle = h
+        loadError = "AXRuntime 已加载"
+        if let sym = dlsym(h, "AXUIElementCreateSystemWide") {
+            createSystemWide = unsafeBitCast(sym, to: CreateSystemWideFn.self)
+        }
+        if let sym = dlsym(h, "AXUIElementCopyElementAtPosition") {
+            copyElementAtPosition = unsafeBitCast(sym, to: CopyElementAtPositionFn.self)
+        }
+        if let sym = dlsym(h, "AXUIElementPerformAction") {
+            performAction = unsafeBitCast(sym, to: PerformActionFn.self)
+        }
+    }
+
+    /// 在屏幕坐标 (x,y) 处按一下（AXPress）。
+    @discardableResult
+    func tap(x: CGFloat, y: CGFloat) -> String {
+        load()
+        guard let createSystemWide, let copyElementAtPosition, let performAction else {
+            return "函数未就绪"
+        }
+        guard let sys = createSystemWide() else { return "CreateSystemWide 返回 nil" }
+        var element: AnyObject?
+        let err = copyElementAtPosition(sys, Float(x), Float(y), &element)
+        guard err == 0, let el = element else {
+            return "CopyElementAtPosition 失败 err=\(err)"
+        }
+        let pressErr = performAction(el, "AXPress" as CFString)
+        return "PerformAction err=\(pressErr)"
+    }
+
+    @discardableResult
+    func tapMany(x: CGFloat, y: CGFloat, times: Int) -> String {
+        var results: [String] = []
+        for i in 1...max(1, times) {
+            let r = tap(x: x, y: y)
+            results.append("[\(i)] \(r)")
+            Thread.sleep(forTimeInterval: 0.4)
+        }
+        return results.joined(separator: "\n")
     }
 
     func probe() -> String {
-        logLines.removeAll()
-        log("== dlopen 私有框架 ==")
-
-        let frameworks: [(String, String)] = [
-            ("AXRuntime", "/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime"),
-            ("XCUIAutomation", "/System/Library/PrivateFrameworks/XCUIAutomation.framework/XCUIAutomation"),
-            ("XCTestCore", "/System/Library/PrivateFrameworks/XCTestCore.framework/XCTestCore"),
-            ("XCTest(Developer路径)", "/Developer/Library/Frameworks/XCTest.framework/XCTest"),
-            ("XCTest(系统Developer)", "/System/Developer/Library/Frameworks/XCTest.framework/XCTest"),
-            ("UITesting(Private)", "/System/Library/PrivateFrameworks/UITesting.framework/UITesting"),
-        ]
-        var handles: [String: UnsafeMutableRawPointer] = [:]
-        for (name, path) in frameworks {
-            if let h = dlopen(path, RTLD_LAZY) {
-                handles[name] = h
-                log("✅ \(name): 成功")
-            } else {
-                log("❌ \(name): 失败")
+        load()
+        var out = [loadError]
+        let syms = ["AXUIElementCreateSystemWide", "AXUIElementCopyElementAtPosition",
+                    "AXUIElementPerformAction", "AXUIElementCopyAttributeValue", "AXUIElementGetPid"]
+        if let h = handle {
+            for s in syms {
+                out.append("\(dlsym(h, s) != nil ? "✅" : "❌") \(s)")
             }
         }
-
-        // ---- AXRuntime 符号探测 ----
-        log("== AXRuntime 符号 ==")
-        if let h = handles["AXRuntime"] {
-            for sym in ["AXUIElementCreateSystemWide", "AXUIElementCopyElementAtPosition",
-                        "AXUIElementPerformAction", "AXUIElementCreateApplication",
-                        "AXUIElementCopyAttributeValue", "AXUIElementGetPid"] {
-                let ok = dlsym(h, sym) != nil
-                log("\(ok ? "✅" : "❌") \(sym)")
-            }
+        // ObjC 类探测
+        for cls in ["XCUIDevice", "XCTRunnerDaemonSession"] {
+            out.append("\(objc_getClass(cls) != nil ? "✅" : "❌") class \(cls)")
         }
-
-        // ---- XCUIAutomation 类探测（objc_getClass）----
-        log("== XCUIAutomation/ObjC 类 ==")
-        for cls in ["XCUIDevice", "XCTRunnerDaemonSession", "XCTestManagerConfiguration",
-                    "XCTestSession", "XCUIApplicationImpl", "XCTestDriver",
-                    "XCTAutomationSupportConfiguration", "XCSynthesizedEventRecord"] {
-            let c = objc_getClass(cls)
-            log("\(c != nil ? "✅" : "❌") class \(cls)")
-        }
-
-        // ---- 尝试通过 ObjC runtime 调 XCUIDevice.shared → eventSynthesizer ----
-        log("== XCUIDevice 事件合成器 ==")
-        if let cls = objc_getClass("XCUIDevice") {
-            let dev = (cls as AnyObject).perform(NSSelectorFromString("sharedDevice"))?.takeRetainedValue()
-            if let dev = dev {
-                log("✅ XCUIDevice.sharedDevice: \(dev)")
-                let es = dev.perform(NSSelectorFromString("eventSynthesizer"))?.takeUnretainedValue()
-                if let es = es {
-                    log("✅ eventSynthesizer: \(es)")
-                    let sel_press = NSSelectorFromString("pressAtPoint:radius:orientation:touchNumber:")
-                    if es.responds(to: sel_press) {
-                        log("✅ eventSynthesizer 响应 pressAtPoint:radius:orientation:touchNumber:")
-                    } else {
-                        log("❌ eventSynthesizer 无 pressAtPoint 方法")
-                    }
-                } else {
-                    log("❌ eventSynthesizer 为 nil（可能需要 daemon 会话）")
-                }
-            } else {
-                log("❌ sharedDevice 为 nil")
-            }
-        } else {
-            log("❌ XCUIDevice 类不存在")
-        }
-
-        log("== XCTRunnerDaemonSession 类 ==")
-        if let cls = objc_getClass("XCTRunnerDaemonSession") {
-            log("类存在: \(cls)")
-        }
-
-        return logLines.joined(separator: "\n")
+        return out.joined(separator: "\n")
     }
 }
 
@@ -101,25 +92,43 @@ struct AXTouchApp: App {
 }
 
 struct ContentView: View {
-    @State private var log: String = "点按钮开始探测"
+    @State private var log: String = ""
+    @State private var xText = "196"
+    @State private var yText = "420"
 
     var body: some View {
         VStack(spacing: 12) {
-            Text("AX/XCUI 可行性探测").font(.title2).bold()
+            Text("AX 触控验证").font(.title2).bold()
+
+            HStack {
+                TextField("x", text: $xText).textFieldStyle(.roundedBorder).frame(width: 80)
+                TextField("y", text: $yText).textFieldStyle(.roundedBorder).frame(width: 80)
+                Button("点 1 下") {
+                    AXBridge.shared.load()
+                    let x = Double(xText) ?? 196, y = Double(yText) ?? 420
+                    log = AXBridge.shared.tap(x: CGFloat(x), y: CGFloat(y))
+                }
+                .buttonStyle(.borderedProminent)
+                Button("连点 5 下") {
+                    AXBridge.shared.load()
+                    let x = Double(xText) ?? 196, y = Double(yText) ?? 420
+                    log = AXBridge.shared.tapMany(x: CGFloat(x), y: CGFloat(y), times: 5)
+                }
+                .buttonStyle(.bordered)
+            }
+
+            Button("探测符号/类") {
+                log = AXBridge.shared.probe()
+            }
+
             ScrollView {
                 Text(log)
                     .font(.system(size: 11, design: .monospaced))
                     .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(8)
             }
             .frame(maxHeight: .infinity)
             .background(Color.black.opacity(0.85))
             .foregroundColor(.green)
-
-            Button("开始探测") {
-                log = AXBridge.shared.probe()
-            }
-            .buttonStyle(.borderedProminent)
         }
         .padding()
     }
