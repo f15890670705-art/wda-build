@@ -49,8 +49,14 @@ jobs:
             rm -rf "$APP"/Frameworks/XC*.framework || true
             echo "--- Frameworks after ---"; ls "$APP/Frameworks" || true
           fi
+          # dSYM 是调试符号、不是可执行文件；Sideloadly 会把它当二进制去签，直接失败
+          #   （macho sign/edit failed (-40)）。整包塞进 Payload 前先清掉。
+          rm -rf "$APP"/PlugIns/*.xctest.dSYM "$APP"/*.dSYM 2>/dev/null || true
+          find "$APP" -name '*.dSYM' -type d -prune -exec rm -rf {} + 2>/dev/null || true
+          find "$APP" -name '.DS_Store' -delete 2>/dev/null || true
           rm -rf Payload && mkdir -p Payload
           cp -R "$APP" Payload/
+          find Payload -name '*.dSYM' -type d -prune -exec rm -rf {} + 2>/dev/null || true
           zip -qry WebDriverAgentRunner.ipa Payload
           ls -la WebDriverAgentRunner.ipa
           unzip -l WebDriverAgentRunner.ipa | head -12
