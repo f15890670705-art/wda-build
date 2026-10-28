@@ -1,0 +1,64 @@
+name: wda
+
+on:
+  workflow_dispatch:
+    inputs:
+      wda_ref:
+        description: 'WebDriverAgent ref (branch/tag)'
+        required: false
+        default: 'master'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: macos-15
+    steps:
+      - name: Clone WebDriverAgent
+        run: |
+          git clone --depth 1 -b "${{ github.event.inputs.wda_ref || 'master' }}" \
+            https://github.com/appium/WebDriverAgent.git wda
+          cd wda && git log -1 --oneline
+
+      - name: Show Xcode
+        run: xcodebuild -version
+
+      - name: Build for testing (unsigned)
+        run: |
+          set -o pipefail
+          cd wda
+          xcodebuild build-for-testing \
+            -project WebDriverAgent.xcodeproj \
+            -scheme WebDriverAgentRunner \
+            -sdk iphoneos \
+            -configuration Debug \
+            -derivedDataPath ./dd \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" 2>&1 | tail -50
+
+      - name: Package unsigned ipa
+        run: |
+          set -e
+          APP=$(find wda/dd/Build/Products -maxdepth 3 -name "WebDriverAgentRunner-Runner.app" -type d | head -1)
+          echo "APP=$APP"
+          test -d "$APP"
+          # iOS 17~17.3：testmanagerd 变更，WDA 不能自带 XCTest 框架副本，否则启动即崩
+          if [ -d "$APP/Frameworks" ]; then
+            echo "--- Frameworks before ---"; ls "$APP/Frameworks" || true
+            rm -rf "$APP"/Frameworks/XC*.framework || true
+            echo "--- Frameworks after ---"; ls "$APP/Frameworks" || true
+          fi
+          rm -rf Payload && mkdir -p Payload
+          cp -R "$APP" Payload/
+          zip -qry WebDriverAgentRunner.ipa Payload
+          ls -la WebDriverAgentRunner.ipa
+          unzip -l WebDriverAgentRunner.ipa | head -12
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wda-ipa
+          path: WebDriverAgentRunner.ipa
+          retention-days: 7
+          if-no-files-found: error
