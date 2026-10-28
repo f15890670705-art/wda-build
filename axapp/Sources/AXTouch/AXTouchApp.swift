@@ -83,7 +83,7 @@ final class WDAHost {
             let methods = { () -> [String] in
                 var out: [String] = []
                 var count: UInt32 = 0
-                if let mlist = class_copyMethodList(objc_getClass("FBWebServer"), &count) {
+                if let mlist = class_copyMethodList(NSClassFromString("FBWebServer"), &count) {
                     for i in 0..<Int(count) {
                         out.append(NSStringFromSelector(method_getName(mlist[i])))
                     }
