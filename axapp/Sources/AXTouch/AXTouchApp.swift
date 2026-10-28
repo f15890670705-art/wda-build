@@ -1,102 +1,146 @@
 import SwiftUI
 import Foundation
 import Network
+import Darwin
 
-/// AX 触控验证 + TCP 控制服务（端口 10010）。
-/// 协议：每行一个 JSON 请求，如 {"cmd":"tap","x":196,"y":420}
-/// 响应：{"ok":true,"err":0} 或 {"ok":false,"error":"..."}
-final class AXBridge {
-    static let shared = AXBridge()
+/// 合成版（照 AScript 架构）：
+/// 1. dlopen AXRuntime + XCUIAutomation（多路径多模式，失败记录 dlerror 原文）
+/// 2. 触控优先级：eventSynthesizer（XCUIAutomation）→ AXUIElement(AXPress)
+/// 3. TCP 控制服务 10010：{"cmd":"tap","x":..,"y":..} / {"cmd":"probe"} / {"cmd":"ping"}
+final class AXEngine {
+    static let shared = AXEngine()
 
-    private typealias CreateSystemWideFn = @convention(c) () -> AnyObject?
-    private typealias CopyElementAtPositionFn = @convention(c) (AnyObject, Float, Float, UnsafeMutablePointer<AnyObject?>?) -> Int32
-    private typealias PerformActionFn = @convention(c) (AnyObject, CFString) -> Int32
+    private var axHandle: UnsafeMutableRawPointer?
+    private var xcuiHandle: UnsafeMutableRawPointer?
+    private var createSystemWide: (@convention(c) () -> AnyObject?)?
+    private var copyElementAtPosition: (@convention(c) (AnyObject, Float, Float, UnsafeMutablePointer<AnyObject?>?) -> Int32)?
+    private var performAction: (@convention(c) (AnyObject, CFString) -> Int32)?
 
-    private var handle: UnsafeMutableRawPointer?
-    private var createSystemWide: CreateSystemWideFn?
-    private var copyElementAtPosition: CopyElementAtPositionFn?
-    private var performAction: PerformActionFn?
+    private(set) var bootLog: [String] = []
+    var xcuiAvailable = false
+    var deviceObj: AnyObject?
+    var synthObj: AnyObject?
 
-    private(set) var loadError: String = "未加载"
+    private func log(_ s: String) { bootLog.append(s) }
 
-    func load() {
-        guard handle == nil else { return }
-        let p = "/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime"
-        guard let h = dlopen(p, RTLD_NOW) else {
-            loadError = "dlopen 失败"
-            return
+    func boot() {
+        guard axHandle == nil else { return }
+
+        // ---- AXRuntime ----
+        let axPath = "/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime"
+        dlerror()
+        if let h = dlopen(axPath, RTLD_NOW | RTLD_GLOBAL) {
+            axHandle = h
+            log("✅ AXRuntime")
+            createSystemWide = unsafeBitCast(dlsym(h, "AXUIElementCreateSystemWide"), to: (@convention(c) () -> AnyObject?).self)
+            copyElementAtPosition = unsafeBitCast(dlsym(h, "AXUIElementCopyElementAtPosition"), to: (@convention(c) (AnyObject, Float, Float, UnsafeMutablePointer<AnyObject?>?) -> Int32).self)
+            performAction = unsafeBitCast(dlsym(h, "AXUIElementPerformAction"), to: (@convention(c) (AnyObject, CFString) -> Int32).self)
+        } else if let e = dlerror() {
+            log("❌ AXRuntime: \(String(cString: e))")
+        } else {
+            log("❌ AXRuntime")
         }
-        handle = h
-        loadError = "AXRuntime 已加载"
-        if let sym = dlsym(h, "AXUIElementCreateSystemWide") {
-            createSystemWide = unsafeBitCast(sym, to: CreateSystemWideFn.self)
+
+        // ---- XCUIAutomation（AScript 同路径，先加载它的依赖）----
+        let deps: [(String, String)] = [
+            ("XCTAutomationSupport", "/System/Library/PrivateFrameworks/XCTAutomationSupport.framework/XCTAutomationSupport"),
+            ("XCTestCore", "/System/Library/PrivateFrameworks/XCTestCore.framework/XCTestCore"),
+            ("XCTestSupport", "/System/Library/PrivateFrameworks/XCTestSupport.framework/XCTestSupport"),
+        ]
+        for (n, p) in deps {
+            dlerror()
+            if dlopen(p, RTLD_NOW | RTLD_GLOBAL) != nil { log("✅ \(n)") }
+            else if let e = dlerror() { log("⚠️ \(n): \(String(cString: e))") }
+            else { log("⚠️ \(n)") }
         }
-        if let sym = dlsym(h, "AXUIElementCopyElementAtPosition") {
-            copyElementAtPosition = unsafeBitCast(sym, to: CopyElementAtPositionFn.self)
+        dlerror()
+        let xcuiPath = "/System/Library/PrivateFrameworks/XCUIAutomation.framework/XCUIAutomation"
+        if let h = dlopen(xcuiPath, RTLD_NOW | RTLD_GLOBAL) {
+            xcuiHandle = h
+            xcuiAvailable = true
+            log("✅ XCUIAutomation —— eventSynthesizer 路线可用!")
+        } else if let e = dlerror() {
+            xcuiAvailable = false
+            log("❌ XCUIAutomation: \(String(cString: e))")
+        } else {
+            xcuiAvailable = false
+            log("❌ XCUIAutomation")
         }
-        if let sym = dlsym(h, "AXUIElementPerformAction") {
-            performAction = unsafeBitCast(sym, to: PerformActionFn.self)
+
+        // ---- XCUIDevice.sharedDevice().eventSynthesizer ----
+        if xcuiAvailable, let cls = objc_getClass("XCUIDevice") {
+            if let dev = (cls as AnyObject).perform(NSSelectorFromString("sharedDevice"))?.takeRetainedValue() {
+                deviceObj = dev
+                if let es = dev.perform(NSSelectorFromString("eventSynthesizer"))?.takeUnretainedValue() {
+                    synthObj = es
+                    log("✅ eventSynthesizer 就绪: \(es)")
+                } else {
+                    log("❌ eventSynthesizer 为 nil")
+                }
+            } else {
+                log("❌ sharedDevice 为 nil")
+            }
         }
     }
 
-    /// 在屏幕坐标 (x,y) 处按一下（AXPress）。
-    @discardableResult
-    func tap(x: CGFloat, y: CGFloat) -> [String: Any] {
-        load()
+    /// 合成点击。优先 XCUIAutomation eventSynthesizer，失败回退 AX。
+    func tap(x: Double, y: Double) -> [String: Any] {
+        boot()
+        // 1) eventSynthesizer 路线
+        if let es = synthObj {
+            let sel = NSSelectorFromString("pressAtPoint:radius:orientation:touchNumber:")
+            if es.responds(to: sel) {
+                let imp = es.method(for: sel)
+                typealias Fn = @convention(c) (AnyObject, Selector, CGPoint, CGFloat, Int, Int) -> Void
+                let fn = unsafeBitCast(imp, to: Fn.self)
+                fn(es, sel, CGPoint(x: x, y: y), 0, 1, 1)
+                // press 即按下+抬起（XCTest 语义里 press 是完整点击）
+                return ["ok": true, "via": "eventSynthesizer"]
+            }
+            let sel2 = NSSelectorFromString("pressAtPoint:radius:orientation:")
+            if es.responds(to: sel2) {
+                let imp = es.method(for: sel2)
+                typealias Fn2 = @convention(c) (AnyObject, Selector, CGPoint, CGFloat, Int) -> Void
+                let fn = unsafeBitCast(imp, to: Fn2.self)
+                fn(es, sel2, CGPoint(x: x, y: y), 0, 1)
+                return ["ok": true, "via": "eventSynthesizer"]
+            }
+        }
+        // 2) AX 路线
         guard let createSystemWide, let copyElementAtPosition, let performAction else {
-            return ["ok": false, "error": "函数未就绪: \(loadError)"]
+            return ["ok": false, "error": "无可用触控路线"]
         }
         guard let sys = createSystemWide() else {
-            return ["ok": false, "error": "CreateSystemWide 返回 nil"]
+            return ["ok": false, "error": "CreateSystemWide nil"]
         }
         var element: AnyObject?
         let err = copyElementAtPosition(sys, Float(x), Float(y), &element)
         guard err == 0, let el = element else {
-            return ["ok": false, "error": "CopyElementAtPosition err=\(err)"]
+            return ["ok": false, "error": "AX CopyElementAtPosition err=\(err) (-25200=权限拒绝)"]
         }
         let pressErr = performAction(el, "AXPress" as CFString)
-        return ["ok": pressErr == 0, "err": pressErr]
+        return ["ok": pressErr == 0, "via": "AX", "err": pressErr]
     }
 
-    func probe() -> String {
-        var out: [String] = []
-        // 按依赖顺序、RTLD_NOW|GLOBAL（AScript 同款路径），失败打 dlerror 原文
-        let frameworks: [(String, String)] = [
-            ("AXRuntime", "/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime"),
-            ("XCTAutomationSupport", "/System/Library/PrivateFrameworks/XCTAutomationSupport.framework/XCTAutomationSupport"),
-            ("XCTestCore", "/System/Library/PrivateFrameworks/XCTestCore.framework/XCTestCore"),
-            ("XCUIAutomation", "/System/Library/PrivateFrameworks/XCUIAutomation.framework/XCUIAutomation"),
-            ("UITesting", "/System/Library/PrivateFrameworks/UITesting.framework/UITesting"),
-            ("XCTest", "/System/Developer/Library/Frameworks/XCTest.framework/XCTest"),
+    func probeDict() -> [String: Any] {
+        boot()
+        var out: [String: Any] = [
+            "xcuiAvailable": xcuiAvailable,
+            "eventSynthesizer": synthObj != nil,
+            "bootLog": bootLog,
         ]
-        out.append("== dlopen (RTLD_NOW|GLOBAL) ==")
-        for (name, path) in frameworks {
-            dlerror()  // 清空旧错误
-            if let h = dlopen(path, RTLD_NOW | RTLD_GLOBAL) {
-                out.append("✅ \(name)")
-            } else if let e = dlerror() {
-                out.append("❌ \(name): \(String(cString: e))")
-            } else {
-                out.append("❌ \(name): 失败(无dlerror)")
-            }
-        }
-        // ObjC 类存在性（XCUIAutomation 加载成功的话这些类会出现）
-        out.append("== ObjC 类 ==")
-        for cls in ["XCUIDevice", "XCTRunnerDaemonSession", "XCSynthesizedEventRecord", "XCUIApplicationImpl"] {
-            out.append("\(objc_getClass(cls) != nil ? "✅" : "❌") class \(cls)")
-        }
-        // AX 符号
-        if let h = dlopen("/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime", RTLD_NOW) {
-            out.append("== AX 符号 ==")
+        if let h = axHandle {
+            var syms: [String: Bool] = [:]
             for s in ["AXUIElementCreateSystemWide", "AXUIElementCopyElementAtPosition", "AXUIElementPerformAction"] {
-                out.append("\(dlsym(h, s) != nil ? "✅" : "❌") \(s)")
+                syms[s] = dlsym(h, s) != nil
             }
+            out["axSymbols"] = syms
         }
-        return out.joined(separator: "\n")
+        return out
     }
 }
 
-/// TCP 控制服务：监听 0.0.0.0:10010，每行一个 JSON 指令。
+/// TCP 控制服务：0.0.0.0:10010，行协议 JSON。
 final class ControlServer {
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "axtouch.control")
@@ -104,35 +148,20 @@ final class ControlServer {
 
     func start(port: UInt16 = 10010) {
         let params = NWParameters.tcp
-        guard let portVal = NWEndpoint.Port(rawValue: port),
-              let listener = try? NWListener(using: params, on: portVal) else {
-            print("[ControlServer] 监听失败 port=\(port)")
-            return
-        }
-        self.listener = listener
-        listener.newConnectionHandler = { conn in
-            print("[ControlServer] 新连接:", conn.endpoint)
+        guard let p = NWEndpoint.Port(rawValue: port), let l = try? NWListener(using: params, on: p) else { return }
+        listener = l
+        l.newConnectionHandler = { conn in
             conn.start(queue: self.queue)
             self.handle(conn)
         }
-        listener.stateUpdateHandler = { state in
-            print("[ControlServer] state: \(state)")
-        }
-        listener.start(queue: queue)
-        print("[ControlServer] listening on 0.0.0.0:\(port)")
+        l.start(queue: queue)
     }
 
     private func handle(_ conn: NWConnection) {
         func receive() {
-            conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, isComplete, error in
-                if let data = data, !data.isEmpty {
-                    self.process(data: data, conn: conn)
-                }
-                if error == nil && !isComplete {
-                    receive()
-                } else {
-                    conn.cancel()
-                }
+            conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, done, _ in
+                if let data = data, !data.isEmpty { self.process(data: data, conn: conn) }
+                if !done { receive() } else { conn.cancel() }
             }
         }
         receive()
@@ -144,73 +173,75 @@ final class ControlServer {
             let lineData = buffer[buffer.startIndex..<nl]
             buffer.removeSubrange(buffer.startIndex...nl)
             guard let line = String(data: lineData, encoding: .utf8), !line.isEmpty else { continue }
-            let response = handleCommand(line)
-            let out = (response + "\n").data(using: .utf8)!
-            conn.send(content: out, completion: .contentProcessed { _ in })
-        }
-    }
-
-    private func handleCommand(_ line: String) -> String {
-        guard let data = line.data(using: .utf8),
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let cmd = obj["cmd"] as? String else {
-            return #"{"ok":false,"error":"bad json"}"#
-        }
-        switch cmd {
-        case "tap":
-            let x = (obj["x"] as? NSNumber)?.doubleValue ?? 0
-            let y = (obj["y"] as? NSNumber)?.doubleValue ?? 0
-            return jsonStr(AXBridge.shared.tap(x: CGFloat(x), y: CGFloat(y)))
-        case "probe":
-            return AXBridge.shared.probe()
-        case "ping":
-            return #"{"ok":true,"pong":true}"#
-        default:
-            return #"{"ok":false,"error":"unknown cmd"}"#
+            let resp: String
+            if let obj = try? JSONSerialization.jsonObject(with: line.data(using: .utf8) ?? Data()) as? [String: Any],
+               let cmd = obj["cmd"] as? String {
+                switch cmd {
+                case "tap":
+                    let x = (obj["x"] as? NSNumber)?.doubleValue ?? 0
+                    let y = (obj["y"] as? NSNumber)?.doubleValue ?? 0
+                    resp = jsonStr(AXEngine.shared.tap(x: x, y: y))
+                case "probe":
+                    resp = jsonStr(AXEngine.shared.probeDict())
+                case "ping":
+                    resp = #"{"ok":true,"pong":true}"#
+                default:
+                    resp = #"{"ok":false,"error":"unknown cmd"}"#
+                }
+            } else {
+                resp = #"{"ok":false,"error":"bad json"}"#
+            }
+            conn.send(content: (resp + "\n").data(using: .utf8), completion: .contentProcessed { _ in })
         }
     }
 
     private func jsonStr(_ obj: [String: Any]) -> String {
-        let d = try? JSONSerialization.data(withJSONObject: obj)
-        return String(data: d ?? Data("{}".utf8), encoding: .utf8) ?? "{}"
+        String(data: (try? JSONSerialization.data(withJSONObject: obj)) ?? Data("{}".utf8), encoding: .utf8) ?? "{}"
     }
 }
 
 @main
 struct AXTouchApp: App {
     var body: some Scene {
-        WindowGroup {
-            ContentView()
-        }
+        WindowGroup { ContentView() }
     }
 }
 
 struct ContentView: View {
-    @State private var log: String = "TCP 服务已启动: 0.0.0.0:10010"
+    @State private var log: String = "启动中…"
 
     var body: some View {
-        VStack(spacing: 12) {
-            Text("AX 触控 + TCP 控制").font(.title2).bold()
-            Text("PC 连接: 手机IP:10010\n{\"cmd\":\"tap\",\"x\":196,\"y\":420}")
-                .font(.system(size: 11, design: .monospaced))
+        VStack(spacing: 10) {
+            Text("AXTouch 触控引擎").font(.title2).bold()
+            Text("TCP 0.0.0.0:10010\n{\"cmd\":\"tap\",\"x\":196,\"y\":420}")
+                .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(.secondary)
             ScrollView {
                 Text(log)
-                    .font(.system(size: 11, design: .monospaced))
+                    .font(.system(size: 10, design: .monospaced))
                     .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(6)
             }
             .frame(maxHeight: .infinity)
             .background(Color.black.opacity(0.85))
             .foregroundColor(.green)
-
-            Button("手动点 (196,420)") {
-                let r = AXBridge.shared.tap(x: 196, y: 420)
-                log = String(describing: r)
+            HStack {
+                Button("引擎状态") { AXEngine.shared.boot(); log = AXEngine.shared.bootLog.joined(separator: "\n") }
+                    .buttonStyle(.bordered)
+                Button("测试点击") {
+                    let r = AXEngine.shared.tap(x: 196, y: 420)
+                    log = String(describing: r)
+                }
+                .buttonStyle(.borderedProminent)
             }
         }
         .padding()
         .onAppear {
             ControlServer().start(port: 10010)
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                AXEngine.shared.boot()
+                log = AXEngine.shared.bootLog.joined(separator: "\n")
+            }
         }
     }
 }
