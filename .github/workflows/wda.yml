@@ -43,11 +43,11 @@ jobs:
           APP=$(find wda/dd/Build/Products -maxdepth 3 -name "WebDriverAgentRunner-Runner.app" -type d | head -1)
           echo "APP=$APP"
           test -d "$APP"
-          # iOS 17~17.3：testmanagerd 变更，WDA 不能自带 XCTest 框架副本，否则启动即崩
+          # 注意：手动 launch（不经过 testmanagerd）的 WDA 必须保留自带 XCTest 框架，
+          # 否则 dyld 找不到 @rpath/XCTest.framework/XCTest 启动即崩（已在 17.2.1 实测）。
+          # 只删 dSYM（Sideloadly 会把它当二进制签名导致 -40 失败）。
           if [ -d "$APP/Frameworks" ]; then
-            echo "--- Frameworks before ---"; ls "$APP/Frameworks" || true
-            rm -rf "$APP"/Frameworks/XC*.framework || true
-            echo "--- Frameworks after ---"; ls "$APP/Frameworks" || true
+            echo "--- Frameworks ---"; ls "$APP/Frameworks" || true
           fi
           # dSYM 是调试符号、不是可执行文件；Sideloadly 会把它当二进制去签，直接失败
           #   （macho sign/edit failed (-40)）。整包塞进 Payload 前先清掉。
