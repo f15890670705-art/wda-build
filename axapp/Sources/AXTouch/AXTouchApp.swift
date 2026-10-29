@@ -1,12 +1,13 @@
 import SwiftUI
+import Combine
 import Foundation
 import Network
 import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "35"
-    static let tag = "v2.0-b35"
+    static let build = "36"
+    static let tag = "v2.0-b36"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -155,11 +156,16 @@ struct AXTouchApp: App {
 
 struct ContentView: View {
     @State private var log = "就绪"
+    @State private var agentReady = false
+    private let readyTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
 
     var body: some View {
         VStack(spacing: 8) {
             Text("AXTouch \(BuildInfo.tag)").font(.title2).bold()
-            Text("TCP 0.0.0.0:10010  |  日志: Documents/axtouch.log")
+            Text(agentReady ? "AGENT READY ✅  (Automation 会话已建立)" : "AGENT —  正在建立会话…")
+                .font(.system(size: 13, weight: .bold, design: .monospaced))
+                .foregroundColor(agentReady ? .green : .orange)
+            Text("TCP 0.0.0.0:10010  |  日志: Documents/agent.log + axtouch.log")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(.secondary)
 
@@ -223,6 +229,9 @@ struct ContentView: View {
                 log = WDAHost.shared.log.joined(separator: "\n")
             }
             log = WDAHost.shared.log.joined(separator: "\n")
+        }
+        .onReceive(readyTimer) { _ in
+            agentReady = AXAgentIsReady()
         }
     }
 }
