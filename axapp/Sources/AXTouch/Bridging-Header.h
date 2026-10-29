@@ -15,3 +15,7 @@ BOOL AXAgentIsReady(void);
 NSString *AXAgentLastError(void);
 NSString *AXAgentLogPath(void);
 void AXAgentStartSticky(void);
+BOOL AXAgentGesture(const double *xy, const double *t, int n);
+BOOL AXAgentSwipe(double x1, double y1, double x2, double y2, double dur);
+BOOL AXAgentLongPress(double x, double y, double dur);
+NSString *AXAgentShot(double maxSide, double quality);
