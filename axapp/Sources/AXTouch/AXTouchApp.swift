@@ -77,7 +77,7 @@ final class WDAHost {
 
     /// 第 4 步：启动 WDA HTTP server（常驻线程版，保住 XPC 连接）
     func startServer() {
-        self.loadAll()
+        self.loadXCTest()
         setenv("USE_PORT", "8100", 1)
         setenv("MJPEG_SERVER_PORT", "9100", 1)
         AXStartWDAServerThread(nil)
