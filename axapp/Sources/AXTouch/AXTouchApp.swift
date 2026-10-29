@@ -6,7 +6,7 @@ import Darwin
 enum BuildInfo {
     static let version = "2.0"
     static let build = "21"
-    static let tag = "v2.0-b22"
+    static let tag = "v2.0-b23"
 }
 
 /// 分步加载：启动只开 socket，其余全部手动触发，崩溃点一目了然。
@@ -75,8 +75,19 @@ final class WDAHost {
         }
     }
 
-    /// 第 4 步：启动 WDA HTTP server
+    /// 第 4 步：启动 WDA HTTP server（常驻线程版，保住 XPC 连接）
     func startServer() {
+        loadAll()
+        setenv("USE_PORT", "8100", 1)
+        setenv("MJPEG_SERVER_PORT", "9100", 1)
+        AXStartWDAServerThread(nil)
+        append("--- 常驻线程已启动（3 秒后 8100 应就绪）---")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
+            append("尝试连接验证: curl http://手机IP:8100/status")
+        }
+    }
+
+    private func legacyStartServer() {
         append("--- 4a 测试本机 socket ---")
         for sockPath in ["/var/run/usbmuxd", "/var/run/lockdown.sock"] {
             let fd = socket(AF_UNIX, SOCK_STREAM, 0)
