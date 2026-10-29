@@ -203,11 +203,11 @@ struct ContentView: View {
             HStack(spacing: 6) {
                 Button("1 AX") { WDAHost.shared.loadAXOnly(); log = WDAHost.shared.log.joined(separator: "\n") }
                     .buttonStyle(.bordered)
-                Button("2 框架") { WDAHost.shared.loadXCTest(); log = WDAHost.shared.log.joined(separator: "\n") }
+                Button("2 框架") { AXLoadXCTestThread(); log = "框架加载已转常驻线程（设备日志可见进度）" }
                     .buttonStyle(.bordered)
-                Button("3 Session") { WDAHost.shared.probeSession(); log = WDAHost.shared.log.joined(separator: "\n") }
+                Button("3 Session") { AXProbeDaemonSession(); log = "探测已转常驻线程，结果看设备日志" }
                     .buttonStyle(.bordered)
-                Button("4 服务") { WDAHost.shared.startServer(); log = WDAHost.shared.log.joined(separator: "\n") }
+                Button("4 服务") { AXStartWDAServerThread(nil); log = "服务在常驻线程启动（连接验证: PC curl 手机IP:8100/status）" }
                     .buttonStyle(.borderedProminent)
             }
             .font(.system(size: 12))
