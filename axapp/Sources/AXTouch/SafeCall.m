@@ -20,7 +20,7 @@ NSString *AXSafeCall(void (^block)(void)) {
 NSString *AXStartWDAServer(void) {
     Class cls = NSClassFromString(@"FBWebServer");
     if (cls == Nil) return @"FBWebServer 类不存在";
-    id server = nil;
+    __block id server = nil;
     NSString *err = AXSafeCall(^{
         server = [[cls alloc] init];
     });
