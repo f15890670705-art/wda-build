@@ -6,8 +6,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "44"
-    static let tag = "v2.0-b44"
+    static let build = "45"
+    static let tag = "v2.0-b45"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -247,6 +247,11 @@ final class ControlServer {
                 case "recprobe":
                     DispatchQueue.global().async { _ = AXAgentProbeRecording() }
                     resp = "{\"ok\":true,\"note\":\"probe started, 4s later check agent.log\"}"
+                case "apptimeout":
+                    /* {"cmd":"apptimeout","v":0.01} —— 调 _XCTSetApplicationStateTimeout */
+                    let v = (obj["v"] as? Double) ?? 0.01
+                    let r = AXAgentSetAppStateTimeout(v)
+                    resp = "{\"ok\":\(r),\"v\":\(v)}"
                 case "tree":
                     /* {"cmd":"tree","max":120} → 读 AX 元素树，详情写 agent.log */
                     let mx = (obj["max"] as? Int) ?? 120
