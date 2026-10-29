@@ -6,8 +6,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "46"
-    static let tag = "v2.0-b46"
+    static let build = "47"
+    static let tag = "v2.0-b47"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -252,6 +252,17 @@ final class ControlServer {
                     let v = (obj["v"] as? Double) ?? 0.01
                     let r = AXAgentSetAppStateTimeout(v)
                     resp = "{\"ok\":\(r),\"v\":\(v)}"
+                case "shot2":
+                    /* 底层截图：跳过 XCUIScreen 三层包装，直接打 screenshotIPCInterface
+                       mode 0 = 整屏, 1 = 半屏 rect 试验 */
+                    let md = (obj["mode"] as? Int) ?? 0
+                    let q2 = (obj["quality"] as? Double) ?? 0.6
+                    let r2 = AXAgentShotLowLevel(Int32(md), q2) ?? "nil"
+                    if r2.count > 1000 {
+                        resp = "{\"ok\":true,\"jpeg\":\"\(r2)\"}"
+                    } else {
+                        resp = "{\"ok\":false,\"error\":\"\(r2)\"}"
+                    }
                 case "tree":
                     /* {"cmd":"tree","max":120} → 读 AX 元素树，详情写 agent.log */
                     let mx = (obj["max"] as? Int) ?? 120
