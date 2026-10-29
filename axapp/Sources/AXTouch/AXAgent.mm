@@ -1191,16 +1191,32 @@ extern "C" NSString *AXAgentShotLowLevel(int mode, double quality) {
         }
         if (!q) { ALog(@"  ⚠️ 没有 XCTImageQuality，用 nil"); }
 
-        /* ★ CGRectNull = 整屏；CGRectZero 会被 daemon 判成 "Empty screenshot requested."
-           （XCUIScreen 内部用的正是 CGRectNull —— 反汇编 0xf214 处 bl _CGRectIsNull） */
-        CGRect rect = CGRectNull;
-        if (mode == 1) rect = CGRectMake(0, 0, 200, 400);   /* 小区域试验，单位待验证 */
+        /* ★ IPC 层不认 CGRectNull / CGRectZero —— 必须给真实矩形，否则
+           daemon 直接回 "Empty screenshot requested."（反汇编里 datasource 会把 rect
+           原样重建丢给 IPC，null 就变成空请求）。
+           mode: 0 = 整屏(点) 1 = 半屏(点) 2 = 整屏(像素) */
+        CGSize pts = [UIScreen mainScreen].bounds.size;
+        CGFloat sc = [UIScreen mainScreen].scale;
+        CGRect rect;
+        if (mode == 1)      rect = CGRectMake(0, 0, pts.width * 0.5, pts.height * 0.5);
+        else if (mode == 2) rect = CGRectMake(0, 0, pts.width * sc, pts.height * sc);
+        else                rect = CGRectMake(0, 0, pts.width, pts.height);
+        ALog(@"  🔬 [shot2] rect = %.0f,%.0f %.0fx%.0f (mode=%d)", rect.origin.x, rect.origin.y,
+             rect.size.width, rect.size.height, mode);
+
+        /* screenID 用真实 displayID，硬传 0 也可能被判空 */
+        long long sid = 0;
+        SEL dSel = NSSelectorFromString(@"displayID");
+        if ([screen respondsToSelector:dSel]) {
+            sid = ((long long (*)(id, SEL))objc_msgSend)(screen, dSel);
+        }
+        ALog(@"  🔬 [shot2] screenID = %lld", sid);
 
         SEL ri = NSSelectorFromString(@"initWithScreenID:rect:encoding:options:");
         if (![reqCls instancesRespondToSelector:ri]) { ALog(@"  ❌ 无 initWithScreenID:rect:encoding:options:"); return @"no init"; }
         id reqObj = ((id (*)(id, SEL))objc_msgSend)(reqCls, NSSelectorFromString(@"alloc"));
         typedef id (*InitReqFn)(id, SEL, long long, CGRect, id, unsigned long);
-        id req = ((InitReqFn)objc_msgSend)(reqObj, ri, 0LL, rect, q, 0UL);
+        id req = ((InitReqFn)objc_msgSend)(reqObj, ri, sid, rect, q, 0UL);
         if (!req) { ALog(@"  ❌ request 构造失败"); return @"req nil"; }
 
         SEL callSel = NSSelectorFromString(@"requestScreenshotWithRequest:withReply:");
