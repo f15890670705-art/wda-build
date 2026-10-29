@@ -476,3 +476,115 @@ extern "C" void AXAgentStartSticky(void) {
     t.name = @"AXAgent-Sticky";
     [t start];
 }
+
+
+#pragma mark - 5. 手势（swipe / longpress / 任意轨迹）
+
+/// xy: [x0,y0, x1,y1, ...]  t: 每个点的时间偏移(秒)，最后一个点是 liftUp
+extern "C" BOOL AXAgentGesture(const double *xy, const double *t, int n) {
+    if (!gReady || !gSession) { ALog(@"❌ gesture 失败：会话未就绪"); return NO; }
+    if (n < 2) { ALog(@"❌ gesture 失败：点数不足"); return NO; }
+    @try {
+        Class pathCls = NSClassFromString(@"XCPointerEventPath");
+        Class recCls  = NSClassFromString(@"XCSynthesizedEventRecord");
+        if (!pathCls || !recCls) { ALog(@"❌ gesture: 类不存在"); return NO; }
+
+        SEL initPath = NSSelectorFromString(@"initForTouchAtPoint:offset:");
+        id (*fpInit)(id, SEL, CGPoint, double) = (id (*)(id, SEL, CGPoint, double))objc_msgSend;
+        id path = fpInit([pathCls alloc], initPath, CGPointMake(xy[0], xy[1]), t[0]);
+        if (!path) { ALog(@"❌ gesture: path 构造失败"); return NO; }
+
+        SEL mv = NSSelectorFromString(@"moveToPoint:atOffset:");
+        void (*fpMv)(id, SEL, CGPoint, double) = (void (*)(id, SEL, CGPoint, double))objc_msgSend;
+        SEL up = NSSelectorFromString(@"liftUpAtOffset:");
+        void (*fpUp)(id, SEL, double) = (void (*)(id, SEL, double))objc_msgSend;
+
+        for (int i = 1; i < n - 1; i++) {
+            if ([path respondsToSelector:mv])
+                fpMv(path, mv, CGPointMake(xy[i*2], xy[i*2+1]), t[i]);
+        }
+        if ([path respondsToSelector:up]) fpUp(path, up, t[n-1]);
+
+        long orient = AXInterfaceOrientation();
+        SEL initRec = NSSelectorFromString(@"initWithName:interfaceOrientation:");
+        id (*fpRec)(id, SEL, id, long) = (id (*)(id, SEL, id, long))objc_msgSend;
+        id rec = fpRec([recCls alloc], initRec, @"AXAgent", orient);
+        if (!rec) { ALog(@"❌ gesture: record 构造失败"); return NO; }
+        SEL addPath = NSSelectorFromString(@"addPointerEventPath:");
+        ((void (*)(id, SEL, id))objc_msgSend)(rec, addPath, path);
+
+        SEL syn = NSSelectorFromString(@"synthesizeEvent:completion:");
+        if (![gSession respondsToSelector:syn]) { ALog(@"❌ gesture: 无 synthesizeEvent"); return NO; }
+        void (^completion)(id) = ^(id err) { };
+        ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, syn, rec, completion);
+        [NSThread sleepForTimeInterval:0.25];
+        ALog(@"  ✅ gesture 已提交（%d 点，末点 %.2fs）", n, t[n-1]);
+        return YES;
+    } @catch (NSException *e) {
+        ALog(@"❌ gesture 异常: %@ / %@", e.name, e.reason);
+        return NO;
+    }
+}
+
+extern "C" BOOL AXAgentSwipe(double x1, double y1, double x2, double y2, double dur) {
+    if (dur <= 0) dur = 0.25;
+    double xy[4] = { x1, y1, x2, y2 };
+    double t[2]  = { 0.0, dur };
+    return AXAgentGesture(xy, t, 2);
+}
+
+extern "C" BOOL AXAgentLongPress(double x, double y, double dur) {
+    if (dur <= 0) dur = 1.0;
+    double xy[4] = { x, y, x, y };
+    double t[2]  = { 0.0, dur };
+    return AXAgentGesture(xy, t, 2);
+}
+
+#pragma mark - 6. 截图（JPEG + 缩放，返回 base64）
+
+extern "C" NSString *AXAgentShot(double maxSide, double quality) {
+    if (!gReady) { ALog(@"❌ shot 失败：会话未就绪"); return nil; }
+    @autoreleasepool {
+        Class scrCls = NSClassFromString(@"XCUIScreen");
+        if (!scrCls) { ALog(@"❌ shot: XCUIScreen 不存在（DDI 未挂载？）"); return nil; }
+
+        id screen = nil;
+        SEL ms = NSSelectorFromString(@"mainScreen");
+        if ([scrCls respondsToSelector:ms]) screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, ms);
+        if (!screen) { ALog(@"❌ shot: mainScreen 为 nil"); return nil; }
+
+        SEL ss = NSSelectorFromString(@"screenshot");
+        if (![screen respondsToSelector:ss]) { ALog(@"❌ shot: 无 screenshot 方法"); return nil; }
+
+        CFTimeInterval t0 = CACurrentMediaTime();
+        id shot = ((id (*)(id, SEL))objc_msgSend)(screen, ss);
+        if (!shot) { ALog(@"❌ shot: screenshot 返回 nil"); return nil; }
+
+        SEL im = NSSelectorFromString(@"image");
+        id img = [shot respondsToSelector:im] ? ((id (*)(id, SEL))objc_msgSend)(shot, im) : nil;
+        if (!img) { ALog(@"❌ shot: image 为 nil"); return nil; }
+        CFTimeInterval t1 = CACurrentMediaTime();
+
+        UIImage *ui = (UIImage *)img;
+        CGSize sz = ui.size;
+        CGFloat longSide = MAX(sz.width, sz.height);
+        UIImage *out = ui;
+        if (maxSide > 0 && longSide > maxSide) {
+            CGFloat k = maxSide / longSide;
+            CGSize ns = CGSizeMake(round(sz.width * k), round(sz.height * k));
+            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:ns];
+            out = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
+                [ui drawInRect:CGRectMake(0, 0, ns.width, ns.height)];
+            }];
+        }
+        if (quality <= 0) quality = 0.6;
+        NSData *jpeg = UIImageJPEGRepresentation(out, quality);
+        CFTimeInterval t2 = CACurrentMediaTime();
+        if (!jpeg) { ALog(@"❌ shot: JPEG 编码失败"); return nil; }
+        ALog(@"  📷 shot %.0fx%.0f -> %.0fx%.0f  %luKB  抓图%.0fms 编码%.0fms",
+             sz.width, sz.height, out.size.width, out.size.height,
+             (unsigned long)(jpeg.length / 1024),
+             (t1 - t0) * 1000.0, (t2 - t1) * 1000.0);
+        return [jpeg base64EncodedStringWithOptions:0];
+    }
+}
