@@ -5,8 +5,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "25"
-    static let tag = "v2.0-b25"
+    static let build = "26"
+    static let tag = "v2.0-b26"
 }
 
 /// 分步加载：启动只开 socket，其余全部手动触发，崩溃点一目了然。
