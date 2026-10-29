@@ -6,8 +6,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "41"
-    static let tag = "v2.0-b41"
+    static let build = "42"
+    static let tag = "v2.0-b42"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -85,37 +85,116 @@ final class WDAHost {
     }
 }
 
+/// Documents 目录
+func AXDocumentsURL() -> URL {
+    return FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+}
+
+/// 列出 Documents 下所有 .log（JSON 一行返回）
+func AXListLogsJSON() -> String {
+    let dir = AXDocumentsURL()
+    let fm = FileManager.default
+    var items: [[String: Any]] = []
+    if let names = try? fm.contentsOfDirectory(atPath: dir.path) {
+        for n in names where n.lowercased().hasSuffix(".log") {
+            let p = dir.appendingPathComponent(n)
+            let attr = try? fm.attributesOfItem(atPath: p.path)
+            let sz = (attr?[.size] as? NSNumber)?.intValue ?? 0
+            let mt = (attr?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0
+            items.append(["name": n, "size": sz, "mtime": mt])
+        }
+    }
+    items.sort { ($0["mtime"] as? Double ?? 0) > ($1["mtime"] as? Double ?? 0) }
+    let dict: [String: Any] = ["ok": true, "dir": dir.path, "logs": items]
+    guard let d = try? JSONSerialization.data(withJSONObject: dict) else { return "{\"ok\":false}" }
+    return String(data: d, encoding: .utf8) ?? "{\"ok\":false}"
+}
+
+/// 读日志尾部 maxKB 千字节，JSON 返回（text 已转义，可安全塞进一行）
+func AXReadLogJSON(_ name: String, _ maxKB: Int) -> String {
+    let dir = AXDocumentsURL()
+    /* 允许 "agent" / "axtouch" 简写，也允许直接给文件名 */
+    var fileName = name
+    if !fileName.lowercased().hasSuffix(".log") { fileName += ".log" }
+    let url = dir.appendingPathComponent(fileName)
+
+    var dict: [String: Any] = ["ok": false, "file": url.path]
+    guard let fh = try? FileHandle(forReadingFrom: url) else {
+        dict["error"] = "打不开（文件不存在？）"
+        return (try? JSONSerialization.data(withJSONObject: dict))
+            .flatMap { String(data: $0, encoding: .utf8) } ?? "{\"ok\":false}"
+    }
+    defer { _ = try? fh.close() }
+
+    let size: UInt64 = fh.seekToEndOfFile()
+    let want = UInt64(max(1, min(maxKB, 16384))) * 1024
+    let from: UInt64 = size > want ? size - want : 0
+    _ = try? fh.seek(toOffset: from)
+
+    /* readToEnd() 返回 Data? 且 throws ⇒ try? 会套成 Data??，这里显式展平 */
+    var data = Data()
+    if let maybe = try? fh.readToEnd(), let got = maybe { data = got }
+    let d = data
+
+    /* 从中间截断可能切在多字节字符中间：丢掉开头最多 3 字节直到能解码 */
+    var text = ""
+    for skip in 0...3 {
+        if skip >= d.count { break }
+        if let s = String(data: d.subdata(in: skip..<d.count), encoding: .utf8) {
+            text = s
+            break
+        }
+    }
+    if text.isEmpty { text = String(decoding: d, as: UTF8.self) }
+
+    dict["ok"] = true
+    dict["size"] = Int(size)
+    dict["from"] = Int(from)
+    dict["bytes"] = d.count
+    dict["text"] = text
+    guard let out = try? JSONSerialization.data(withJSONObject: dict) else { return "{\"ok\":false}" }
+    return String(data: out, encoding: .utf8) ?? "{\"ok\":false}"
+}
+
+/// 每条连接独立的接收缓冲（原来的 buffer 是 ControlServer 的成员，
+/// 多个客户端同时连会互相串包）
+private final class AXConn {
+    let c: NWConnection
+    var buf = Data()
+    init(_ c: NWConnection) { self.c = c }
+}
+
 /// TCP 控制 10010
 final class ControlServer {
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "ax.ctl")
-    private var buffer = Data()
 
     func start(port: UInt16 = 10010) {
         guard let p = NWEndpoint.Port(rawValue: port), let l = try? NWListener(using: .tcp, on: p) else { return }
         listener = l
         l.newConnectionHandler = { c in
             c.start(queue: self.queue)
-            self.handle(c)
+            let conn = AXConn(c)
+            self.handle(conn)
         }
         l.start(queue: queue)
     }
 
-    private func handle(_ c: NWConnection) {
+    private func handle(_ conn: AXConn) {
         func rec() {
-            c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { d, _, done, _ in
-                if let d = d, !d.isEmpty { self.process(d, c) }
-                if !done { rec() } else { c.cancel() }
+            conn.c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { d, _, done, _ in
+                if let d = d, !d.isEmpty { self.process(d, conn) }
+                if !done { rec() } else { conn.c.cancel() }
             }
         }
         rec()
     }
 
-    private func process(_ data: Data, _ c: NWConnection) {
-        buffer.append(data)
-        while let nl = buffer.firstIndex(of: 0x0A) {
-            let ld = buffer[buffer.startIndex..<nl]
-            buffer.removeSubrange(buffer.startIndex...nl)
+    private func process(_ data: Data, _ conn: AXConn) {
+        conn.buf.append(data)
+        while let nl = conn.buf.firstIndex(of: 0x0A) {
+            let ld = conn.buf[conn.buf.startIndex..<nl]
+            conn.buf.removeSubrange(conn.buf.startIndex...nl)
             guard let line = String(data: ld, encoding: .utf8), !line.isEmpty else { continue }
             var resp = "{\"ok\":false}"
             if let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
@@ -178,12 +257,20 @@ final class ControlServer {
                     }
                 case "probe":
                     resp = (try? String(data: JSONSerialization.data(withJSONObject: WDAHost.shared.probe()), encoding: .utf8)) ?? "{}"
+                case "logs":
+                    resp = AXListLogsJSON()
+                case "log":
+                    /* {"cmd":"log","file":"agent","kb":5120}
+                       默认 5MB（上限 16MB）；file 可给 agent / axtouch / xxx.log */
+                    let name = (obj["file"] as? String) ?? "agent"
+                    let kb = (obj["kb"] as? Int) ?? 5120
+                    resp = AXReadLogJSON(name, kb)
                 case "load": AXLoadXCTestThread(); resp = "{\"ok\":true}"
                 case "server": AXStartWDAServerThread(nil); resp = "{\"ok\":true}"
                 default: resp = "{\"ok\":false,\"error\":\"unknown\"}"
                 }
             }
-            c.send(content: (resp + "\n").data(using: .utf8), completion: .contentProcessed { _ in })
+            conn.c.send(content: (resp + "\n").data(using: .utf8), completion: .contentProcessed { _ in })
         }
     }
 }
