@@ -1161,9 +1161,13 @@ extern "C" NSString *AXAgentShotLowLevel(int mode, double quality) {
 
         /* ★ 真实类名（之前按 "XCUILocalDeviceScreenshotIPCInterface" 猜一直是错的） */
         const char *ipcCls = object_getClassName(ipc);
-        ALog(@"  🔬 [shot2] datasource 类 = %s", object_getClassName(ds));
-        ALog(@"  🔬 [shot2] ipc 类 = %s", ipcCls);
-        AXDumpClass(@(ipcCls));
+        static BOOL shot2Dumped = NO;
+        if (!shot2Dumped) {
+            shot2Dumped = YES;
+            ALog(@"  🔬 [shot2] datasource 类 = %s", object_getClassName(ds));
+            ALog(@"  🔬 [shot2] ipc 类 = %s", ipcCls);
+            AXDumpClass(@(ipcCls));
+        }
 
         /* legacy 标志只是读一下，看当前值 */
         SEL legSel = NSSelectorFromString(@"useLegacyScreenshotPath");
@@ -1187,8 +1191,10 @@ extern "C" NSString *AXAgentShotLowLevel(int mode, double quality) {
         }
         if (!q) { ALog(@"  ⚠️ 没有 XCTImageQuality，用 nil"); }
 
-        CGRect rect = CGRectZero;          /* CGRectZero = 整屏（__XCUIFailWithError 那条路走的是它） */
-        if (mode == 1) rect = CGRectMake(0, 0, 0.5, 0.5);
+        /* ★ CGRectNull = 整屏；CGRectZero 会被 daemon 判成 "Empty screenshot requested."
+           （XCUIScreen 内部用的正是 CGRectNull —— 反汇编 0xf214 处 bl _CGRectIsNull） */
+        CGRect rect = CGRectNull;
+        if (mode == 1) rect = CGRectMake(0, 0, 200, 400);   /* 小区域试验，单位待验证 */
 
         SEL ri = NSSelectorFromString(@"initWithScreenID:rect:encoding:options:");
         if (![reqCls instancesRespondToSelector:ri]) { ALog(@"  ❌ 无 initWithScreenID:rect:encoding:options:"); return @"no init"; }
