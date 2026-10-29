@@ -87,6 +87,9 @@ static void ALog(NSString *fmt, ...) {
 
 #pragma mark - 动态调用小工具
 
+/* 定义在文件后部（录屏探针那节），这里先声明 */
+static void AXDumpClass(NSString *name);
+
 static void AXCallVoid(id obj, NSString *selName) {
     SEL sel = NSSelectorFromString(selName);
     if (!obj || ![obj respondsToSelector:sel]) return;
@@ -543,6 +546,8 @@ extern "C" BOOL AXAgentLongPress(double x, double y, double dur) {
 
 #pragma mark - 6. 截图（JPEG + 缩放，返回 base64）
 
+static BOOL gShotProbed = NO;
+
 extern "C" NSString *AXAgentShot(double maxSide, double quality) {
     if (!gReady) { ALog(@"❌ shot 失败：会话未就绪"); return nil; }
     @autoreleasepool {
@@ -557,19 +562,55 @@ extern "C" NSString *AXAgentShot(double maxSide, double quality) {
         SEL ss = NSSelectorFromString(@"screenshot");
         if (![screen respondsToSelector:ss]) { ALog(@"❌ shot: 无 screenshot 方法"); return nil; }
 
+        /* ===== 段1：截图请求（XCUIScreen → XCUIScreenshot 对象） ===== */
         CFTimeInterval t0 = CACurrentMediaTime();
         id shot = ((id (*)(id, SEL))objc_msgSend)(screen, ss);
+        CFTimeInterval t1 = CACurrentMediaTime();
         if (!shot) { ALog(@"❌ shot: screenshot 返回 nil"); return nil; }
 
+        /* 首次调用：把 shot 对象的家底摊开，并单独计时几个可能更快的取图方式 */
+        if (!gShotProbed) {
+            gShotProbed = YES;
+            ALog(@"  🔍 [shot 探测] screenshot 返回类 = %@", NSStringFromClass([shot class]));
+            AXDumpClass(NSStringFromClass([shot class]));
+
+            SEL sp = NSSelectorFromString(@"pngRepresentation");
+            if ([shot respondsToSelector:sp]) {
+                CFTimeInterval p0 = CACurrentMediaTime();
+                id png = ((id (*)(id, SEL))objc_msgSend)(shot, sp);
+                CFTimeInterval p1 = CACurrentMediaTime();
+                NSUInteger n = [png isKindOfClass:[NSData class]] ? [(NSData *)png length] : 0;
+                ALog(@"  🔍 [shot 探测] pngRepresentation → %@  %.1fKB  %.0fms",
+                     png ? NSStringFromClass([png class]) : @"nil",
+                     n / 1024.0, (p1 - p0) * 1000.0);
+            } else {
+                ALog(@"  🔍 [shot 探测] 无 pngRepresentation");
+            }
+
+            SEL cg = NSSelectorFromString(@"CGImage");
+            if ([shot respondsToSelector:cg]) {
+                CFTimeInterval p0 = CACurrentMediaTime();
+                id g = ((id (*)(id, SEL))objc_msgSend)(shot, cg);
+                CFTimeInterval p1 = CACurrentMediaTime();
+                ALog(@"  🔍 [shot 探测] CGImage → %@  %.0fms", g ? @"ok" : @"nil", (p1 - p0) * 1000.0);
+            } else {
+                ALog(@"  🔍 [shot 探测] 无 CGImage");
+            }
+        }
+
+        /* ===== 段2：解成 UIImage ===== */
+        CFTimeInterval t2a = CACurrentMediaTime();
         SEL im = NSSelectorFromString(@"image");
         id img = [shot respondsToSelector:im] ? ((id (*)(id, SEL))objc_msgSend)(shot, im) : nil;
+        CFTimeInterval t2b = CACurrentMediaTime();
         if (!img) { ALog(@"❌ shot: image 为 nil"); return nil; }
-        CFTimeInterval t1 = CACurrentMediaTime();
 
+        /* ===== 段3：缩放 ===== */
         UIImage *ui = (UIImage *)img;
         CGSize sz = ui.size;
         CGFloat longSide = MAX(sz.width, sz.height);
         UIImage *out = ui;
+        CFTimeInterval t3a = CACurrentMediaTime();
         if (maxSide > 0 && longSide > maxSide) {
             CGFloat k = maxSide / longSide;
             CGSize ns = CGSizeMake(round(sz.width * k), round(sz.height * k));
@@ -581,14 +622,19 @@ extern "C" NSString *AXAgentShot(double maxSide, double quality) {
                 [ui drawInRect:CGRectMake(0, 0, ns.width, ns.height)];
             }];
         }
+        CFTimeInterval t3b = CACurrentMediaTime();
+
+        /* ===== 段4：JPEG 编码 ===== */
         if (quality <= 0) quality = 0.6;
         NSData *jpeg = UIImageJPEGRepresentation(out, quality);
-        CFTimeInterval t2 = CACurrentMediaTime();
+        CFTimeInterval t4 = CACurrentMediaTime();
         if (!jpeg) { ALog(@"❌ shot: JPEG 编码失败"); return nil; }
-        ALog(@"  📷 shot %.0fx%.0f -> %.0fx%.0f  %luKB  抓图%.0fms 编码%.0fms",
+
+        ALog(@"  📷 shot %.0fx%.0f -> %.0fx%.0f %luKB | 请求%.0f 解码%.0f 缩放%.0f 编码%.0f ms",
              sz.width, sz.height, out.size.width, out.size.height,
              (unsigned long)(jpeg.length / 1024),
-             (t1 - t0) * 1000.0, (t2 - t1) * 1000.0);
+             (t1 - t0) * 1000.0, (t2b - t2a) * 1000.0,
+             (t3b - t3a) * 1000.0, (t4 - t3b) * 1000.0);
         return [jpeg base64EncodedStringWithOptions:0];
     }
 }
@@ -610,6 +656,19 @@ static void AXDumpClass(NSString *name) {
     }
     free(ms);
     ALog(@"     方法(%u): %@", n, sb.length ? sb : @"(无)");
+
+    /* ★ b44：类方法（metaclass）单独 dump —— sharedClient 这类工厂方法全在这里，
+       只看实例方法会误判"类里没有 sharedClient" */
+    Class meta = object_getClass(cls);
+    unsigned int mn = 0;
+    Method *mms = class_copyMethodList(meta, &mn);
+    NSMutableString *sm = [NSMutableString string];
+    for (unsigned i = 0; i < mn; i++) {
+        [sm appendFormat:@"+%@ |", NSStringFromSelector(method_getName(mms[i]))];
+        if (sm.length > 700) break;
+    }
+    free(mms);
+    ALog(@"     类方法(%u): %@", mn, sm.length ? sm : @"(无)");
 
     unsigned int ivn = 0;
     Ivar *iv = class_copyIvarList(cls, &ivn);
@@ -769,6 +828,59 @@ static void AXDumpNode(id elem, int depth, int *count, int maxNodes) {
     }
 }
 
+/* 路线 B：直接用 XCUIApplication 拿 accessibilityElement（不走 XCAXClient_iOS） */
+static id AXElementViaXCUIApplication(void) {
+    Class appCls = NSClassFromString(@"XCUIApplication");
+    if (!appCls) { ALog(@"  · XCUIApplication 不存在"); return nil; }
+
+    SEL sAlloc = NSSelectorFromString(@"alloc");
+    SEL sInitBid = NSSelectorFromString(@"initWithBundleIdentifier:");
+    SEL sInit = NSSelectorFromString(@"init");
+    SEL sAccEl = NSSelectorFromString(@"accessibilityElement");
+
+    /* B1: initWithBundleIdentifier: */
+    if ([appCls instancesRespondToSelector:sInitBid]) {
+        for (NSString *bid in @[@"com.apple.springboard"]) {
+            @try {
+                id obj = ((id (*)(id, SEL))objc_msgSend)(appCls, sAlloc);
+                id app = ((id (*)(id, SEL, id))objc_msgSend)(obj, sInitBid, bid);
+                ALog(@"  · XCUIApplication(%@) = %@", bid, app ? @"ok" : @"nil");
+                if (!app) continue;
+                ALog(@"     respondsToSelector(accessibilityElement) = %d",
+                     (int)[app respondsToSelector:sAccEl]);
+                if ([app respondsToSelector:sAccEl]) {
+                    id el = ((id (*)(id, SEL))objc_msgSend)(app, sAccEl);
+                    ALog(@"     accessibilityElement → %@",
+                         el ? NSStringFromClass([el class]) : @"nil");
+                    if (el) return el;
+                }
+            } @catch (NSException *e) {
+                ALog(@"  · XCUIApplication(%@) 异常: %@ / %@", bid, e.name, e.reason);
+            }
+        }
+    } else {
+        ALog(@"  · XCUIApplication 无 initWithBundleIdentifier:");
+    }
+
+    /* B2: 无参 init（用测试配置里的 target） */
+    if ([appCls instancesRespondToSelector:sInit]) {
+        @try {
+            id obj = ((id (*)(id, SEL))objc_msgSend)(appCls, sAlloc);
+            id app = ((id (*)(id, SEL))objc_msgSend)(obj, sInit);
+            ALog(@"  · XCUIApplication() = %@", app ? @"ok" : @"nil");
+            if (app && [app respondsToSelector:sAccEl]) {
+                id el = ((id (*)(id, SEL))objc_msgSend)(app, sAccEl);
+                ALog(@"     accessibilityElement → %@",
+                     el ? NSStringFromClass([el class]) : @"nil");
+                if (el) return el;
+            }
+        } @catch (NSException *e) {
+            ALog(@"  · XCUIApplication() 异常: %@ / %@", e.name, e.reason);
+        }
+    }
+    return nil;
+}
+
 /* 读当前可达的 AX 元素树。maxNodes 限制节点数（防止界面复杂时刷爆日志）。
    返回摘要字符串；详细内容写 agent.log。 */
 extern "C" NSString *AXAgentDumpTree(int maxNodes) {
@@ -776,50 +888,68 @@ extern "C" NSString *AXAgentDumpTree(int maxNodes) {
     ALog(@"===== 节点树读取开始（max=%d）=====", maxNodes);
     if (!gReady) { ALog(@"❌ 会话未就绪"); return @"not ready"; }
 
-    Class axCls = NSClassFromString(@"XCAXClient_iOS");
-    if (!axCls) { ALog(@"❌ XCAXClient_iOS 不存在"); return @"no XCAXClient"; }
-
     /* 无论成败都先把类结构摊开，方法名就是下次要用的线索 */
+    ALog(@"--- 类结构 ---");
     AXDumpClass(@"XCAXClient_iOS");
+    AXDumpClass(@"XCUIApplication");
+    AXDumpClass(@"XCUIRemoteAccessibilityInterface");
+    AXDumpClass(@"XCUIApplicationProcessTracker");
     AXDumpClass(@"XCAccessibilityElement");
 
-    id client = AXShared(axCls, @[@"sharedClient"]);
-    if (!client) { ALog(@"❌ sharedClient 为空"); return @"no client"; }
-
-    /* 1) 无参方法：拿焦点应用 / 系统根 */
     id root = nil;
-    NSArray *probes = @[@"focusedApplication", @"frontmostApplication",
-                        @"systemWideElement", @"applicationElement"];
-    for (NSString *n in probes) {
-        SEL s = NSSelectorFromString(n);
-        if (![client respondsToSelector:s]) { ALog(@"  · %@ 不存在", n); continue; }
-        @try {
-            id (*fp)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
-            id r = fp(client, s);
-            ALog(@"  · %@ → %@", n, r ? NSStringFromClass([r class]) : @"nil");
-            if (r && !root) root = r;
-        } @catch (NSException *e) { ALog(@"  · %@ 异常: %@", n, e.reason); }
-    }
 
-    /* 2) 带 pid 的方法：先用自己进程验证通道是否通 */
-    if (!root) {
-        SEL sp = NSSelectorFromString(@"accessibilityElementForPid:");
-        if ([client respondsToSelector:sp]) {
+    /* 路线 A：XCAXClient_iOS 单例 / 手工 init */
+    Class axCls = NSClassFromString(@"XCAXClient_iOS");
+    if (axCls) {
+        id client = AXShared(axCls, @[@"sharedClient", @"defaultClient",
+                                      @"currentClient", @"client"]);
+        if (!client) {
             @try {
-                id (*fp)(id, SEL, int) = (id (*)(id, SEL, int))objc_msgSend;
-                id r = fp(client, sp, (int)getpid());
-                ALog(@"  · accessibilityElementForPid(%d) → %@", (int)getpid(),
-                     r ? NSStringFromClass([r class]) : @"nil");
-                if (r) root = r;
-            } @catch (NSException *e) { ALog(@"  · pid 版异常: %@", e.reason); }
-        } else {
-            ALog(@"  · accessibilityElementForPid: 不存在");
+                id obj = ((id (*)(id, SEL))objc_msgSend)(axCls, NSSelectorFromString(@"alloc"));
+                SEL ini = NSSelectorFromString(@"init");
+                if ([obj respondsToSelector:ini]) {
+                    id c2 = ((id (*)(id, SEL))objc_msgSend)(obj, ini);
+                    ALog(@"  · XCAXClient_iOS alloc/init → %@",
+                         c2 ? NSStringFromClass([c2 class]) : @"nil");
+                    client = c2;
+                }
+            } @catch (NSException *e) {
+                ALog(@"  · XCAXClient_iOS alloc/init 异常: %@ / %@", e.name, e.reason);
+            }
+        }
+        if (client) {
+            for (NSString *n in @[@"focusedApplication", @"frontmostApplication",
+                                  @"systemWideElement", @"applicationElement"]) {
+                SEL s = NSSelectorFromString(n);
+                if (![client respondsToSelector:s]) { ALog(@"  · %@ 不存在", n); continue; }
+                @try {
+                    id r = ((id (*)(id, SEL))objc_msgSend)(client, s);
+                    ALog(@"  · %@ → %@", n, r ? NSStringFromClass([r class]) : @"nil");
+                    if (r && !root) root = r;
+                } @catch (NSException *e) { ALog(@"  · %@ 异常: %@", n, e.reason); }
+            }
+            if (!root) {
+                SEL sp = NSSelectorFromString(@"accessibilityElementForPid:");
+                if ([client respondsToSelector:sp]) {
+                    @try {
+                        id r = ((id (*)(id, SEL, int))objc_msgSend)(client, sp, (int)getpid());
+                        ALog(@"  · accessibilityElementForPid(%d) → %@", (int)getpid(),
+                             r ? NSStringFromClass([r class]) : @"nil");
+                        if (r) root = r;
+                    } @catch (NSException *e) { ALog(@"  · pid 版异常: %@", e.reason); }
+                }
+            }
         }
     }
 
-    if (!root) { ALog(@"❌ 拿不到根元素"); return @"no element"; }
+    /* 路线 B：XCUIApplication（XCAXClient_iOS 拿不到时的备用通道） */
+    if (!root) {
+        ALog(@"--- 路线 B: XCUIApplication ---");
+        root = AXElementViaXCUIApplication();
+    }
 
-    /* 3) 递归打印 */
+    if (!root) { ALog(@"❌ 两条路线都没拿到根元素"); return @"no element"; }
+
     int count = 0;
     AXDumpNode(root, 0, &count, maxNodes);
     ALog(@"===== 节点树结束：共 %d 个节点 =====", count);
