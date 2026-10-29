@@ -26,16 +26,14 @@ static NSString *describeCPP(std::exception_ptr ep) {
 
 extern "C" NSString *AXSafeCall(void (^block)(void)) {
     @try {
-        try {
-            block();
-            return nil;
-        } catch (...) {
-            return describeCPP(std::current_exception());
-        }
+        block();
+        return nil;
     } @catch (NSException *e) {
-        return [NSString stringWithFormat:@"NSException %@: %@", e.name, e.reason];
+        // NSException 必须最先匹配（ObjC 异常在底层也是 C++ 异常，catch(...) 会把它吃掉）
+        return [NSString stringWithFormat:@"NSException [%@] reason: %@\nstack:\n%@",
+                e.name, e.reason, [e.callStackSymbols componentsJoinedByString:@"\n"]];
     } @catch (...) {
-        return @"ObjC 未知异常";
+        return describeCPP(std::current_exception());
     }
 }
 
