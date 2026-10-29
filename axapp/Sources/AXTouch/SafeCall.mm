@@ -267,6 +267,15 @@ extern "C" NSString *AXScanLoopbackPorts(void) {
 // 1) 检查 /Developer/Library/Frameworks/XCTest.framework 是否存在（DDI 挂载标志）
 // 2) mDNS 查询 com.apple.internal.dt.coredevice.untrusted.tunnelservice（本机回环）
 // 3) 列出本机所有网卡的 IPv6 地址（AScript 用 ::1 + mDNS 找端点）
+
+static void bootstrapBrowseReply(DNSServiceRef sref, DNSServiceFlags flags, uint32_t idx,
+                                 DNSServiceErrorType err, const char *name, const char *type,
+                                 const char *domain, void *ctx) {
+    if (err == kDNSServiceErr_NoError) {
+        NSLog(@"[Bootstrap] mDNS: %s (%s)", name, type);
+    }
+}
+
 extern "C" NSString *AXBootstrapProbe(void) {
     NSMutableString *out = [NSMutableString string];
 
@@ -301,22 +310,26 @@ extern "C" NSString *AXBootstrapProbe(void) {
 
     // 3) mDNS 查询 untrusted.tunnelservice（异步，5 秒窗口）
     [out appendString:@"== mDNS 查询 untrusted.tunnelservice（5 秒）==\n"];
-    dispatch_group_t g = dispatch_group_create();
-    dispatch_group_enter(g);
-    __block DNSServiceRef sd = NULL;
-    DNSServiceBrowse(&sd, 0, 0, "_remoted._tcp", "local",
-                     ^(DNSServiceRef sref, DNSServiceFlags flags, uint32_t idx,
-                       DNSServiceErrorType err, const char *name, const char *type, const char *domain, void *ctx) {
-        if (err == kDNSServiceErr_NoError) {
-            NSLog(@"[Bootstrap] mDNS 发现: %s (%s)", name, type);
+    DNSServiceRef sd = NULL;
+    DNSServiceErrorType berr = DNSServiceBrowse(&sd, 0, 0, "_remoted._tcp", "local",
+                     (DNSServiceBrowseReply)bootstrapBrowseReply, NULL);
+    if (berr != kDNSServiceErr_NoError) {
+        [out appendFormat:@"mDNS Browse 失败 err=%d\n", berr];
+    } else {
+        int dnsfd = DNSServiceRefSockFD(sd);
+        if (dnsfd >= 0) {
+            fd_set rset;
+            struct timeval tv;
+            for (int i = 0; i < 50; i++) {
+                FD_ZERO(&rset); FD_SET(dnsfd, &rset);
+                tv.tv_sec = 0; tv.tv_usec = 100000;
+                if (select(dnsfd + 1, &rset, NULL, NULL, &tv) > 0) {
+                    DNSServiceProcessResult(sd);
+                }
+            }
         }
-    }, NULL);
-    // 5 秒后停止
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
         if (sd) DNSServiceRefDeallocate(sd);
-        dispatch_group_leave(g);
-    });
-    dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC));
+    }
     [out appendString:@"mDNS 窗口结束\n"];
     return out;
 }
