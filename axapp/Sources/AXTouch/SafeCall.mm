@@ -173,7 +173,7 @@ extern "C" NSString *AXTestLockdownTCP(void) {
         close(fd);
         return [NSString stringWithFormat:@"❌ connect [::1]:49152 errno=%d (%s)", e, strerror(e)];
     }
-    [out appendFormat:@"✅ TCP connect [::1]:62078 成功！lockdown 监听 loopback\n"];
+    [out appendFormat:@"✅ TCP connect [::1]:49152 成功！lockdown loopback 端口\n"];
     NSDictionary *q = @{@"Label": @"axtouch-poc", @"Request": @"QueryType"};
     NSData *pl = [NSPropertyListSerialization dataWithPropertyList:q format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
     uint32_t len = htonl((uint32_t)pl.length);
