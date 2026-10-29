@@ -3,9 +3,13 @@
 #include <exception>
 #include <string>
 #include <cxxabi.h>
+#ifdef __cplusplus
 
 // ObjC++ 文件：既能捕 NSException 也能捕 C++ 异常
 // （XCTest 内部抛的是 C++ 异常 → std::terminate → abort，纯 .m 里的 @catch(...) 抓不到）
+
+extern "C" {
+#endif
 
 static NSString *describeCPP(std::exception_ptr ep) {
     if (!ep) return @"(no exception_ptr)";
@@ -24,7 +28,7 @@ static NSString *describeCPP(std::exception_ptr ep) {
 }
 
 /// 通用安全调用：返回 nil = 成功，否则返回原因。
-NSString *AXSafeCall(void (^block)(void)) {
+extern "C" NSString *AXSafeCall(void (^block)(void)) {
     @try {
         try {
             block();
@@ -40,7 +44,7 @@ NSString *AXSafeCall(void (^block)(void)) {
 }
 
 /// 探测 XCTRunnerDaemonSession.sharedSession
-NSString *AXProbeDaemonSession(void) {
+extern "C" NSString *AXProbeDaemonSession(void) {
     Class cls = NSClassFromString(@"XCTRunnerDaemonSession");
     if (cls == Nil) return @"XCTRunnerDaemonSession 类不存在（框架未加载）";
     __block id session = nil;
@@ -52,7 +56,7 @@ NSString *AXProbeDaemonSession(void) {
 }
 
 /// 启动 FBWebServer（WDA HTTP 服务器）
-NSString *AXStartWDAServer(void) {
+extern "C" NSString *AXStartWDAServer(void) {
     Class cls = NSClassFromString(@"FBWebServer");
     if (cls == Nil) return @"FBWebServer 类不存在";
     __block id server = nil;
@@ -75,7 +79,7 @@ NSString *AXStartWDAServer(void) {
 
 /// 常驻线程启动 WDA server：线程永不退出，autoreleasepool 永不 pop，
 /// WebDriverAgentLib 内部的 NSXPCConnection 就不会被释放（避免 _xpc_api_misuse 崩溃）。
-void AXStartWDAServerThread(NSString **outLog) {
+extern "C" void AXStartWDAServerThread(NSString **outLog) {
     NSThread *t = [[NSThread alloc] initWithBlock:^{
         NSString *err = AXStartWDAServer();
         if (outLog) { *outLog = err ? [NSString stringWithFormat:@"❌ %@", err]
