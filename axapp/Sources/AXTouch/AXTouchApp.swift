@@ -163,6 +163,12 @@ struct ContentView: View {
                     log = r
                 }
                     .buttonStyle(.bordered)
+                Button("6 lockdown") {
+                    let r = AXTestLockdownTCP() ?? "nil"
+                    WDAHost.shared.append(r)
+                    log = r
+                }
+                    .buttonStyle(.bordered)
                 Button("4 服务") { AXStartWDAServerThread(nil); log = "服务已在常驻线程启动\nPC 验证: curl http://手机IP:8100/status" }
                     .buttonStyle(.borderedProminent)
             }
