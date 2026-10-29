@@ -19,9 +19,9 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: AXTouch-b24
+        CFBundleDisplayName: AXTouch-b25
         CFBundleShortVersionString: "2.0"
-        CFBundleVersion: "24"
+        CFBundleVersion: "25"
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
