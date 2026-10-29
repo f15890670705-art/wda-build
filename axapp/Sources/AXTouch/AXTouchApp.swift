@@ -6,8 +6,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "49"
-    static let tag = "v2.0-b49"
+    static let build = "50"
+    static let tag = "v2.0-b50"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -262,6 +262,23 @@ final class ControlServer {
                         resp = "{\"ok\":true,\"jpeg\":\"\(r2)\"}"
                     } else {
                         resp = "{\"ok\":false,\"error\":\"\(r2)\"}"
+                    }
+                case "stream":
+                    /* {"cmd":"stream","op":"start|stop|status"} */
+                    let op = (obj["op"] as? String) ?? "status"
+                    if op == "start" {
+                        let port = UInt16((obj["port"] as? Int) ?? 27184)
+                        if let br = obj["bitrate"] as? Int { AXStreamSetParams(Int32(br), 0, 0) }
+                        if let fp = obj["fps"] as? Int { AXStreamSetParams(0, Int32(fp), 0) }
+                        if let ms = obj["maxSide"] as? Int { AXStreamSetParams(0, 0, Int32(ms)) }
+                        let ok = AXStreamStart(port)
+                        resp = "{\"ok\":\(ok)}"
+                    } else if op == "stop" {
+                        AXStreamStop()
+                        resp = "{\"ok\":true}"
+                    } else {
+                        let st = AXStreamStats()
+                        resp = (try? String(data: JSONSerialization.data(withJSONObject: st), encoding: .utf8)) ?? "{}"
                     }
                 case "tree":
                     /* {"cmd":"tree","max":120} → 读 AX 元素树，详情写 agent.log */
