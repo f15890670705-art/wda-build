@@ -446,20 +446,18 @@ extern "C" BOOL AXAgentTap(double x, double y) {
         void (*fp3)(id, SEL, id) = (void (*)(id, SEL, id))objc_msgSend;
         fp3(rec, addPath, path);
 
-        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
-        __block NSString *replyDesc = @"(无 reply)";
+        // completion 块绝不能捕获任何 ObjC 对象（__block 变量在函数返回后会失效，
+        // XPC 回调再来时 objc_retain 野指针直接 SIGSEGV —— b35/b36 就是这个崩的）
+        void (^completion)(id) = ^(id err) { /* 空，只为满足 ABI */ };
         SEL syn = NSSelectorFromString(@"synthesizeEvent:completion:");
         if (![gSession respondsToSelector:syn]) {
             ALog(@"❌ tap：daemonSession 无 synthesizeEvent:completion:");
             return NO;
         }
         void (*fp4)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
-        fp4(gSession, syn, rec, ^(id err) {
-            replyDesc = err ? @"返回错误对象" : @"(nil=成功)";
-            dispatch_semaphore_signal(sem);
-        });
-        long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
-        ALog(@"  tap(%.1f, %.1f) -> reply=%@ timeout=%@", x, y, replyDesc, waited ? @"YES" : @"NO");
+        fp4(gSession, syn, rec, completion);
+        [NSThread sleepForTimeInterval:0.4];
+        ALog(@"  ✅ tap(%.1f, %.1f) 已提交合成事件", x, y);
         return YES;
     } @catch (NSException *e) {
         ALog(@"❌ tap 异常: %@ / %@", e.name, e.reason);
