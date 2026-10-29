@@ -19,9 +19,9 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: AXTouch-b39
+        CFBundleDisplayName: hbVideo
         CFBundleShortVersionString: "2.0"
-        CFBundleVersion: "39"
+        CFBundleVersion: "41"
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
@@ -30,7 +30,7 @@ targets:
         NSLocalNetworkUsageDescription: AXTouch needs local network for control
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.aojoy.ascript.ios
+        PRODUCT_BUNDLE_IDENTIFIER: com.heibai.video.core
         PRODUCT_NAME: AXTouch
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
