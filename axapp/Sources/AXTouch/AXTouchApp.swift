@@ -59,8 +59,29 @@ final class WDAHost {
         }
     }
 
-    /// 启动 WDA 的 HTTP server（FBWebServer.startHTTPServer）
+    /// 启动 WDA 的 HTTP server（FBWebServer.startHTTPServer）——用 ObjC 包装捕获 NSException
     func startServer() {
+        loadAll()
+        setenv("USE_PORT", "8100", 1)
+        setenv("MJPEG_SERVER_PORT", "9100", 1)
+        // 先探 daemon session（拿到异常原因）
+        if let e = AXProbeDaemonSession() {
+            append("⚠️ XCTRunnerDaemonSession 异常: ")
+            append(e)
+        } else {
+            append("✅ XCTRunnerDaemonSession.sharedSession 成功！")
+        }
+        // 再起 server
+        if let err = AXStartWDAServer() {
+            append("❌ startHTTPServer 异常:")
+            append(err)
+            return
+        }
+        serverStarted = true
+        append("✅ FBWebServer.startHTTPServer 已调用（8100）")
+    }
+
+    private func legacyStartServer() {
         loadAll()
         guard objc_getClass("FBWebServer") != nil else {
             append("❌ FBWebServer 类不存在（WebDriverAgentLib 未加载成功）")
