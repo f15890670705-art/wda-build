@@ -16,6 +16,12 @@ targets:
       - path: Sources/AXTouch/Frameworks
         type: folder
         buildPhase: resources
+    # H.264 推流需要的系统框架（AXAgent.mm 里用 VideoToolbox 编码）
+    dependencies:
+      - sdk: VideoToolbox.framework
+      - sdk: CoreMedia.framework
+      - sdk: CoreVideo.framework
+      - sdk: ImageIO.framework
     info:
       path: Info.plist
       properties:
