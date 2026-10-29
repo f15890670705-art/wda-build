@@ -5,11 +5,30 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "26"
-    static let tag = "v2.0-b26"
+    static let build = "27"
+    static let tag = "v2.0-b27"
 }
 
-/// 分步加载：启动只开 socket，其余全部手动触发，崩溃点一目了然。
+/// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
+enum FileLog {
+    static let path: String = {
+        let docs = NSSearchPathForDirectoriesInDomains(.documentDirectory, .userDomainMask, true).first ?? "/tmp"
+        return docs + "/axtouch.log"
+    }()
+
+    static func write(_ s: String) {
+        let line = "\(Date()) [\(BuildInfo.tag)] \(s)\n"
+        if let fh = FileHandle(forWritingAtPath: path) {
+            fh.seekToEndOfFile()
+            fh.write(line.data(using: .utf8) ?? Data())
+            fh.closeFile()
+        } else {
+            try? line.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+}
+
+/// 分步加载。框架加载与 WDA 服务全部走常驻线程（XPC 保活）。
 final class WDAHost {
     static let shared = WDAHost()
     private(set) var log: [String] = []
@@ -19,7 +38,8 @@ final class WDAHost {
 
     func append(_ s: String) {
         log.append(s)
-        NSLog("[WDHost] %@@", s)   // NSLog 才进 syslog，print 不进
+        NSLog("[WDHost] %@", s)
+        FileLog.write(s)
     }
 
     func clear() { log.removeAll() }
@@ -28,14 +48,12 @@ final class WDAHost {
 
     var loadedCount: Int { loaded.count }
 
-    /// 第 1 步：只加载 AXRuntime（最轻量，验证 dlopen 本身没问题）
     func loadAXOnly() {
         let p = fwDir + "/AXRuntime.framework/AXRuntime"
         if dlopen(p, RTLD_NOW) != nil {
             append("✅[1] AXRuntime（内嵌）")
             return
         }
-        // 内嵌没有就用系统的
         if dlopen("/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime", RTLD_NOW) != nil {
             append("✅[1] AXRuntime（系统）")
         } else {
@@ -43,83 +61,14 @@ final class WDAHost {
         }
     }
 
-    /// 第 2 步：加载 XCTest 全套 + WebDriverAgentLib
-    func loadXCTest() {
-        setenv("DYLD_FRAMEWORK_PATH", fwDir, 1)
-        let order = ["Testing", "XCTestCore", "XCTAutomationSupport", "XCTest",
-                     "XCTestSupport", "XCUIAutomation", "XCUnit", "WebDriverAgentLib"]
-        for name in order {
-            let path = "\(fwDir)/\(name).framework/\(name)"
-            dlerror()
-            if let h = dlopen(path, RTLD_NOW | RTLD_GLOBAL) {
-                loaded[name] = h
-                append("✅[2] \(name)")
-            } else if let e = dlerror() {
-                append("❌[2] \(name): \(String(cString: e).prefix(120))")
-            } else {
-                append("❌[2] \(name)")
-            }
-        }
-        frameworksLoaded = objc_getClass("FBWebServer") != nil
-        append(frameworksLoaded ? "✅[2] FBWebServer 类已注册" : "❌[2] FBWebServer 类缺失")
-    }
-
-    /// 第 3 步：探测 XCTRunnerDaemonSession（捕获异常原因）
-    func probeSession() {
-        append("--- 探测 XCTRunnerDaemonSession ---")
+    func probeSessionMainThread_forbidden() {
+        append("--- 探测 XCTRunnerDaemonSession（主线程，已知有 XPC 释放风险）---")
         if let e = AXProbeDaemonSession() {
             append("⚠️[3] 异常:")
             append(String(e.prefix(600)))
         } else {
             append("✅[3] sharedSession 成功")
         }
-    }
-
-    /// 第 4 步：启动 WDA HTTP server（常驻线程版，保住 XPC 连接）
-    func startServer() {
-        self.loadXCTest()
-        setenv("USE_PORT", "8100", 1)
-        setenv("MJPEG_SERVER_PORT", "9100", 1)
-        AXStartWDAServerThread(nil)
-        self.append("--- 常驻线程已启动（3 秒后 8100 应就绪）---")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            self.append("尝试连接验证: curl http://手机IP:8100/status")
-        }
-    }
-
-    private func legacyStartServer() {
-        append("--- 4a 测试本机 socket ---")
-        for sockPath in ["/var/run/usbmuxd", "/var/run/lockdown.sock"] {
-            let fd = socket(AF_UNIX, SOCK_STREAM, 0)
-            guard fd >= 0 else { append("❌ socket() 失败 errno=\(errno)"); continue }
-            var addr = sockaddr_un()
-            addr.sun_family = sa_family_t(AF_UNIX)
-            let pathBytes = Array(sockPath.utf8CString)
-            withUnsafeMutableBytes(of: &addr.sun_path) { dest in
-                let cnt = min(pathBytes.count, dest.count - 1)
-                dest.baseAddress!.copyMemory(from: Array(pathBytes.prefix(cnt)), byteCount: cnt)
-            }
-            let r = withUnsafePointer(to: &addr) { ptr in
-                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                    connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
-                }
-            }
-            if r == 0 {
-                append("✅[4] connect \(sockPath) 成功!!")
-                close(fd)
-            } else {
-                append("❌[4] connect \(sockPath) errno=\(errno) (\(String(cString: strerror(errno))))")
-                close(fd)
-            }
-        }
-        append("--- 4b 启动 FBWebServer ---")
-        if let err = AXStartWDAServer() {
-            append("❌[4] 异常:")
-            append(String(err.prefix(600)))
-            return
-        }
-        serverStarted = true
-        append("✅[4] startHTTPServer 已调用")
     }
 
     func probe() -> [String: Any] {
@@ -130,6 +79,7 @@ final class WDAHost {
             cls[c] = objc_getClass(c) != nil
         }
         out["classes"] = cls
+        out["logfile"] = FileLog.path
         return out
     }
 }
@@ -173,8 +123,8 @@ final class ControlServer {
                 case "ping": resp = "{\"ok\":true,\"tag\":\"\(BuildInfo.tag)\"}"
                 case "probe":
                     resp = (try? String(data: JSONSerialization.data(withJSONObject: WDAHost.shared.probe()), encoding: .utf8)) ?? "{}"
-                case "load": WDAHost.shared.loadXCTest(); resp = "{\"ok\":true}"
-                case "server": WDAHost.shared.startServer(); resp = "{\"ok\":true}"
+                case "load": AXLoadXCTestThread(); resp = "{\"ok\":true}"
+                case "server": AXStartWDAServerThread(nil); resp = "{\"ok\":true}"
                 default: resp = "{\"ok\":false,\"error\":\"unknown\"}"
                 }
             }
@@ -196,18 +146,18 @@ struct ContentView: View {
     var body: some View {
         VStack(spacing: 8) {
             Text("AXTouch \(BuildInfo.tag)").font(.title2).bold()
-            Text("TCP 0.0.0.0:10010  |  \(WDAHost.shared.loadedCount) 个框架")
+            Text("TCP 0.0.0.0:10010  |  日志: Documents/axtouch.log")
                 .font(.system(size: 10, design: .monospaced))
                 .foregroundColor(.secondary)
 
             HStack(spacing: 6) {
                 Button("1 AX") { WDAHost.shared.loadAXOnly(); log = WDAHost.shared.log.joined(separator: "\n") }
                     .buttonStyle(.bordered)
-                Button("2 框架") { AXLoadXCTestThread(); log = "框架加载已转常驻线程（设备日志可见进度）" }
+                Button("2 框架") { AXLoadXCTestThread(); log = "已转常驻线程加载（结果看 axtouch.log / syslog）" }
                     .buttonStyle(.bordered)
-                Button("3 Session") { AXProbeDaemonSession(); log = "探测已转常驻线程，结果看设备日志" }
+                Button("3 Session") { WDAHost.shared.probeSessionMainThread_forbidden(); log = WDAHost.shared.log.joined(separator: "\n") }
                     .buttonStyle(.bordered)
-                Button("4 服务") { AXStartWDAServerThread(nil); log = "服务在常驻线程启动（连接验证: PC curl 手机IP:8100/status）" }
+                Button("4 服务") { AXStartWDAServerThread(nil); log = "服务已在常驻线程启动\nPC 验证: curl http://手机IP:8100/status" }
                     .buttonStyle(.borderedProminent)
             }
             .font(.system(size: 12))
@@ -225,7 +175,8 @@ struct ContentView: View {
         .padding()
         .onAppear {
             ControlServer().start(port: 10010)
-            log = "AXTouch \(BuildInfo.tag) 已启动\nTCP 10010 就绪\n请按 1→2→3→4 顺序点"
+            WDAHost.shared.append("App 启动 \(BuildInfo.tag)，日志文件: \(FileLog.path)")
+            log = WDAHost.shared.log.joined(separator: "\n")
         }
     }
 }
