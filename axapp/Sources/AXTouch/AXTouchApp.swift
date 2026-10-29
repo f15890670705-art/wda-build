@@ -6,8 +6,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "40"
-    static let tag = "v2.0-b40"
+    static let build = "41"
+    static let tag = "v2.0-b41"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -195,84 +195,30 @@ struct AXTouchApp: App {
     }
 }
 
+/// UIKit 主界面（AXMainViewController，照 ios-daemon 卡片式 UI）挂进 SwiftUI
+struct AXUIKitHost: UIViewControllerRepresentable {
+    func makeUIViewController(context: Context) -> UIViewController {
+        AXMakeRootController()
+    }
+    func updateUIViewController(_ uiViewController: UIViewController, context: Context) {}
+}
+
 struct ContentView: View {
-    @State private var log = "就绪"
-    @State private var agentReady = false
-    private let readyTimer = Timer.publish(every: 1, on: .main, in: .common).autoconnect()
+    /// 只在首帧启动一次服务与会话，避免 SwiftUI 重复重建 body 时重复起监听
+    @State private var booted = false
 
     var body: some View {
-        VStack(spacing: 8) {
-            Text("AXTouch \(BuildInfo.tag)").font(.title2).bold()
-            Text(agentReady ? "AGENT READY ✅  (Automation 会话已建立)" : "AGENT —  正在建立会话…")
-                .font(.system(size: 13, weight: .bold, design: .monospaced))
-                .foregroundColor(agentReady ? .green : .orange)
-            Text("TCP 0.0.0.0:10010  |  日志: Documents/agent.log + axtouch.log")
-                .font(.system(size: 10, design: .monospaced))
-                .foregroundColor(.secondary)
-
-            HStack(spacing: 6) {
-                Button("1 AX") { WDAHost.shared.loadAXOnly(); log = WDAHost.shared.log.joined(separator: "\n") }
-                    .buttonStyle(.bordered)
-                Button("2 框架") { AXLoadXCTestThread(); log = "已转常驻线程加载（结果看 axtouch.log / syslog）" }
-                    .buttonStyle(.bordered)
-                Button("3 Session") { WDAHost.shared.probeSessionMainThread_forbidden(); log = WDAHost.shared.log.joined(separator: "\n") }
-                    .buttonStyle(.bordered)
-                Button("7 boot") {
-                    DispatchQueue.global().async {
-                        let r = AXBootstrapProbe() ?? "nil"
-                        WDAHost.shared.append(r)
-                        FileLog.write(r)
-                    }
+        AXUIKitHost()
+            .ignoresSafeArea()          // VC 内部用 safeAreaLayoutGuide 自己避让
+            .onAppear {
+                guard !booted else { return }
+                booted = true
+                ControlServer().start(port: 10010)
+                WDAHost.shared.append("App 启动 \(BuildInfo.tag)，日志文件: \(FileLog.path)")
+                // 自动执行 AXAgent bootstrap（复刻 ASAgen：DDI 框架 → daemon session → 自动化模式）
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                    AXAgentStartSticky()   // 常驻线程里 bootstrap，XPC 连接不会被释放
                 }
-                    .buttonStyle(.bordered)
-                Button("5 sock") {
-                    let r = AXTestLocalSocket() ?? "nil"
-                    WDAHost.shared.append(r)
-                    log = r
-                }
-                    .buttonStyle(.bordered)
-                Button("7 扫描") {
-                    DispatchQueue.global().async {
-                        let r = AXScanLoopbackPorts() ?? "nil"
-                        WDAHost.shared.append("::1 可达端口: \(r)")
-                        FileLog.write("::1 端口扫描结果: \(r)")
-                    }
-                }
-                    .buttonStyle(.bordered)
-                Button("6 lockdown") {
-                    let r = AXTestLockdownTCP() ?? "nil"
-                    WDAHost.shared.append(r)
-                    log = r
-                }
-                    .buttonStyle(.bordered)
-                Button("4 服务") { AXStartWDAServerThread(nil); log = "服务已在常驻线程启动\nPC 验证: curl http://手机IP:8100/status" }
-                    .buttonStyle(.borderedProminent)
             }
-            .font(.system(size: 12))
-
-            ScrollView {
-                Text(log)
-                    .font(.system(size: 10, design: .monospaced))
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(6)
-            }
-            .frame(maxHeight: .infinity)
-            .background(Color.black.opacity(0.85))
-            .foregroundColor(.green)
-        }
-        .padding()
-        .onAppear {
-            ControlServer().start(port: 10010)
-            WDAHost.shared.append("App 启动 \(BuildInfo.tag)，日志文件: \(FileLog.path)")
-            // 自动执行 AXAgent bootstrap（复刻 ASAgen：DDI 框架 → daemon session → 自动化模式）
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                AXAgentStartSticky()   // 常驻线程里 bootstrap，XPC 连接不会被释放
-                log = WDAHost.shared.log.joined(separator: "\n")
-            }
-            log = WDAHost.shared.log.joined(separator: "\n")
-        }
-        .onReceive(readyTimer) { _ in
-            agentReady = AXAgentIsReady()
-        }
     }
 }
