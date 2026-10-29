@@ -24,7 +24,7 @@ jobs:
           xcodebuild -project AXTouch.xcodeproj -scheme AXTouch \
             -sdk iphoneos -configuration Release -derivedDataPath dd \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
-            ARCHS=arm64 build 2>&1 | tail -40
+            ARCHS=arm64 build 2>&1 | tail -200
           test -f dd/Build/Products/Release-iphoneos/AXTouch.app/AXTouch
           mkdir -p Payload
           cp -R dd/Build/Products/Release-iphoneos/AXTouch.app Payload/
