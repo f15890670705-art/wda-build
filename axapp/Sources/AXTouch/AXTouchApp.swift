@@ -157,6 +157,14 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
                 Button("3 Session") { WDAHost.shared.probeSessionMainThread_forbidden(); log = WDAHost.shared.log.joined(separator: "\n") }
                     .buttonStyle(.bordered)
+                Button("7 boot") {
+                    DispatchQueue.global().async {
+                        let r = AXBootstrapProbe() ?? "nil"
+                        WDAHost.shared.append(r)
+                        FileLog.write(r)
+                    }
+                }
+                    .buttonStyle(.bordered)
                 Button("5 sock") {
                     let r = AXTestLocalSocket() ?? "nil"
                     WDAHost.shared.append(r)
