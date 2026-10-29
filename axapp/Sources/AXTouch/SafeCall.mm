@@ -109,3 +109,69 @@ extern "C" void AXLoadXCTestThread(void) {
     t.name = @"WDA-Load-Thread";
     [t start];
 }
+
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+
+extern "C" NSString *AXTestLocalSocket(void) {
+    NSMutableString *out = [NSMutableString string];
+    // 连接 /var/run/usbmuxd
+    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return @"socket() 失败";
+    struct sockaddr_un addr; memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    const char *path = "/var/run/usbmuxd";
+    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
+    int r = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (r != 0) {
+        int e = errno;
+        close(fd);
+        return [NSString stringWithFormat:@"❌ connect /var/run/usbmuxd errno=%d (%s)", e, strerror(e)];
+    }
+    [out appendFormat:@"✅ connect /var/run/usbmuxd 成功
+"];
+    // 发 usbmux Hello（16 字节头 + binary plist）
+    NSDictionary *hello = @{@"ClientVersionString": @"axtouch-1.0",
+                            @"MessageType": @"Hello",
+                            @"ProgName": @"AXTouch"};
+    NSData *plist = [NSPropertyListSerialization dataWithPropertyList:hello
+                                                               format:NSPropertyListBinaryFormat_v1_0
+                                                              options:0 error:nil];
+    uint32_t hdr[4] = {(uint32_t)(plist.length + 16), 1, 1, 1};  // len, version=1, type=1(Hello), tag=1
+    NSMutableData *msg = [NSMutableData dataWithBytes:hdr length:16];
+    [msg appendData:plist];
+    ssize_t w = write(fd, msg.bytes, msg.length);
+    if (w < 0) { close(fd); return [NSString stringWithFormat:@"❌ write Hello errno=%d", errno]; }
+    [out appendFormat:@"✅ Hello 已发送 (%zd 字节)
+", w];
+    // 读响应头 16 字节
+    uint8_t rhdr[16];
+    ssize_t got = 0;
+    while (got < 16) {
+        ssize_t n = read(fd, rhdr + got, 16 - got);
+        if (n <= 0) { close(fd); return [NSString stringWithFormat:@"❌ 读响应头失败 got=%zd errno=%d", got, errno]; }
+        got += n;
+    }
+    uint32_t rlen, rver, rtype, rtag;
+    memcpy(&rlen, rhdr, 4); memcpy(&rver, rhdr + 4, 4); memcpy(&rtype, rhdr + 8, 4); memcpy(&rtag, rhdr + 12, 4);
+    [out appendFormat:@"✅ 响应头: len=%u ver=%u type=%u tag=%u
+", rlen, rver, rtype, rtag];
+    if (rlen > 16 && rlen < 65536) {
+        uint32_t bodyLen = rlen - 16;
+        NSMutableData *body = [NSMutableData dataWithCapacity:bodyLen];
+        uint8_t buf[4096];
+        while (body.length < bodyLen) {
+            ssize_t n = read(fd, buf, MIN((uint32_t)sizeof(buf), bodyLen - (uint32_t)body.length));
+            if (n <= 0) break;
+            [body appendBytes:buf length:n];
+        }
+        if (body.length == bodyLen) {
+            id obj = [NSPropertyListSerialization propertyListWithData:body options:0 format:nil error:nil];
+            [out appendFormat:@"响应内容: %@
+", obj];
+        }
+    }
+    close(fd);
+    return out;
+}
