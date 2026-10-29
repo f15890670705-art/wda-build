@@ -6,6 +6,7 @@
 //
 #import "AXMainViewController.h"
 #import "AXLogViewerViewController.h"
+#import "AXStream.h"
 #import "UITheme.h"
 #import <ifaddrs.h>
 #import <arpa/inet.h>
@@ -170,6 +171,7 @@ static NSString *AXLanIP(void) {
 @property (nonatomic, strong) UIButton    *shotBtn;
 @property (nonatomic, strong) UIButton    *burstBtn;
 
+@property (nonatomic, strong) UIButton *streamBtn;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) BOOL burstRunning;
 
@@ -189,6 +191,7 @@ static NSString *AXLanIP(void) {
 - (void)didTapLogs;
 - (void)didTapTree;
 - (void)didTapServer;
+- (void)didTapStream;
 - (void)didTapShot;
 - (void)didTapBurst;
 - (void)didTapDiag:(UIButton *)sender;
@@ -250,20 +253,16 @@ static NSString *AXLanIP(void) {
 
     self.cardStatus  = [AXCardView card];
     self.cardDevice  = [AXCardView card];
-    self.cardFrame   = [AXCardView card];
     self.cardControl = [AXCardView card];
-    self.cardDiag    = [AXCardView card];
     [self.content addSubview:self.cardStatus];
     [self.content addSubview:self.cardDevice];
-    [self.content addSubview:self.cardFrame];
     [self.content addSubview:self.cardControl];
-    [self.content addSubview:self.cardDiag];
 
     [self buildCardStatus];
     [self buildCardDevice];
-    [self buildCardFrame];
     [self buildCardControl];
-    [self buildCardDiag];
+    /* 2026-10-30 用户要求下架：画面测试卡（抓帧/连拍）与诊断卡不再显示。
+       实现代码保留在 buildCardFrame / buildCardDiag 里，需要时把上面几行加回来即可。 */
 
     UILayoutGuide *g = self.view.safeAreaLayoutGuide;
     [NSLayoutConstraint activateConstraints:@[
@@ -290,18 +289,10 @@ static NSString *AXLanIP(void) {
         [self.cardDevice.leadingAnchor  constraintEqualToAnchor:self.content.leadingAnchor constant:AT_PAD],
         [self.cardDevice.trailingAnchor constraintEqualToAnchor:self.content.trailingAnchor constant:-AT_PAD],
 
-        [self.cardFrame.topAnchor      constraintEqualToAnchor:self.cardDevice.bottomAnchor constant:12],
-        [self.cardFrame.leadingAnchor  constraintEqualToAnchor:self.content.leadingAnchor constant:AT_PAD],
-        [self.cardFrame.trailingAnchor constraintEqualToAnchor:self.content.trailingAnchor constant:-AT_PAD],
-
-        [self.cardControl.topAnchor      constraintEqualToAnchor:self.cardFrame.bottomAnchor constant:12],
+        [self.cardControl.topAnchor      constraintEqualToAnchor:self.cardDevice.bottomAnchor constant:12],
         [self.cardControl.leadingAnchor  constraintEqualToAnchor:self.content.leadingAnchor constant:AT_PAD],
         [self.cardControl.trailingAnchor constraintEqualToAnchor:self.content.trailingAnchor constant:-AT_PAD],
-
-        [self.cardDiag.topAnchor      constraintEqualToAnchor:self.cardControl.bottomAnchor constant:12],
-        [self.cardDiag.leadingAnchor  constraintEqualToAnchor:self.content.leadingAnchor constant:AT_PAD],
-        [self.cardDiag.trailingAnchor constraintEqualToAnchor:self.content.trailingAnchor constant:-AT_PAD],
-        [self.cardDiag.bottomAnchor   constraintEqualToAnchor:self.content.bottomAnchor constant:-24],
+        [self.cardControl.bottomAnchor   constraintEqualToAnchor:self.content.bottomAnchor constant:-24],
     ]];
 }
 
@@ -520,11 +511,11 @@ static NSString *AXLanIP(void) {
     UIButton *rec = [self buildBigButton:@"读节点树" bg:ATBrownBg() fg:ATBrown()];
     [rec addTarget:self action:@selector(didTapTree) forControlEvents:UIControlEventTouchUpInside];
 
-    UIButton *server = [self buildBigButton:@"拉起 WDA 服务" bg:ATPurpleBg() fg:ATPurple()];
-    [server addTarget:self action:@selector(didTapServer) forControlEvents:UIControlEventTouchUpInside];
+    self.streamBtn = [self buildBigButton:@"开始投屏" bg:ATBlue() fg:[UIColor whiteColor]];
+    [self.streamBtn addTarget:self action:@selector(didTapStream) forControlEvents:UIControlEventTouchUpInside];
 
     UIStackView *row1 = [self stackWith:@[rebuild, logs]];
-    UIStackView *row2 = [self stackWith:@[rec, server]];
+    UIStackView *row2 = [self stackWith:@[rec, self.streamBtn]];
     [self.cardControl addSubview:row1];
     [self.cardControl addSubview:row2];
 
@@ -684,6 +675,20 @@ static NSString *AXLanIP(void) {
             if (ss) ss.frameStat.text = [NSString stringWithFormat:@"节点树: %@", r];
         });
     });
+}
+
+- (void)didTapStream {
+    if (AXStreamIsRunning()) {
+        AXStreamStop();
+        [self.streamBtn setTitle:@"开始投屏" forState:UIControlStateNormal];
+        self.streamBtn.backgroundColor = ATBlue();
+        [self.streamBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    } else {
+        BOOL ok = AXStreamStart(27184);
+        [self.streamBtn setTitle:(ok ? @"停止投屏" : @"启动失败") forState:UIControlStateNormal];
+        self.streamBtn.backgroundColor = ok ? ATRed() : ATBrownBg();
+        [self.streamBtn setTitleColor:(ok ? [UIColor whiteColor] : ATBrown()) forState:UIControlStateNormal];
+    }
 }
 
 - (void)didTapServer {
