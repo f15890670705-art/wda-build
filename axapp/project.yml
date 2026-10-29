@@ -19,7 +19,7 @@ targets:
     info:
       path: Info.plist
       properties:
-        CFBundleDisplayName: AXTouch-b21
+        CFBundleDisplayName: AXTouch-b22
         CFBundleShortVersionString: "2.0"
         CFBundleVersion: "22"
         UILaunchScreen: {}
