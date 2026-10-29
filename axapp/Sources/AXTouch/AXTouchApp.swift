@@ -86,7 +86,7 @@ final class WDAHost {
             let pathBytes = Array(sockPath.utf8CString)
             withUnsafeMutableBytes(of: &addr.sun_path) { dest in
                 let cnt = min(pathBytes.count, dest.count - 1)
-                dest.baseAddress!.copyBytes(from: Array(pathBytes.prefix(cnt)), count: cnt)
+                dest.baseAddress!.copyMemory(from: Array(pathBytes.prefix(cnt)), byteCount: cnt)
             }
             let r = withUnsafePointer(to: &addr) { ptr in
                 ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
