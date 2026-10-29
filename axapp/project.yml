@@ -38,6 +38,7 @@ targets:
         ENABLE_BITCODE: NO
         TARGETED_DEVICE_FAMILY: "1,2"
         SWIFT_VERSION: "5.0"
+        SWIFT_OBJC_BRIDGING_HEADER: Sources/AXTouch/Bridging-Header.h
         ARCHS: arm64
         ONLY_ACTIVE_ARCH: NO
         LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/Frameworks @loader_path/Frameworks"
