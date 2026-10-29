@@ -572,7 +572,10 @@ extern "C" NSString *AXAgentShot(double maxSide, double quality) {
         if (maxSide > 0 && longSide > maxSide) {
             CGFloat k = maxSide / longSide;
             CGSize ns = CGSizeMake(round(sz.width * k), round(sz.height * k));
-            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:ns];
+            UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+            fmt.scale = 1.0;            // 关键：否则按屏幕 3 倍渲染，像素数 ×9、编码变慢 5 倍
+            fmt.opaque = YES;
+            UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:ns format:fmt];
             out = [r imageWithActions:^(UIGraphicsImageRendererContext *ctx) {
                 [ui drawInRect:CGRectMake(0, 0, ns.width, ns.height)];
             }];
