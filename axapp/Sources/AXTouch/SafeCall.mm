@@ -143,8 +143,7 @@ extern "C" NSString *AXTestLocalSocket(void) {
     [msg appendData:plist];
     ssize_t w = write(fd, msg.bytes, msg.length);
     if (w < 0) { close(fd); return [NSString stringWithFormat:@"❌ write Hello errno=%d", errno]; }
-    [out appendFormat:@"✅ Hello 已发送 (%zd 字节)
-", w];
+    [out appendFormat:@"✅ Hello 已发送 (%zd 字节)\n", w];
     // 读响应头 16 字节
     uint8_t rhdr[16];
     ssize_t got = 0;
@@ -155,8 +154,7 @@ extern "C" NSString *AXTestLocalSocket(void) {
     }
     uint32_t rlen, rver, rtype, rtag;
     memcpy(&rlen, rhdr, 4); memcpy(&rver, rhdr + 4, 4); memcpy(&rtype, rhdr + 8, 4); memcpy(&rtag, rhdr + 12, 4);
-    [out appendFormat:@"✅ 响应头: len=%u ver=%u type=%u tag=%u
-", rlen, rver, rtype, rtag];
+    [out appendFormat:@"✅ 响应头: len=%u ver=%u type=%u tag=%u\n", rlen, rver, rtype, rtag];
     if (rlen > 16 && rlen < 65536) {
         uint32_t bodyLen = rlen - 16;
         NSMutableData *body = [NSMutableData dataWithCapacity:bodyLen];
@@ -168,8 +166,7 @@ extern "C" NSString *AXTestLocalSocket(void) {
         }
         if (body.length == bodyLen) {
             id obj = [NSPropertyListSerialization propertyListWithData:body options:0 format:nil error:nil];
-            [out appendFormat:@"响应内容: %@
-", obj];
+            [out appendFormat:@"响应内容: %@\n", obj];
         }
     }
     close(fd);
