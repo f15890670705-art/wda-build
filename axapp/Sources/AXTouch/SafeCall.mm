@@ -171,3 +171,56 @@ extern "C" NSString *AXTestLocalSocket(void) {
     close(fd);
     return out;
 }
+
+#include <netinet/in.h>
+#include <arpa/inet.h>
+
+extern "C" NSString *AXTestLockdownTCP(void) {
+    NSMutableString *out = [NSMutableString string];
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) return [NSString stringWithFormat:@"socket(AF_INET6) 失败 errno=%d", errno];
+    struct sockaddr_in6 addr; memset(&addr, 0, sizeof(addr));
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons(62078);
+    inet_pton(AF_INET6, "::1", &addr.sin6_addr);
+    int r = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (r != 0) {
+        int e = errno; close(fd);
+        return [NSString stringWithFormat:@"❌ connect [::1]:62078 errno=%d (%s)", e, strerror(e)];
+    }
+    [out appendFormat:@"✅ TCP connect [::1]:62078 成功！lockdown 监听 loopback
+"];
+    // lockdown 协议：4 字节大端长度头 + binary plist
+    NSDictionary *q = @{@"Label": @"axtouch-poc", @"Request": @"QueryType"};
+    NSData *pl = [NSPropertyListSerialization dataWithPropertyList:q format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+    uint32_t len = htonl((uint32_t)pl.length);
+    NSMutableData *msg = [NSMutableData dataWithBytes:&len length:4];
+    [msg appendData:pl];
+    ssize_t w = write(fd, msg.bytes, msg.length);
+    if (w < 0) { close(fd); return [NSString stringWithFormat:@"❌ write QueryType errno=%d", errno]; }
+    [out appendFormat:@"✅ QueryType 已发送 (%zd 字节)
+", w];
+    uint8_t lh[4]; ssize_t got = 0;
+    while (got < 4) {
+        ssize_t n = read(fd, lh + got, 4 - got);
+        if (n <= 0) { close(fd); return [NSString stringWithFormat:@"❌ 读长度头失败 got=%zd errno=%d", got, errno]; }
+        got += n;
+    }
+    uint32_t rlen; memcpy(&rlen, lh, 4); rlen = ntohl(rlen);
+    [out appendFormat:@"✅ 响应长度: %u
+", rlen];
+    if (rlen > 0 && rlen < 1048576) {
+        NSMutableData *body = [NSMutableData dataWithCapacity:rlen];
+        uint8_t buf[8192];
+        while (body.length < rlen) {
+            ssize_t n = read(fd, buf, MIN((uint32_t)sizeof(buf), rlen - (uint32_t)body.length));
+            if (n <= 0) break;
+            [body appendBytes:buf length:n];
+        }
+        id obj = [NSPropertyListSerialization propertyListWithData:body options:0 format:nil error:nil];
+        [out appendFormat:@"响应: %@
+", obj];
+    }
+    close(fd);
+    return out;
+}
