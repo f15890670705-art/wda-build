@@ -1131,6 +1131,137 @@ extern "C" BOOL AXAgentSetAppStateTimeout(double v) {
     }
 }
 
+#pragma mark - 底层截图（绕过 XCUIScreen 的三层包装，直接打 IPC）
+
+/* 反汇编得到的调用链：
+     -[XCUIScreen screenshot]
+       → screenshotWithEncoding:options:
+         → screenshotWithPreferredEncoding:rect:options:error:   (futureWithTimeout 包装)
+           → XCUILocalDeviceScreenDataSource requestScreenshotWithRequest:withReply:
+             → screenshotIPCInterface requestScreenshotWithRequest:withReply:   ← 真正的 101ms
+   这里直接构造 XCTScreenshotRequest 丢给 screenshotIPCInterface，跳过三层包装，
+   并把 IPC 对象的真实类名/方法表 dump 出来（之前按名字猜一直是错的）。 */
+extern "C" NSString *AXAgentShotLowLevel(int mode, double quality) {
+    if (!gReady) return @"not ready";
+    @autoreleasepool {
+        Class scrCls = NSClassFromString(@"XCUIScreen");
+        if (!scrCls) return @"no XCUIScreen";
+        id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+        if (!screen) return @"no screen";
+
+        SEL sdSel = NSSelectorFromString(@"screenDataSource");
+        if (![screen respondsToSelector:sdSel]) return @"no screenDataSource";
+        id ds = ((id (*)(id, SEL))objc_msgSend)(screen, sdSel);
+        if (!ds) return @"nil datasource";
+
+        SEL ipcSel = NSSelectorFromString(@"screenshotIPCInterface");
+        if (![ds respondsToSelector:ipcSel]) return @"no screenshotIPCInterface";
+        id ipc = ((id (*)(id, SEL))objc_msgSend)(ds, ipcSel);
+        if (!ipc) return @"nil ipc";
+
+        /* ★ 真实类名（之前按 "XCUILocalDeviceScreenshotIPCInterface" 猜一直是错的） */
+        const char *ipcCls = object_getClassName(ipc);
+        ALog(@"  🔬 [shot2] datasource 类 = %s", object_getClassName(ds));
+        ALog(@"  🔬 [shot2] ipc 类 = %s", ipcCls);
+        AXDumpClass(@(ipcCls));
+
+        /* legacy 标志只是读一下，看当前值 */
+        SEL legSel = NSSelectorFromString(@"useLegacyScreenshotPath");
+        if ([ipc respondsToSelector:legSel]) {
+            BOOL b = ((BOOL (*)(id, SEL))objc_msgSend)(ipc, legSel);
+            ALog(@"  🔬 [shot2] useLegacyScreenshotPath = %d", (int)b);
+        } else {
+            ALog(@"  🔬 [shot2] 无 useLegacyScreenshotPath");
+        }
+
+        /* 构造 XCTScreenshotRequest */
+        Class reqCls = NSClassFromString(@"XCTScreenshotRequest");
+        if (!reqCls) { ALog(@"  ❌ 无 XCTScreenshotRequest"); return @"no request class"; }
+
+        Class qCls = NSClassFromString(@"XCTImageQuality");
+        id q = nil;
+        if (qCls) {
+            id qa = ((id (*)(id, SEL))objc_msgSend)(qCls, NSSelectorFromString(@"alloc"));
+            SEL qi = NSSelectorFromString(@"initWithImageQuality:");
+            if ([qa respondsToSelector:qi]) q = ((id (*)(id, SEL, double))objc_msgSend)(qa, qi, quality);
+        }
+        if (!q) { ALog(@"  ⚠️ 没有 XCTImageQuality，用 nil"); }
+
+        CGRect rect = CGRectZero;          /* CGRectZero = 整屏（__XCUIFailWithError 那条路走的是它） */
+        if (mode == 1) rect = CGRectMake(0, 0, 0.5, 0.5);
+
+        SEL ri = NSSelectorFromString(@"initWithScreenID:rect:encoding:options:");
+        if (![reqCls instancesRespondToSelector:ri]) { ALog(@"  ❌ 无 initWithScreenID:rect:encoding:options:"); return @"no init"; }
+        id reqObj = ((id (*)(id, SEL))objc_msgSend)(reqCls, NSSelectorFromString(@"alloc"));
+        typedef id (*InitReqFn)(id, SEL, long long, CGRect, id, unsigned long);
+        id req = ((InitReqFn)objc_msgSend)(reqObj, ri, 0LL, rect, q, 0UL);
+        if (!req) { ALog(@"  ❌ request 构造失败"); return @"req nil"; }
+
+        SEL callSel = NSSelectorFromString(@"requestScreenshotWithRequest:withReply:");
+        if (![ipc respondsToSelector:callSel]) { ALog(@"  ❌ ipc 无 requestScreenshotWithRequest:withReply:"); return @"no call"; }
+
+        __block id gotValue = nil;
+        __block id gotErr = nil;
+        dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+
+        CFTimeInterval t0 = CACurrentMediaTime();
+        void (^reply)(id, id) = ^(id v, id e) {
+            gotValue = v;
+            gotErr = e;
+            dispatch_semaphore_signal(sem);
+        };
+        @try {
+            ((void (*)(id, SEL, id, id))objc_msgSend)(ipc, callSel, req, reply);
+        } @catch (NSException *ex) {
+            ALog(@"  ❌ 调用异常: %@", ex.reason);
+            return @"call threw";
+        }
+        long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(5.0 * NSEC_PER_SEC)));
+        CFTimeInterval dt = (CACurrentMediaTime() - t0) * 1000.0;
+        if (waited != 0) { ALog(@"  ⏱ [shot2] 5s 超时，无回调"); return @"timeout"; }
+
+        ALog(@"  ⏱ [shot2] IPC 往返 %.0fms", dt);
+        if (gotErr) ALog(@"  ⚠️ [shot2] err = %@", gotErr);
+        if (!gotValue) { ALog(@"  ❌ [shot2] 返回 nil"); return @"nil image"; }
+
+        ALog(@"  🔬 [shot2] 返回值类 = %s", object_getClassName(gotValue));
+        /* 返回的可能是 XCTImage（有 data 方法）也可能是 UIImage */
+        NSData *jpeg = nil;
+        CFTimeInterval t1 = CACurrentMediaTime();
+        if ([gotValue respondsToSelector:NSSelectorFromString(@"data")]) {
+            id d = ((id (*)(id, SEL))objc_msgSend)(gotValue, NSSelectorFromString(@"data"));
+            if ([d isKindOfClass:[NSData class]]) {
+                NSData *raw = (NSData *)d;
+                ALog(@"  🔬 [shot2] data 长度 = %lu 字节", (unsigned long)raw.length);
+                UIImage *ui = [UIImage imageWithData:raw];
+                if (ui) {
+                    CGSize sz = ui.size;
+                    CGFloat k = 720.0 / MAX(sz.width, sz.height);
+                    if (k > 1.0) k = 1.0;
+                    CGSize ns = CGSizeMake(round(sz.width * k), round(sz.height * k));
+                    UIGraphicsImageRendererFormat *fmt = [UIGraphicsImageRendererFormat defaultFormat];
+                    fmt.scale = 1.0; fmt.opaque = YES;
+                    UIImage *out = ui;
+                    if (k < 1.0) {
+                        UIGraphicsImageRenderer *r = [[UIGraphicsImageRenderer alloc] initWithSize:ns format:fmt];
+                        CGFloat kk = k;
+                        out = [r imageWithActions:^(UIGraphicsImageRendererContext *c) {
+                            [ui drawInRect:CGRectMake(0, 0, ns.width, ns.height)];
+                            (void)kk;
+                        }];
+                    }
+                    jpeg = UIImageJPEGRepresentation(out, quality > 0 ? quality : 0.6);
+                    ALog(@"  📷 [shot2] %.0fx%.0f -> %.0fx%.0f  %luKB  (后处理 %.0fms)",
+                         sz.width, sz.height, out.size.width, out.size.height,
+                         (unsigned long)(jpeg.length / 1024), (CACurrentMediaTime() - t1) * 1000.0);
+                }
+            }
+        }
+        if (!jpeg) { ALog(@"  ⚠️ [shot2] 拿不到可编码数据"); return @"no data"; }
+        return [jpeg base64EncodedStringWithOptions:0];
+    }
+}
+
 /* 读当前可达的 AX 元素树。maxNodes 限制节点数（防止界面复杂时刷爆日志）。
    返回摘要字符串；详细内容写 agent.log。 */
 extern "C" NSString *AXAgentDumpTree(int maxNodes) {
