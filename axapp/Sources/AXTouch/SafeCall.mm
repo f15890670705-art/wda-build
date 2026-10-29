@@ -262,6 +262,7 @@ extern "C" NSString *AXScanLoopbackPorts(void) {
 #include <ifaddrs.h>
 #include <net/if.h>
 #include <dns_sd.h>
+#include <netdb.h>
 
 // ASAgent bootstrap：按 AScript 的实际流程实现
 // 1) 检查 /Developer/Library/Frameworks/XCTest.framework 是否存在（DDI 挂载标志）
