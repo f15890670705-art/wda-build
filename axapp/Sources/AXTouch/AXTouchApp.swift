@@ -6,8 +6,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "37"
-    static let tag = "v2.0-b37"
+    static let build = "38"
+    static let tag = "v2.0-b38"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -135,6 +135,44 @@ final class ControlServer {
                     let y = (obj["y"] as? Double) ?? 0
                     let r = AXAgentTap(x, y)
                     resp = "{\"ok\":\(r)}"
+                case "swipe":
+                    let r = AXAgentSwipe((obj["x1"] as? Double) ?? 0, (obj["y1"] as? Double) ?? 0,
+                                         (obj["x2"] as? Double) ?? 0, (obj["y2"] as? Double) ?? 0,
+                                         (obj["duration"] as? Double) ?? 0.25)
+                    resp = "{\"ok\":\(r)}"
+                case "longpress":
+                    let r = AXAgentLongPress((obj["x"] as? Double) ?? 0, (obj["y"] as? Double) ?? 0,
+                                             (obj["duration"] as? Double) ?? 1.0)
+                    resp = "{\"ok\":\(r)}"
+                case "touch":
+                    if let evs = obj["events"] as? [[String: Any]], evs.count >= 2 {
+                        var xy = [Double]()
+                        var ts = [Double]()
+                        var acc = 0.0
+                        for e in evs {
+                            xy.append((e["x"] as? Double) ?? 0)
+                            xy.append((e["y"] as? Double) ?? 0)
+                            acc += (e["delay"] as? Double) ?? 0
+                            ts.append(acc)
+                        }
+                        var ok = false
+                        xy.withUnsafeBufferPointer { xb in
+                            ts.withUnsafeBufferPointer { tb in
+                                ok = AXAgentGesture(xb.baseAddress!, tb.baseAddress!, Int32(evs.count))
+                            }
+                        }
+                        resp = "{\"ok\":\(ok)}"
+                    } else {
+                        resp = "{\"ok\":false,\"error\":\"需要 events 数组(>=2 点)\"}"
+                    }
+                case "shot":
+                    let maxSide = (obj["max"] as? Double) ?? 720
+                    let q = (obj["quality"] as? Double) ?? 0.6
+                    if let b64 = AXAgentShot(maxSide, q) {
+                        resp = "{\"ok\":true,\"w\":0,\"jpeg\":\"\(b64)\"}"
+                    } else {
+                        resp = "{\"ok\":false,\"error\":\"shot failed\"}"
+                    }
                 case "probe":
                     resp = (try? String(data: JSONSerialization.data(withJSONObject: WDAHost.shared.probe()), encoding: .utf8)) ?? "{}"
                 case "load": AXLoadXCTestThread(); resp = "{\"ok\":true}"
