@@ -709,3 +709,119 @@ extern "C" NSString *AXAgentProbeRecording(void) {
     ALog(@"===== 录屏流探针结束 =====");
     return @"probe done";
 }
+
+#pragma mark - 节点树（AX 元素树读取）
+
+/* 对任意 AX 元素取属性：优先 attributeValueForKey:，退回 valueForKey: */
+static id AXNodeAttr(id elem, NSString *key) {
+    if (!elem) return nil;
+    SEL s1 = NSSelectorFromString(@"attributeValueForKey:");
+    if ([elem respondsToSelector:s1]) {
+        @try {
+            id (*fp)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+            id v = fp(elem, s1, key);
+            if (v) return v;
+        } @catch (NSException *e) { }
+    }
+    SEL s2 = NSSelectorFromString(@"valueForKey:");
+    if ([elem respondsToSelector:s2]) {
+        @try {
+            id (*fp)(id, SEL, id) = (id (*)(id, SEL, id))objc_msgSend;
+            return fp(elem, s2, key);
+        } @catch (NSException *e) { }
+    }
+    return nil;
+}
+
+static NSString *AXShort(id v) {
+    if (!v) return @"-";
+    if ([v isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)v;
+        if (s.length == 0) return @"\"\"";
+        if (s.length > 60) s = [[s substringToIndex:60] stringByAppendingString:@"…"];
+        return s;
+    }
+    if ([v isKindOfClass:[NSNumber class]]) return [v description];
+    if ([v isKindOfClass:[NSArray class]])
+        return [NSString stringWithFormat:@"<array %lu>", (unsigned long)[(NSArray *)v count]];
+    return NSStringFromClass([v class]);
+}
+
+static void AXDumpNode(id elem, int depth, int *count, int maxNodes) {
+    if (!elem || *count >= maxNodes || depth > 8) return;
+    (*count)++;
+
+    NSString *label = AXShort(AXNodeAttr(elem, @"label"));
+    NSString *ident = AXShort(AXNodeAttr(elem, @"identifier"));
+    NSString *value = AXShort(AXNodeAttr(elem, @"value"));
+    NSString *type  = AXShort(AXNodeAttr(elem, @"elementType"));
+
+    NSMutableString *pad = [NSMutableString string];
+    for (int i = 0; i < depth; i++) [pad appendString:@"  "];
+    ALog(@"%@· %@ type=%@ label=%@ id=%@ val=%@",
+         pad, NSStringFromClass([elem class]), type, label, ident, value);
+
+    id kids = AXNodeAttr(elem, @"children");
+    if (![kids isKindOfClass:[NSArray class]]) return;
+    for (id k in (NSArray *)kids) {
+        if (*count >= maxNodes) break;
+        AXDumpNode(k, depth + 1, count, maxNodes);
+    }
+}
+
+/* 读当前可达的 AX 元素树。maxNodes 限制节点数（防止界面复杂时刷爆日志）。
+   返回摘要字符串；详细内容写 agent.log。 */
+extern "C" NSString *AXAgentDumpTree(int maxNodes) {
+    if (maxNodes <= 0) maxNodes = 120;
+    ALog(@"===== 节点树读取开始（max=%d）=====", maxNodes);
+    if (!gReady) { ALog(@"❌ 会话未就绪"); return @"not ready"; }
+
+    Class axCls = NSClassFromString(@"XCAXClient_iOS");
+    if (!axCls) { ALog(@"❌ XCAXClient_iOS 不存在"); return @"no XCAXClient"; }
+
+    /* 无论成败都先把类结构摊开，方法名就是下次要用的线索 */
+    AXDumpClass(@"XCAXClient_iOS");
+    AXDumpClass(@"XCAccessibilityElement");
+
+    id client = AXShared(axCls, @[@"sharedClient"]);
+    if (!client) { ALog(@"❌ sharedClient 为空"); return @"no client"; }
+
+    /* 1) 无参方法：拿焦点应用 / 系统根 */
+    id root = nil;
+    NSArray *probes = @[@"focusedApplication", @"frontmostApplication",
+                        @"systemWideElement", @"applicationElement"];
+    for (NSString *n in probes) {
+        SEL s = NSSelectorFromString(n);
+        if (![client respondsToSelector:s]) { ALog(@"  · %@ 不存在", n); continue; }
+        @try {
+            id (*fp)(id, SEL) = (id (*)(id, SEL))objc_msgSend;
+            id r = fp(client, s);
+            ALog(@"  · %@ → %@", n, r ? NSStringFromClass([r class]) : @"nil");
+            if (r && !root) root = r;
+        } @catch (NSException *e) { ALog(@"  · %@ 异常: %@", n, e.reason); }
+    }
+
+    /* 2) 带 pid 的方法：先用自己进程验证通道是否通 */
+    if (!root) {
+        SEL sp = NSSelectorFromString(@"accessibilityElementForPid:");
+        if ([client respondsToSelector:sp]) {
+            @try {
+                id (*fp)(id, SEL, int) = (id (*)(id, SEL, int))objc_msgSend;
+                id r = fp(client, sp, (int)getpid());
+                ALog(@"  · accessibilityElementForPid(%d) → %@", (int)getpid(),
+                     r ? NSStringFromClass([r class]) : @"nil");
+                if (r) root = r;
+            } @catch (NSException *e) { ALog(@"  · pid 版异常: %@", e.reason); }
+        } else {
+            ALog(@"  · accessibilityElementForPid: 不存在");
+        }
+    }
+
+    if (!root) { ALog(@"❌ 拿不到根元素"); return @"no element"; }
+
+    /* 3) 递归打印 */
+    int count = 0;
+    AXDumpNode(root, 0, &count, maxNodes);
+    ALog(@"===== 节点树结束：共 %d 个节点 =====", count);
+    return [NSString stringWithFormat:@"nodes=%d", count];
+}
