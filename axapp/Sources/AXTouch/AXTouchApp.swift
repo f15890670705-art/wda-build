@@ -3,124 +3,95 @@ import Foundation
 import Network
 import Darwin
 
-/// 照 AScript 架构：App 内自带整套 XCTest 框架 + WebDriverAgentLib，
-/// 启动时按依赖顺序 dlopen，然后把 WDA 的 HTTP 服务器拉起来（8100），
-/// 让任何 WDA 客户端（包括我们 PC 端）直接连。
+enum BuildInfo {
+    static let version = "2.0"
+    static let build = "20"
+    static let tag = "v2.0-b20"
+}
+
+/// 分步加载：启动只开 socket，其余全部手动触发，崩溃点一目了然。
 final class WDAHost {
     static let shared = WDAHost()
     private(set) var log: [String] = []
     private var loaded: [String: UnsafeMutableRawPointer] = [:]
     var serverStarted = false
+    var frameworksLoaded = false
 
-    private func append(_ s: String) {
+    func append(_ s: String) {
         log.append(s)
-        print("[WDAHost] \(s)")
+        print("[WDHost] \(s)")
     }
 
-    private var fwDir: String {
-        Bundle.main.bundlePath + "/Frameworks"
+    func clear() { log.removeAll() }
+
+    private var fwDir: String { Bundle.main.bundlePath + "/Frameworks" }
+
+    var loadedCount: Int { loaded.count }
+
+    /// 第 1 步：只加载 AXRuntime（最轻量，验证 dlopen 本身没问题）
+    func loadAXOnly() {
+        let p = fwDir + "/AXRuntime.framework/AXRuntime"
+        if dlopen(p, RTLD_NOW) != nil {
+            append("✅[1] AXRuntime（内嵌）")
+            return
+        }
+        // 内嵌没有就用系统的
+        if dlopen("/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime", RTLD_NOW) != nil {
+            append("✅[1] AXRuntime（系统）")
+        } else {
+            append("❌[1] AXRuntime 加载失败")
+        }
     }
 
-    /// 按依赖顺序加载内嵌框架
-    func loadAll() {
-        guard loaded.isEmpty else { return }
-        // 让内嵌 Frameworks 可被 @rpath 解析
-        setenv("DYLD_FRAMEWORK_PATH", fwDir + ":" + (getenv("DYLD_FRAMEWORK_PATH").map { String(cString: $0) } ?? ""), 1)
-        setenv("DYLD_LIBRARY_PATH", fwDir + ":" + (getenv("DYLD_LIBRARY_PATH").map { String(cString: $0) } ?? ""), 1)
-
-        let order = [
-            "Testing",
-            "XCTestCore",
-            "XCTAutomationSupport",
-            "XCTest",
-            "XCTestSupport",
-            "XCUIAutomation",
-            "XCUnit",
-            "WebDriverAgentLib",
-        ]
+    /// 第 2 步：加载 XCTest 全套 + WebDriverAgentLib
+    func loadXCTest() {
+        setenv("DYLD_FRAMEWORK_PATH", fwDir, 1)
+        let order = ["Testing", "XCTestCore", "XCTAutomationSupport", "XCTest",
+                     "XCTestSupport", "XCUIAutomation", "XCUnit", "WebDriverAgentLib"]
         for name in order {
             let path = "\(fwDir)/\(name).framework/\(name)"
             dlerror()
             if let h = dlopen(path, RTLD_NOW | RTLD_GLOBAL) {
                 loaded[name] = h
-                append("✅ \(name)")
+                append("✅[2] \(name)")
             } else if let e = dlerror() {
-                append("❌ \(name): \(String(cString: e))")
+                append("❌[2] \(name): \(String(cString: e).prefix(120))")
             } else {
-                append("❌ \(name)")
+                append("❌[2] \(name)")
             }
         }
-        // Swift 支持库
-        let swiftLib = "\(fwDir)/libXCTestSwiftSupport.dylib"
-        if dlopen(swiftLib, RTLD_NOW | RTLD_GLOBAL) != nil {
-            append("✅ libXCTestSwiftSupport")
+        frameworksLoaded = objc_getClass("FBWebServer") != nil
+        append(frameworksLoaded ? "✅[2] FBWebServer 类已注册" : "❌[2] FBWebServer 类缺失")
+    }
+
+    /// 第 3 步：探测 XCTRunnerDaemonSession（捕获异常原因）
+    func probeSession() {
+        append("--- 探测 XCTRunnerDaemonSession ---")
+        if let e = AXProbeDaemonSession() {
+            append("⚠️[3] 异常:")
+            append(String(e.prefix(600)))
         } else {
-            append("⚠️ libXCTestSwiftSupport")
+            append("✅[3] sharedSession 成功")
         }
     }
 
-    /// 启动 WDA 的 HTTP server（FBWebServer.startHTTPServer）——用 ObjC 包装捕获 NSException
+    /// 第 4 步：启动 WDA HTTP server
     func startServer() {
-        loadAll()
-        setenv("USE_PORT", "8100", 1)
-        setenv("MJPEG_SERVER_PORT", "9100", 1)
-        // 先探 daemon session（拿到异常原因）
-        if let e = AXProbeDaemonSession() {
-            append("⚠️ XCTRunnerDaemonSession 异常: ")
-            append(e)
-        } else {
-            append("✅ XCTRunnerDaemonSession.sharedSession 成功！")
-        }
-        // 再起 server
+        append("--- 启动 FBWebServer ---")
         if let err = AXStartWDAServer() {
-            append("❌ startHTTPServer 异常:")
-            append(err)
+            append("❌[4] 异常:")
+            append(String(err.prefix(600)))
             return
         }
         serverStarted = true
-        append("✅ FBWebServer.startHTTPServer 已调用（8100）")
-    }
-
-    private func legacyStartServer() {
-        loadAll()
-        guard objc_getClass("FBWebServer") != nil else {
-            append("❌ FBWebServer 类不存在（WebDriverAgentLib 未加载成功）")
-            return
-        }
-        setenv("USE_PORT", "8100", 1)
-        setenv("MJPEG_SERVER_PORT", "9100", 1)
-
-        guard let cls = NSClassFromString("FBWebServer") as? NSObject.Type else {
-            append("❌ FBWebServer 无法实例化")
-            return
-        }
-        let server = cls.init()
-        if server.responds(to: NSSelectorFromString("startHTTPServer")) {
-            server.perform(NSSelectorFromString("startHTTPServer"))
-            serverStarted = true
-            append("✅ 已调用 FBWebServer.startHTTPServer（8100）")
-        } else {
-            append("❌ FBWebServer 无 startHTTPServer")
-            let methods = { () -> [String] in
-                var out: [String] = []
-                var count: UInt32 = 0
-                if let mlist = class_copyMethodList(NSClassFromString("FBWebServer"), &count) {
-                    for i in 0..<Int(count) {
-                        out.append(NSStringFromSelector(method_getName(mlist[i])))
-                    }
-                    free(mlist)
-                }
-                return out
-            }()
-            append("可用方法: \(methods.joined(separator: ", "))")
-        }
+        append("✅[4] startHTTPServer 已调用")
     }
 
     func probe() -> [String: Any] {
-        loadAll()
-        var out: [String: Any] = ["log": log, "serverStarted": serverStarted]
+        var out: [String: Any] = ["tag": BuildInfo.tag, "log": log,
+                                  "loaded": loadedCount, "server": serverStarted]
         var cls: [String: Bool] = [:]
-        for c in ["FBWebServer", "FBApplication", "FBXCTestDaemonsProxy", "XCUIDevice", "XCTRunnerDaemonSession", "XCUIApplication"] {
+        for c in ["FBWebServer", "FBApplication", "FBXCTestDaemonsProxy", "XCUIDevice", "XCTRunnerDaemonSession"] {
             cls[c] = objc_getClass(c) != nil
         }
         out["classes"] = cls
@@ -128,62 +99,52 @@ final class WDAHost {
     }
 }
 
-/// TCP 控制服务：0.0.0.0:10010
+/// TCP 控制 10010
 final class ControlServer {
     private var listener: NWListener?
-    private let queue = DispatchQueue(label: "axtouch.control")
+    private let queue = DispatchQueue(label: "ax.ctl")
     private var buffer = Data()
 
     func start(port: UInt16 = 10010) {
         guard let p = NWEndpoint.Port(rawValue: port), let l = try? NWListener(using: .tcp, on: p) else { return }
         listener = l
-        l.newConnectionHandler = { conn in
-            conn.start(queue: self.queue)
-            self.handle(conn)
+        l.newConnectionHandler = { c in
+            c.start(queue: self.queue)
+            self.handle(c)
         }
         l.start(queue: queue)
-        print("[ControlServer] listening \(port)")
     }
 
-    private func handle(_ conn: NWConnection) {
-        func receive() {
-            conn.receive(minimumIncompleteLength: 1, maximumLength: 65536) { data, _, done, _ in
-                if let data = data, !data.isEmpty { self.process(data: data, conn: conn) }
-                if !done { receive() } else { conn.cancel() }
+    private func handle(_ c: NWConnection) {
+        func rec() {
+            c.receive(minimumIncompleteLength: 1, maximumLength: 65536) { d, _, done, _ in
+                if let d = d, !d.isEmpty { self.process(d, c) }
+                if !done { rec() } else { c.cancel() }
             }
         }
-        receive()
+        rec()
     }
 
-    private func process(data: Data, conn: NWConnection) {
+    private func process(_ data: Data, _ c: NWConnection) {
         buffer.append(data)
         while let nl = buffer.firstIndex(of: 0x0A) {
-            let lineData = buffer[buffer.startIndex..<nl]
+            let ld = buffer[buffer.startIndex..<nl]
             buffer.removeSubrange(buffer.startIndex...nl)
-            guard let line = String(data: lineData, encoding: .utf8), !line.isEmpty else { continue }
+            guard let line = String(data: ld, encoding: .utf8), !line.isEmpty else { continue }
             var resp = "{\"ok\":false}"
             if let obj = try? JSONSerialization.jsonObject(with: Data(line.utf8)) as? [String: Any],
                let cmd = obj["cmd"] as? String {
                 switch cmd {
+                case "ping": resp = "{\"ok\":true,\"tag\":\"\(BuildInfo.tag)\"}"
                 case "probe":
-                    let d = try? JSONSerialization.data(withJSONObject: WDAHost.shared.probe())
-                    resp = String(data: d ?? Data("{}".utf8), encoding: .utf8) ?? "{}"
-                case "startserver":
-                    WDAHost.shared.startServer()
-                    Thread.sleep(forTimeInterval: 2)
-                    resp = "{\"ok\":true,\"log\":\(jsonArr(WDAHost.shared.log))}"
-                case "ping":
-                    resp = "{\"ok\":true,\"pong\":true}"
-                default:
-                    resp = "{\"ok\":false,\"error\":\"unknown\"}"
+                    resp = (try? String(data: JSONSerialization.data(withJSONObject: WDAHost.shared.probe()), encoding: .utf8)) ?? "{}"
+                case "load": WDAHost.shared.loadXCTest(); resp = "{\"ok\":true}"
+                case "server": WDAHost.shared.startServer(); resp = "{\"ok\":true}"
+                default: resp = "{\"ok\":false,\"error\":\"unknown\"}"
                 }
             }
-            conn.send(content: (resp + "\n").data(using: .utf8), completion: .contentProcessed { _ in })
+            c.send(content: (resp + "\n").data(using: .utf8), completion: .contentProcessed { _ in })
         }
-    }
-
-    private func jsonArr(_ a: [String]) -> String {
-        (try? String(data: JSONSerialization.data(withJSONObject: a), encoding: .utf8)) ?? "[]"
     }
 }
 
@@ -195,11 +156,27 @@ struct AXTouchApp: App {
 }
 
 struct ContentView: View {
-    @State private var log = "启动中…"
+    @State private var log = "就绪"
 
     var body: some View {
-        VStack(spacing: 10) {
-            Text("WDA 宿主").font(.title2).bold()
+        VStack(spacing: 8) {
+            Text("AXTouch \(BuildInfo.tag)").font(.title2).bold()
+            Text("TCP 0.0.0.0:10010  |  \(WDAHost.shared.loadedCount) 个框架")
+                .font(.system(size: 10, design: .monospaced))
+                .foregroundColor(.secondary)
+
+            HStack(spacing: 6) {
+                Button("1 AX") { WDAHost.shared.loadAXOnly(); log = WDAHost.shared.log.joined(separator: "\n") }
+                    .buttonStyle(.bordered)
+                Button("2 框架") { WDAHost.shared.loadXCTest(); log = WDAHost.shared.log.joined(separator: "\n") }
+                    .buttonStyle(.bordered)
+                Button("3 Session") { WDAHost.shared.probeSession(); log = WDAHost.shared.log.joined(separator: "\n") }
+                    .buttonStyle(.bordered)
+                Button("4 服务") { WDAHost.shared.startServer(); log = WDAHost.shared.log.joined(separator: "\n") }
+                    .buttonStyle(.borderedProminent)
+            }
+            .font(.system(size: 12))
+
             ScrollView {
                 Text(log)
                     .font(.system(size: 10, design: .monospaced))
@@ -209,25 +186,11 @@ struct ContentView: View {
             .frame(maxHeight: .infinity)
             .background(Color.black.opacity(0.85))
             .foregroundColor(.green)
-            HStack {
-                Button("加载框架") {
-                    WDAHost.shared.loadAll()
-                    log = WDAHost.shared.log.joined(separator: "\n")
-                }
-                Button("启动 WDA 服务") {
-                    WDAHost.shared.startServer()
-                    log = WDAHost.shared.log.joined(separator: "\n")
-                }
-                .buttonStyle(.borderedProminent)
-            }
         }
         .padding()
         .onAppear {
             ControlServer().start(port: 10010)
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
-                WDAHost.shared.loadAll()
-                log = WDAHost.shared.log.joined(separator: "\n")
-            }
+            log = "AXTouch \(BuildInfo.tag) 已启动\nTCP 10010 就绪\n请按 1→2→3→4 顺序点"
         }
     }
 }
