@@ -8,3 +8,4 @@ NSString *AXTestLocalSocket(void);
 NSString *AXTestLockdownTCP(void);
 NSString *AXScanLoopbackPorts(void);
 NSString *AXBootstrapProbe(void);
+NSString *AXRunRSDProbe(void);
