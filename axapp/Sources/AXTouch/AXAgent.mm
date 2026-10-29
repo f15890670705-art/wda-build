@@ -881,6 +881,144 @@ static id AXElementViaXCUIApplication(void) {
     return nil;
 }
 
+#pragma mark - 路线 C：AXRuntime + AXUIElement（照 AScript 的做法）
+
+/* AScript 二进制里的做法（反编译所得）：
+     dlopen "/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime"
+     dlsym  AXUIElementCreateSystemWide / AXUIElementGetPid / AXUIElementCopyAttributeValue
+     读 AXFocusedApplication → 递归 AXChildren，属性名用 "AXRole"/"AXTitle"/"AXValue"
+   它在普通签名下就能跑（二进制里没有 platform-application 等特权 entitlements），
+   所以这条路不依赖 UI test bundle，也不依赖 DDI。 */
+
+typedef void *(*AXCreateSystemWideFn)(void);
+typedef void *(*AXCreateAppFn)(pid_t pid);
+typedef int (*AXCopyAttrFn)(void *elem, CFStringRef attr, CFTypeRef *out);
+typedef int (*AXGetPidFn)(void *elem, pid_t *pid);
+
+static void *AXFindSymbol(const char *name) {
+    void *p = dlsym(RTLD_DEFAULT, name);
+    if (p) return p;
+    static const char *fws[] = {
+        "/System/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
+        "/System/Developer/Library/PrivateFrameworks/AXRuntime.framework/AXRuntime",
+        "/System/Library/PrivateFrameworks/AccessibilityUtilities.framework/AccessibilityUtilities",
+        NULL
+    };
+    for (int i = 0; fws[i]; i++) {
+        void *h = dlopen(fws[i], RTLD_NOW | RTLD_GLOBAL);
+        if (!h) continue;
+        p = dlsym(h, name);
+        if (p) return p;
+    }
+    return NULL;
+}
+
+/* 读一个 AX 属性并转成可打印字符串（只处理 String/Number，其它返回类名） */
+static NSString *AXAttrToStr(void *elem, AXCopyAttrFn copyAttr, NSString *key) {
+    if (!elem || !copyAttr) return nil;
+    CFTypeRef v = NULL;
+    int err = copyAttr(elem, (__bridge CFStringRef)key, &v);
+    if (err != 0 || !v) return nil;
+    NSString *s = nil;
+    CFTypeID t = CFGetTypeID(v);
+    if (t == CFStringGetTypeID()) {
+        s = [(__bridge NSString *)v copy];
+    } else if (t == CFNumberGetTypeID()) {
+        s = [(__bridge NSNumber *)v description];
+    } else if (t == CFBooleanGetTypeID()) {
+        s = [(__bridge NSNumber *)v boolValue] ? @"true" : @"false";
+    } else if (t == CFArrayGetTypeID()) {
+        s = [NSString stringWithFormat:@"<array %ld>", (long)CFArrayGetCount((CFArrayRef)v)];
+    }
+    CFRelease(v);
+    if (s && s.length > 60) s = [[s substringToIndex:60] stringByAppendingString:@"…"];
+    return s;
+}
+
+static void AXDumpAXNode(void *node, int depth, int *count, int maxNodes,
+                         AXCopyAttrFn copyAttr, AXGetPidFn getPid) {
+    if (!node || *count >= maxNodes || depth > 10) return;
+    (*count)++;
+
+    NSString *role   = AXAttrToStr(node, copyAttr, @"AXRole");
+    NSString *title  = AXAttrToStr(node, copyAttr, @"AXTitle");
+    NSString *label  = AXAttrToStr(node, copyAttr, @"AXLabel");
+    NSString *value  = AXAttrToStr(node, copyAttr, @"AXIdentifier");
+    NSString *val    = AXAttrToStr(node, copyAttr, @"AXValue");
+    pid_t p = -1;
+    if (getPid) { @try { getPid(node, &p); } @catch (NSException *e) { } }
+
+    NSMutableString *pad = [NSMutableString string];
+    for (int i = 0; i < depth; i++) [pad appendString:@"  "];
+    ALog(@"%@· %@ pid=%d role=%@ title=%@ label=%@ id=%@ val=%@",
+         pad, role ?: @"?", (int)p, role ?: @"-", title ?: @"-", label ?: @"-",
+         value ?: @"-", val ?: @"-");
+
+    CFTypeRef kids = NULL;
+    int err = copyAttr(node, CFSTR("AXChildren"), &kids);
+    if (err == 0 && kids && CFGetTypeID(kids) == CFArrayGetTypeID()) {
+        CFArrayRef arr = (CFArrayRef)kids;
+        CFIndex n = CFArrayGetCount(arr);
+        for (CFIndex i = 0; i < n; i++) {
+            if (*count >= maxNodes) break;
+            void *ch = (void *)CFArrayGetValueAtIndex(arr, i);
+            AXDumpAXNode(ch, depth + 1, count, maxNodes, copyAttr, getPid);
+        }
+    }
+    if (kids) CFRelease(kids);
+}
+
+/* 返回读到的节点数（-1 = 失败）；每一步的 AXError 都打进日志（err=0 才是成功） */
+static int AXRootViaAXRuntime(int maxNodes) {
+    AXCreateSystemWideFn createSW = (AXCreateSystemWideFn)AXFindSymbol("AXUIElementCreateSystemWide");
+    AXCopyAttrFn copyAttr = (AXCopyAttrFn)AXFindSymbol("AXUIElementCopyAttributeValue");
+    AXGetPidFn getPid = (AXGetPidFn)AXFindSymbol("AXUIElementGetPid");
+
+    ALog(@"  · dlsym: CreateSystemWide=%p CopyAttributeValue=%p GetPid=%p",
+         (void *)createSW, (void *)copyAttr, (void *)getPid);
+    if (!createSW || !copyAttr) { ALog(@"  · ❌ AXRuntime 符号拿不到"); return -1; }
+
+    void *sys = createSW();
+    ALog(@"  · AXUIElementCreateSystemWide → %p", sys);
+    if (!sys) return -1;
+
+    /* 依次试几个入口属性（AScript 里这三个名字都出现过） */
+    const char *attrs[] = { "AXFocusedApplication", "AXFrontmostApplication", "AXFocusedUIElement", NULL };
+    void *root = NULL;
+    for (int i = 0; attrs[i]; i++) {
+        CFTypeRef v = NULL;
+        int err = copyAttr(sys, CFSTR(attrs[i]), &v);
+        ALog(@"  · %@ → err=%d val=%p", @(attrs[i]), err, v);
+        if (err == 0 && v && !root) {
+            root = (void *)v;      /* 持有，稍后释放 */
+        } else if (v) {
+            CFRelease(v);
+        }
+    }
+    CFRelease(sys);
+    if (!root) return -1;
+
+    int count = 0;
+    AXDumpAXNode(root, 0, &count, maxNodes, copyAttr, getPid);
+    ALog(@"  ✅ AX 树读到 %d 个节点", count);
+    CFRelease(root);
+    return count;
+}
+
+/* 动态调整 _XCTSetApplicationStateTimeout（截图 101ms 疑似被 100ms 超时吃掉） */
+extern "C" BOOL AXAgentSetAppStateTimeout(double v) {
+    void (*fn)(double) = (void (*)(double))AXFindSymbol("_XCTSetApplicationStateTimeout");
+    if (!fn) { ALog(@"❌ 找不到 _XCTSetApplicationStateTimeout"); return NO; }
+    @try {
+        fn(v);
+        ALog(@"✅ _XCTSetApplicationStateTimeout(%.3f)", v);
+        return YES;
+    } @catch (NSException *e) {
+        ALog(@"❌ 设置异常: %@", e.reason);
+        return NO;
+    }
+}
+
 /* 读当前可达的 AX 元素树。maxNodes 限制节点数（防止界面复杂时刷爆日志）。
    返回摘要字符串；详细内容写 agent.log。 */
 extern "C" NSString *AXAgentDumpTree(int maxNodes) {
@@ -895,6 +1033,15 @@ extern "C" NSString *AXAgentDumpTree(int maxNodes) {
     AXDumpClass(@"XCUIRemoteAccessibilityInterface");
     AXDumpClass(@"XCUIApplicationProcessTracker");
     AXDumpClass(@"XCAccessibilityElement");
+
+    /* ===== 路线 C 优先：AXRuntime + AXUIElement（AScript 的做法）===== */
+    ALog(@"--- 路线 C: AXRuntime + AXUIElement ---");
+    int axNodes = AXRootViaAXRuntime(maxNodes);
+    if (axNodes >= 0) {
+        ALog(@"===== 节点树结束（AXRuntime 路线，%d 个节点）=====", axNodes);
+        return [NSString stringWithFormat:@"nodes=%d", axNodes];
+    }
+    ALog(@"  · 路线 C 失败，继续试 A/B");
 
     id root = nil;
 
