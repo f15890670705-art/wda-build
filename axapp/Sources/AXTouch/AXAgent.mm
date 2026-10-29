@@ -982,13 +982,16 @@ static int AXRootViaAXRuntime(int maxNodes) {
     ALog(@"  · AXUIElementCreateSystemWide → %p", sys);
     if (!sys) return -1;
 
-    /* 依次试几个入口属性（AScript 里这三个名字都出现过） */
-    const char *attrs[] = { "AXFocusedApplication", "AXFrontmostApplication", "AXFocusedUIElement", NULL };
+    /* 依次试几个入口属性（AScript 里这三个名字都出现过）
+       ★ CFSTR() 只接受字符串字面量，变量名必须走 (__bridge CFStringRef) */
+    NSArray<NSString *> *attrs = @[@"AXFocusedApplication",
+                                   @"AXFrontmostApplication",
+                                   @"AXFocusedUIElement"];
     void *root = NULL;
-    for (int i = 0; attrs[i]; i++) {
+    for (NSString *a in attrs) {
         CFTypeRef v = NULL;
-        int err = copyAttr(sys, CFSTR(attrs[i]), &v);
-        ALog(@"  · %@ → err=%d val=%p", @(attrs[i]), err, v);
+        int err = copyAttr(sys, (__bridge CFStringRef)a, &v);
+        ALog(@"  · %@ → err=%d val=%p", a, err, v);
         if (err == 0 && v && !root) {
             root = (void *)v;      /* 持有，稍后释放 */
         } else if (v) {
