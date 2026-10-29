@@ -42,6 +42,7 @@
 #import <dlfcn.h>
 #import <unistd.h>
 #import <stdarg.h>
+#import <ctype.h>
 
 static id  gSession = nil;
 static BOOL gReady = NO;
@@ -968,6 +969,75 @@ static void AXDumpAXNode(void *node, int depth, int *count, int maxNodes,
     if (kids) CFRelease(kids);
 }
 
+/* 打印某个方法完整的 type encoding —— 决定能不能安全调用它 */
+static const char *AXMethodTypes(Class cls, NSString *selName, char *buf, size_t buflen) {
+    if (!cls) return NULL;
+    Method m = class_getInstanceMethod(cls, NSSelectorFromString(selName));
+    if (!m) return NULL;
+    const char *t = method_getTypeEncoding(m);
+    if (!t) return NULL;
+    snprintf(buf, buflen, "%s", t);
+    return buf;
+}
+
+/* 解析返回值 + 第一个参数的类型字符（跳过 self/_cmd 和偏移数字） */
+static void AXParseTypes(const char *types, char *ret, size_t rl, char *arg1, size_t al) {
+    ret[0] = 0; arg1[0] = 0;
+    if (!types) return;
+    const char *p = types;
+    size_t i = 0;
+    while (*p && *p != ':' && i + 1 < rl) ret[i++] = *p++;
+    ret[i] = 0;
+    /* 找到第二个 ':' 之后 */
+    const char *c = strchr(types, ':');
+    if (!c) return;
+    c++;
+    while (*c && (isdigit((unsigned char)*c) || *c == '+' || *c == '-')) c++;
+    c = strchr(c, ':');
+    if (!c) return;
+    c++;
+    while (*c && isdigit((unsigned char)*c)) c++;
+    i = 0;
+    while (*c && i + 1 < al) arg1[i++] = *c++;
+    arg1[i] = 0;
+}
+
+/* 尝试调用 XCAXClient_iOS 的 loadAccessibility:（AScript 里出现 8 次的那个）
+   ★ 参数类型不明确时只记录、不调用 —— 传错 block 会 SIGSEGV，@try 接不住 */
+static BOOL AXTryLoadAccessibility(id client) {
+    if (!client) return NO;
+    BOOL any = NO;
+    NSArray<NSString *> *sels = @[@"loadAccessibility:", @"_loadAccessibility:"];
+    for (NSString *name in sels) {
+        SEL s = NSSelectorFromString(name);
+        if (![client respondsToSelector:s]) { ALog(@"  · %@ 不存在", name); continue; }
+
+        char tb[128]; char ret[32]; char arg[32];
+        const char *t = AXMethodTypes([client class], name, tb, sizeof(tb));
+        if (!t) { ALog(@"  · %@ 无 type encoding", name); continue; }
+        AXParseTypes(t, ret, sizeof(ret), arg, sizeof(arg));
+        ALog(@"  · %@ types=%s  返回=%s  参数1=%s", name, t, ret, arg);
+
+        /* 指针参数（NSError**）→ 传 NULL，安全 */
+        if (arg[0] == '^') {
+            @try {
+                ((void (*)(id, SEL, void *))objc_msgSend)(client, s, NULL);
+                ALog(@"  ✅ %@(NULL) 调用完成", name);
+                any = YES;
+            } @catch (NSException *e) { ALog(@"  ❌ %@ 异常: %@", name, e.reason); }
+        } else if (arg[0] == 'd' || arg[0] == 'f') {
+            @try {
+                ((void (*)(id, SEL, double))objc_msgSend)(client, s, 3.0);
+                ALog(@"  ✅ %@(3.0) 调用完成", name);
+                any = YES;
+            } @catch (NSException *e) { ALog(@"  ❌ %@ 异常: %@", name, e.reason); }
+        } else {
+            ALog(@"  ⚠️ %@ 参数是 '%s'（可能是 block），本版不调用，避免崩溃", name, arg);
+        }
+    }
+    return any;
+}
+
 /* 返回读到的节点数（-1 = 失败）；每一步的 AXError 都打进日志（err=0 才是成功） */
 static int AXRootViaAXRuntime(int maxNodes) {
     AXCreateSystemWideFn createSW = (AXCreateSystemWideFn)AXFindSymbol("AXUIElementCreateSystemWide");
@@ -977,6 +1047,22 @@ static int AXRootViaAXRuntime(int maxNodes) {
     ALog(@"  · dlsym: CreateSystemWide=%p CopyAttributeValue=%p GetPid=%p",
          (void *)createSW, (void *)copyAttr, (void *)getPid);
     if (!createSW || !copyAttr) { ALog(@"  · ❌ AXRuntime 符号拿不到"); return -1; }
+
+    /* ★ 先开 AX 开关：建 XCAXClient_iOS 实例并调 loadAccessibility:
+       （AScript 二进制里 loadAccessibility 出现 8 次，我们之前一次都没调 —— 这大概率是
+         kAXErrorAPIDisabled(-25211) 的根源） */
+    Class axCls2 = NSClassFromString(@"XCAXClient_iOS");
+    if (axCls2) {
+        id client2 = nil;
+        @try {
+            id obj = ((id (*)(id, SEL))objc_msgSend)(axCls2, NSSelectorFromString(@"alloc"));
+            SEL ini = NSSelectorFromString(@"init");
+            if ([obj respondsToSelector:ini])
+                client2 = ((id (*)(id, SEL))objc_msgSend)(obj, ini);
+        } @catch (NSException *e) { ALog(@"  · client init 异常: %@", e.reason); }
+        ALog(@"  · XCAXClient_iOS 实例 = %p", (__bridge void *)client2);
+        AXTryLoadAccessibility(client2);
+    }
 
     void *sys = createSW();
     ALog(@"  · AXUIElementCreateSystemWide → %p", sys);
@@ -999,6 +1085,29 @@ static int AXRootViaAXRuntime(int maxNodes) {
         }
     }
     CFRelease(sys);
+
+    /* 自测：AXUIElementCreateApplication(自己) —— 如果连自己都 -25211，说明 AX 全局 disabled；
+       如果自己能读、只有 SystemWide 不行，那是跨进程权限问题，方向不同 */
+    if (!root) {
+        AXCreateAppFn createApp = (AXCreateAppFn)AXFindSymbol("AXUIElementCreateApplication");
+        ALog(@"  · dlsym CreateApplication=%p", (void *)createApp);
+        if (createApp) {
+            void *me = createApp((pid_t)getpid());
+            ALog(@"  · CreateApplication(self pid=%d) → %p", (int)getpid(), me);
+            if (me) {
+                CFTypeRef v = NULL;
+                int e2 = copyAttr(me, CFSTR("AXRole"), &v);
+                ALog(@"  · self AXRole → err=%d val=%p", e2, v);
+                if (v) CFRelease(v);
+                CFTypeRef k2 = NULL;
+                int e3 = copyAttr(me, CFSTR("AXChildren"), &k2);
+                ALog(@"  · self AXChildren → err=%d", e3);
+                if (k2) CFRelease(k2);
+                CFRelease(me);
+            }
+        }
+    }
+
     if (!root) return -1;
 
     int count = 0;
