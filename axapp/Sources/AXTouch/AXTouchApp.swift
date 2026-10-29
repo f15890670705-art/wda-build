@@ -6,8 +6,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "39"
-    static let tag = "v2.0-b39"
+    static let build = "40"
+    static let tag = "v2.0-b40"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -165,6 +165,9 @@ final class ControlServer {
                     } else {
                         resp = "{\"ok\":false,\"error\":\"需要 events 数组(>=2 点)\"}"
                     }
+                case "recprobe":
+                    DispatchQueue.global().async { _ = AXAgentProbeRecording() }
+                    resp = "{\"ok\":true,\"note\":\"probe started, 4s later check agent.log\"}"
                 case "shot":
                     let maxSide = (obj["max"] as? Double) ?? 720
                     let q = (obj["quality"] as? Double) ?? 0.6
