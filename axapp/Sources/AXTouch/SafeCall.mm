@@ -3,13 +3,9 @@
 #include <exception>
 #include <string>
 #include <cxxabi.h>
-#ifdef __cplusplus
 
 // ObjC++ 文件：既能捕 NSException 也能捕 C++ 异常
 // （XCTest 内部抛的是 C++ 异常 → std::terminate → abort，纯 .m 里的 @catch(...) 抓不到）
-
-extern "C" {
-#endif
 
 static NSString *describeCPP(std::exception_ptr ep) {
     if (!ep) return @"(no exception_ptr)";
@@ -27,7 +23,6 @@ static NSString *describeCPP(std::exception_ptr ep) {
     }
 }
 
-/// 通用安全调用：返回 nil = 成功，否则返回原因。
 extern "C" NSString *AXSafeCall(void (^block)(void)) {
     @try {
         try {
@@ -43,7 +38,6 @@ extern "C" NSString *AXSafeCall(void (^block)(void)) {
     }
 }
 
-/// 探测 XCTRunnerDaemonSession.sharedSession
 extern "C" NSString *AXProbeDaemonSession(void) {
     Class cls = NSClassFromString(@"XCTRunnerDaemonSession");
     if (cls == Nil) return @"XCTRunnerDaemonSession 类不存在（框架未加载）";
@@ -55,7 +49,6 @@ extern "C" NSString *AXProbeDaemonSession(void) {
     return session ? nil : @"sharedSession 返回 nil";
 }
 
-/// 启动 FBWebServer（WDA HTTP 服务器）
 extern "C" NSString *AXStartWDAServer(void) {
     Class cls = NSClassFromString(@"FBWebServer");
     if (cls == Nil) return @"FBWebServer 类不存在";
@@ -77,14 +70,14 @@ extern "C" NSString *AXStartWDAServer(void) {
     });
 }
 
-/// 常驻线程启动 WDA server：线程永不退出，autoreleasepool 永不 pop，
-/// WebDriverAgentLib 内部的 NSXPCConnection 就不会被释放（避免 _xpc_api_misuse 崩溃）。
 extern "C" void AXStartWDAServerThread(NSString **outLog) {
     NSThread *t = [[NSThread alloc] initWithBlock:^{
         NSString *err = AXStartWDAServer();
-        if (outLog) { *outLog = err ? [NSString stringWithFormat:@"❌ %@", err]
-                                    : @"✅ startHTTPServer 已调用（线程保持运行）"; }
-        // 线程挂起但不 pop autorelease pool，保住所有 XPC 连接
+        if (outLog) {
+            *outLog = err ? [NSString stringWithFormat:@"❌ %@", err]
+                          : @"✅ startHTTPServer 已调用（线程保持运行）";
+        }
+        // 线程永不退出 → autorelease pool 永不 pop → WDA 内部的 NSXPCConnection 不会被释放
         while (YES) { [NSThread sleepForTimeInterval:86400.0]; }
     }];
     t.name = @"WDA-Server-Thread";
