@@ -5,8 +5,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "33"
-    static let tag = "v2.0-b33"
+    static let build = "34"
+    static let tag = "v2.0-b34"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -204,6 +204,13 @@ struct ContentView: View {
         .onAppear {
             ControlServer().start(port: 10010)
             WDAHost.shared.append("App 启动 \(BuildInfo.tag)，日志文件: \(FileLog.path)")
+            // 自动执行完整 RSD 探测（mDNS → RSDCheckin），结果写日志文件
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
+                let r = AXRunRSDProbe() ?? "nil"
+                FileLog.write("===== RSD 自动探测 =====")
+                FileLog.write(r)
+                WDAHost.shared.append("RSD 探测完成，详情见 axtouch.log")
+            }
             log = WDAHost.shared.log.joined(separator: "\n")
         }
     }
