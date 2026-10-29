@@ -1,5 +1,6 @@
 #import <Foundation/Foundation.h>
 #import <objc/message.h>
+#include <dlfcn.h>
 #include <exception>
 #include <string>
 #include <cxxabi.h>
