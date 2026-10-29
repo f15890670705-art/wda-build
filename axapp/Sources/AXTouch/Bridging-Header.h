@@ -23,3 +23,4 @@ BOOL AXAgentLongPress(double x, double y, double dur);
 NSString *AXAgentShot(double maxSide, double quality);
 NSString *AXAgentProbeRecording(void);
 NSString *AXAgentDumpTree(int maxNodes);
+BOOL AXAgentSetAppStateTimeout(double v);
