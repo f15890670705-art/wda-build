@@ -30,7 +30,7 @@ targets:
         NSLocalNetworkUsageDescription: AXTouch needs local network for control
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: com.ascript.webdriveragentrunner.xctrunner
+        PRODUCT_BUNDLE_IDENTIFIER: com.aojoy.ascript.ios
         PRODUCT_NAME: AXTouch
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGNING_REQUIRED: NO
