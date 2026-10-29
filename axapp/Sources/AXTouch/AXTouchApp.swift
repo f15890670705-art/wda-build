@@ -77,13 +77,13 @@ final class WDAHost {
 
     /// 第 4 步：启动 WDA HTTP server（常驻线程版，保住 XPC 连接）
     func startServer() {
-        loadAll()
+        self.loadAll()
         setenv("USE_PORT", "8100", 1)
         setenv("MJPEG_SERVER_PORT", "9100", 1)
         AXStartWDAServerThread(nil)
-        append("--- 常驻线程已启动（3 秒后 8100 应就绪）---")
+        self.append("--- 常驻线程已启动（3 秒后 8100 应就绪）---")
         DispatchQueue.main.asyncAfter(deadline: .now() + 3) {
-            append("尝试连接验证: curl http://手机IP:8100/status")
+            self.append("尝试连接验证: curl http://手机IP:8100/status")
         }
     }
 
