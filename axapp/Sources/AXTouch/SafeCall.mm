@@ -9,6 +9,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <fcntl.h>
 
 // ObjC++ 文件：既能捕 NSException 也能捕 C++ 异常
 // （XCTest 内部抛的是 C++ 异常 → std::terminate → abort，纯 .m 里的 @catch(...) 抓不到）
@@ -204,5 +205,56 @@ extern "C" NSString *AXTestLockdownTCP(void) {
         [out appendFormat:@"响应: %@\n", obj];
     }
     close(fd);
+    return out;
+}
+
+#include <dispatch/dispatch.h>
+
+/// 扫描 ::1 上所有可达端口（非阻塞 connect + 100ms 超时），列出本机 loopback 监听的服务
+extern "C" NSString *AXScanLoopbackPorts(void) {
+    NSMutableString *out = [NSMutableString string];
+    NSMutableArray *found = [NSMutableArray array];
+    // iOS 没有便捷的非阻塞 connect 等待，用 dispatch 组 + 每端口独立 socket
+    dispatch_group_t group = dispatch_group_create();
+    __block NSLock *lock = [[NSLock alloc] init];
+    for (int port = 1024; port <= 65535; port++) {
+        dispatch_group_enter(group);
+        dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            int fd = socket(AF_INET6, SOCK_STREAM, 0);
+            if (fd < 0) { dispatch_group_leave(group); return; }
+            // 非阻塞
+            int flags = fcntl(fd, F_GETFL, 0);
+            fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+            struct sockaddr_in6 addr; memset(&addr, 0, sizeof(addr));
+            addr.sin6_family = AF_INET6;
+            addr.sin6_port = htons((uint16_t)port);
+            inet_pton(AF_INET6, "::1", &addr.sin6_addr);
+            int r = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+            if (r == 0) {
+                [lock lock]; [found addObject:@(port)]; [lock unlock];
+                close(fd);
+                dispatch_group_leave(group);
+                return;
+            }
+            if (errno == EINPROGRESS) {
+                struct timeval tv = {0, 120000};  // 120ms
+                fd_set wset; FD_ZERO(&wset); FD_SET(fd, &wset);
+                if (select(fd + 1, NULL, &wset, NULL, &tv) > 0) {
+                    int err = 0; socklen_t elen = sizeof(err);
+                    getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+                    if (err == 0) {
+                        [lock lock]; [found addObject:@(port)]; [lock unlock];
+                    }
+                }
+            }
+            close(fd);
+            dispatch_group_leave(group);
+        });
+    }
+    dispatch_group_wait(group, dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC));
+    for (NSNumber *p in found) {
+        [out appendFormat:@"%@ ", p];
+    }
+    if (found.count == 0) [out appendString:@"（无可达端口）"];
     return out;
 }
