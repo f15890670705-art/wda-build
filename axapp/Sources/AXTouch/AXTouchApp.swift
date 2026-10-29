@@ -5,8 +5,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "34"
-    static let tag = "v2.0-b34"
+    static let build = "35"
+    static let tag = "v2.0-b35"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -121,6 +121,19 @@ final class ControlServer {
                let cmd = obj["cmd"] as? String {
                 switch cmd {
                 case "ping": resp = "{\"ok\":true,\"tag\":\"\(BuildInfo.tag)\"}"
+                case "status":
+                    let ready = AXAgentIsReady()
+                    let err = AXAgentLastError() ?? ""
+                    let lp = AXAgentLogPath() ?? ""
+                    resp = "{\"ok\":true,\"ready\":\(ready),\"err\":\"\(err)\",\"log\":\"\(lp)\"}"
+                case "agent":
+                    AXAgentStartSticky()
+                    resp = "{\"ok\":true,\"note\":\"bootstrap started\"}"
+                case "tap":
+                    let x = (obj["x"] as? Double) ?? 0
+                    let y = (obj["y"] as? Double) ?? 0
+                    let r = AXAgentTap(x, y)
+                    resp = "{\"ok\":\(r)}"
                 case "probe":
                     resp = (try? String(data: JSONSerialization.data(withJSONObject: WDAHost.shared.probe()), encoding: .utf8)) ?? "{}"
                 case "load": AXLoadXCTestThread(); resp = "{\"ok\":true}"
@@ -204,12 +217,10 @@ struct ContentView: View {
         .onAppear {
             ControlServer().start(port: 10010)
             WDAHost.shared.append("App 启动 \(BuildInfo.tag)，日志文件: \(FileLog.path)")
-            // 自动执行完整 RSD 探测（mDNS → RSDCheckin），结果写日志文件
-            DispatchQueue.global().asyncAfter(deadline: .now() + 1.5) {
-                let r = AXRunRSDProbe() ?? "nil"
-                FileLog.write("===== RSD 自动探测 =====")
-                FileLog.write(r)
-                WDAHost.shared.append("RSD 探测完成，详情见 axtouch.log")
+            // 自动执行 AXAgent bootstrap（复刻 ASAgen：DDI 框架 → daemon session → 自动化模式）
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                AXAgentStartSticky()   // 常驻线程里 bootstrap，XPC 连接不会被释放
+                log = WDAHost.shared.log.joined(separator: "\n")
             }
             log = WDAHost.shared.log.joined(separator: "\n")
         }
