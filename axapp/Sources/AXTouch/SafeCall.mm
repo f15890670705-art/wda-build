@@ -129,8 +129,7 @@ extern "C" NSString *AXTestLocalSocket(void) {
         close(fd);
         return [NSString stringWithFormat:@"❌ connect /var/run/usbmuxd errno=%d (%s)", e, strerror(e)];
     }
-    [out appendFormat:@"✅ connect /var/run/usbmuxd 成功
-"];
+    [out appendFormat:@"✅ connect /var/run/usbmuxd 成功\n"];
     // 发 usbmux Hello（16 字节头 + binary plist）
     NSDictionary *hello = @{@"ClientVersionString": @"axtouch-1.0",
                             @"MessageType": @"Hello",
