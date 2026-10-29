@@ -258,3 +258,71 @@ extern "C" NSString *AXScanLoopbackPorts(void) {
     if (found.count == 0) [out appendString:@"（无可达端口）"];
     return out;
 }
+
+#include <ifaddrs.h>
+#include <net/if.h>
+#include <dns_sd.h>
+
+// ASAgent bootstrap：按 AScript 的实际流程实现
+// 1) 检查 /Developer/Library/Frameworks/XCTest.framework 是否存在（DDI 挂载标志）
+// 2) mDNS 查询 com.apple.internal.dt.coredevice.untrusted.tunnelservice（本机回环）
+// 3) 列出本机所有网卡的 IPv6 地址（AScript 用 ::1 + mDNS 找端点）
+extern "C" NSString *AXBootstrapProbe(void) {
+    NSMutableString *out = [NSMutableString string];
+
+    // 1) DDI 挂载检查
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSArray *ddiPaths = @[@"/Developer/Library/Frameworks/XCTest.framework",
+                          @"/System/Developer/Library/Frameworks/XCTest.framework",
+                          @"/private/preboot/Cryptexes/OS/Developer/Library/Frameworks/XCTest.framework"];
+    BOOL ddiMounted = NO;
+    for (NSString *p in ddiPaths) {
+        BOOL isDir;
+        if ([fm fileExistsAtPath:p isDirectory:&isDir] && isDir) {
+            ddiMounted = YES;
+            [out appendFormat:@"✅ DDI 已挂载: %@
+", p];
+        }
+    }
+    if (!ddiMounted) [out appendString:@"❌ DDI 未挂载（/Developer 路径全部不存在）
+"];
+
+    // 2) 本机网卡 IPv6 地址（AScript 的 mDNS/连接用）
+    [out appendString:@"== 本机 IPv6 地址 ==
+"];
+    struct ifaddrs *ifap = NULL, *ifa = NULL;
+    if (getifaddrs(&ifap) == 0) {
+        for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
+            if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET6) {
+                char host[128] = {0};
+                getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in6), host, sizeof(host), NULL, 0, NI_NUMERICHOST);
+                [out appendFormat:@"%@: %s
+", ifa->ifa_name, host];
+            }
+        }
+        freeifaddrs(ifap);
+    }
+
+    // 3) mDNS 查询 untrusted.tunnelservice（异步，5 秒窗口）
+    [out appendString:@"== mDNS 查询 untrusted.tunnelservice（5 秒）==
+"];
+    dispatch_group_t g = dispatch_group_create();
+    dispatch_group_enter(g);
+    __block DNSServiceRef sd = NULL;
+    DNSServiceBrowse(&sd, 0, 0, "_remoted._tcp", "local",
+                     ^(DNSServiceRef sref, DNSServiceFlags flags, uint32_t idx,
+                       DNSServiceErrorType err, const char *name, const char *type, const char *domain, void *ctx) {
+        if (err == kDNSServiceErr_NoError) {
+            NSLog(@"[Bootstrap] mDNS 发现: %s (%s)", name, type);
+        }
+    }, NULL);
+    // 5 秒后停止
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC), dispatch_get_main_queue(), ^{
+        if (sd) DNSServiceRefDeallocate(sd);
+        dispatch_group_leave(g);
+    });
+    dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC));
+    [out appendString:@"mDNS 窗口结束
+"];
+    return out;
+}
