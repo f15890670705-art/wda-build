@@ -13,8 +13,6 @@ targets:
       - path: Sources/AXTouch
         excludes:
           - "Frameworks/**"
-      # 显式补一条：目录扫描曾漏掉这个文件导致链接期才报 undefined symbols
-      - path: Sources/AXTouch/AXStream.mm
       - path: Sources/AXTouch/Frameworks
         type: folder
         buildPhase: resources
