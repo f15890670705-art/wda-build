@@ -19,6 +19,7 @@ extern NSString *AXAgentLogPath(void);
 extern void AXAgentStartSticky(void);
 extern NSString *AXAgentShot(double maxSide, double quality);
 extern NSString *AXAgentProbeRecording(void);
+extern NSString *AXAgentDumpTree(int maxNodes);
 extern void AXLoadXCTestThread(void);
 extern void AXStartWDAServerThread(NSString **outLog);
 extern NSString *AXProbeDaemonSession(void);
@@ -87,10 +88,11 @@ static NSString *AXLanIP(void) {
     UIView *v = [UIView new];
     v.backgroundColor = ATCard();
     v.layer.cornerRadius = AT_CARD_RADIUS;
-    v.layer.shadowColor = [UIColor blackColor].CGColor;
-    v.layer.shadowOpacity = 0.04;
-    v.layer.shadowRadius = 8;
-    v.layer.shadowOffset = CGSizeMake(0, 2);
+    /* ★ b43：去掉了 shadowRadius=8 的实时阴影。
+       实测 XCUIScreen 截图在带阴影的卡片界面上要 203ms，在无阴影的旧界面上只要 105ms
+       —— 阴影每次抓图都要重新做离屏合成。改用 1px 细线描边，视觉几乎一样，合成便宜。 */
+    v.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
+    v.layer.borderColor = ATDivider().CGColor;
     v.translatesAutoresizingMaskIntoConstraints = NO;
     return v;
 }
@@ -185,7 +187,7 @@ static NSString *AXLanIP(void) {
 - (void)didTapRefresh;
 - (void)didTapRebuild;
 - (void)didTapLogs;
-- (void)didTapRecProbe;
+- (void)didTapTree;
 - (void)didTapServer;
 - (void)didTapShot;
 - (void)didTapBurst;
@@ -515,8 +517,8 @@ static NSString *AXLanIP(void) {
     UIButton *logs = [self buildBigButton:@"📄  运行日志" bg:ATGreen() fg:[UIColor whiteColor]];
     [logs addTarget:self action:@selector(didTapLogs) forControlEvents:UIControlEventTouchUpInside];
 
-    UIButton *rec = [self buildBigButton:@"录屏流探针" bg:ATBrownBg() fg:ATBrown()];
-    [rec addTarget:self action:@selector(didTapRecProbe) forControlEvents:UIControlEventTouchUpInside];
+    UIButton *rec = [self buildBigButton:@"读节点树" bg:ATBrownBg() fg:ATBrown()];
+    [rec addTarget:self action:@selector(didTapTree) forControlEvents:UIControlEventTouchUpInside];
 
     UIButton *server = [self buildBigButton:@"拉起 WDA 服务" bg:ATPurpleBg() fg:ATPurple()];
     [server addTarget:self action:@selector(didTapServer) forControlEvents:UIControlEventTouchUpInside];
@@ -672,10 +674,15 @@ static NSString *AXLanIP(void) {
     [self.navigationController pushViewController:vc animated:YES];
 }
 
-- (void)didTapRecProbe {
-    self.frameStat.text = @"录屏探针已启动，4 秒后看运行日志";
+- (void)didTapTree {
+    self.frameStat.text = @"读节点中…（结果看运行日志）";
+    __weak typeof(self) ws = self;
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
-        (void)AXAgentProbeRecording();
+        NSString *r = AXAgentDumpTree(120) ?: @"nil";
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong typeof(ws) ss = ws;
+            if (ss) ss.frameStat.text = [NSString stringWithFormat:@"节点树: %@", r];
+        });
     });
 }
 
