@@ -165,13 +165,13 @@ extern "C" NSString *AXTestLockdownTCP(void) {
     struct sockaddr_in6 addr;
     memset(&addr, 0, sizeof(addr));
     addr.sin6_family = AF_INET6;
-    addr.sin6_port = htons(62078);
+    addr.sin6_port = htons(49152);
     inet_pton(AF_INET6, "::1", &addr.sin6_addr);
     int r = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
     if (r != 0) {
         int e = errno;
         close(fd);
-        return [NSString stringWithFormat:@"❌ connect [::1]:62078 errno=%d (%s)", e, strerror(e)];
+        return [NSString stringWithFormat:@"❌ connect [::1]:49152 errno=%d (%s)", e, strerror(e)];
     }
     [out appendFormat:@"✅ TCP connect [::1]:62078 成功！lockdown 监听 loopback\n"];
     NSDictionary *q = @{@"Label": @"axtouch-poc", @"Request": @"QueryType"};
@@ -290,7 +290,7 @@ extern "C" NSString *AXBootstrapProbe(void) {
         BOOL isDir;
         if ([fm fileExistsAtPath:p isDirectory:&isDir] && isDir) {
             ddiMounted = YES;
-            [out appendFormat:@"✅ DDI 已挂载: %@\n", p];
+            [out appendFormat:@"✅ DDI 已挂载: %s\n", [p UTF8String]];
         }
     }
     if (!ddiMounted) [out appendString:@"❌ DDI 未挂载（/Developer 路径全部不存在）\n"];
