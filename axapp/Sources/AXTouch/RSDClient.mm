@@ -42,7 +42,7 @@ static void rsdBrowseCallback(DNSServiceRef sdRef, DNSServiceFlags flags, uint32
     // 解析该实例的 host/port
     DNSServiceRef resolveRef = NULL;
     DNSServiceErrorType rerr = DNSServiceResolve(&resolveRef, 0, ifIndex, serviceName, regtype, replyDomain,
-        ^(DNSServiceRef r, DNSServiceFlags f, uint32_t idx, DNSServiceErrorType e,
+        (DNSServiceResolveReply)^(DNSServiceRef r, DNSServiceFlags f, uint32_t idx, DNSServiceErrorType e,
           const char *fullname, const char *hosttarget, uint16_t port, uint16_t txtLen, const unsigned char *txtRecord) {
             if (e == kDNSServiceErr_NoError) {
                 NSString *ep = [NSString stringWithFormat:@"%s:%u", hosttarget, ntohs(port)];
