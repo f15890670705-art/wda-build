@@ -4,6 +4,11 @@
 #include <exception>
 #include <string>
 #include <cxxabi.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <unistd.h>
 
 // ObjC++ 文件：既能捕 NSException 也能捕 C++ 异常
 // （XCTest 内部抛的是 C++ 异常 → std::terminate → abort，纯 .m 里的 @catch(...) 抓不到）
@@ -76,7 +81,6 @@ extern "C" void AXStartWDAServerThread(NSString **outLog) {
             *outLog = err ? [NSString stringWithFormat:@"❌ %@", err]
                           : @"✅ startHTTPServer 已调用（线程保持运行）";
         }
-        // 线程永不退出 → autorelease pool 永不 pop → WDA 内部的 NSXPCConnection 不会被释放
         while (YES) { [NSThread sleepForTimeInterval:86400.0]; }
     }];
     t.name = @"WDA-Server-Thread";
@@ -103,23 +107,19 @@ extern "C" void AXLoadXCTestThread(void) {
             NSString *e = AXStartWDAServer();
             NSLog(@"[WDA-Thread] server: %@", e ? e : @"✅ 已启动");
         }
-        // 永不退出：所有 XPC 对象保活
         while (YES) { [NSThread sleepForTimeInterval:86400.0]; }
     }];
     t.name = @"WDA-Load-Thread";
     [t start];
 }
 
-#include <sys/socket.h>
-#include <sys/un.h>
-#include <unistd.h>
-
+/// 测试 /var/run/usbmuxd（unix socket，预期 errno=2）
 extern "C" NSString *AXTestLocalSocket(void) {
     NSMutableString *out = [NSMutableString string];
-    // 连接 /var/run/usbmuxd
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return @"socket() 失败";
-    struct sockaddr_un addr; memset(&addr, 0, sizeof(addr));
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
     const char *path = "/var/run/usbmuxd";
     strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
@@ -130,20 +130,18 @@ extern "C" NSString *AXTestLocalSocket(void) {
         return [NSString stringWithFormat:@"❌ connect /var/run/usbmuxd errno=%d (%s)", e, strerror(e)];
     }
     [out appendFormat:@"✅ connect /var/run/usbmuxd 成功\n"];
-    // 发 usbmux Hello（16 字节头 + binary plist）
     NSDictionary *hello = @{@"ClientVersionString": @"axtouch-1.0",
                             @"MessageType": @"Hello",
                             @"ProgName": @"AXTouch"};
     NSData *plist = [NSPropertyListSerialization dataWithPropertyList:hello
                                                                format:NSPropertyListBinaryFormat_v1_0
                                                               options:0 error:nil];
-    uint32_t hdr[4] = {(uint32_t)(plist.length + 16), 1, 1, 1};  // len, version=1, type=1(Hello), tag=1
+    uint32_t hdr[4] = {(uint32_t)(plist.length + 16), 1, 1, 1};
     NSMutableData *msg = [NSMutableData dataWithBytes:hdr length:16];
     [msg appendData:plist];
     ssize_t w = write(fd, msg.bytes, msg.length);
     if (w < 0) { close(fd); return [NSString stringWithFormat:@"❌ write Hello errno=%d", errno]; }
     [out appendFormat:@"✅ Hello 已发送 (%zd 字节)\n", w];
-    // 读响应头 16 字节
     uint8_t rhdr[16];
     ssize_t got = 0;
     while (got < 16) {
@@ -154,43 +152,27 @@ extern "C" NSString *AXTestLocalSocket(void) {
     uint32_t rlen, rver, rtype, rtag;
     memcpy(&rlen, rhdr, 4); memcpy(&rver, rhdr + 4, 4); memcpy(&rtype, rhdr + 8, 4); memcpy(&rtag, rhdr + 12, 4);
     [out appendFormat:@"✅ 响应头: len=%u ver=%u type=%u tag=%u\n", rlen, rver, rtype, rtag];
-    if (rlen > 16 && rlen < 65536) {
-        uint32_t bodyLen = rlen - 16;
-        NSMutableData *body = [NSMutableData dataWithCapacity:bodyLen];
-        uint8_t buf[4096];
-        while (body.length < bodyLen) {
-            ssize_t n = read(fd, buf, MIN((uint32_t)sizeof(buf), bodyLen - (uint32_t)body.length));
-            if (n <= 0) break;
-            [body appendBytes:buf length:n];
-        }
-        if (body.length == bodyLen) {
-            id obj = [NSPropertyListSerialization propertyListWithData:body options:0 format:nil error:nil];
-            [out appendFormat:@"响应内容: %@\n", obj];
-        }
-    }
     close(fd);
     return out;
 }
 
-#include <netinet/in.h>
-#include <arpa/inet.h>
-
+/// 测试 ::1:62078 lockdown TCP（AScript 内核路线的第一跳）
 extern "C" NSString *AXTestLockdownTCP(void) {
     NSMutableString *out = [NSMutableString string];
     int fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (fd < 0) return [NSString stringWithFormat:@"socket(AF_INET6) 失败 errno=%d", errno];
-    struct sockaddr_in6 addr; memset(&addr, 0, sizeof(addr));
+    struct sockaddr_in6 addr;
+    memset(&addr, 0, sizeof(addr));
     addr.sin6_family = AF_INET6;
     addr.sin6_port = htons(62078);
     inet_pton(AF_INET6, "::1", &addr.sin6_addr);
     int r = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
     if (r != 0) {
-        int e = errno; close(fd);
+        int e = errno;
+        close(fd);
         return [NSString stringWithFormat:@"❌ connect [::1]:62078 errno=%d (%s)", e, strerror(e)];
     }
-    [out appendFormat:@"✅ TCP connect [::1]:62078 成功！lockdown 监听 loopback
-"];
-    // lockdown 协议：4 字节大端长度头 + binary plist
+    [out appendFormat:@"✅ TCP connect [::1]:62078 成功！lockdown 监听 loopback\n"];
     NSDictionary *q = @{@"Label": @"axtouch-poc", @"Request": @"QueryType"};
     NSData *pl = [NSPropertyListSerialization dataWithPropertyList:q format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
     uint32_t len = htonl((uint32_t)pl.length);
@@ -198,17 +180,18 @@ extern "C" NSString *AXTestLockdownTCP(void) {
     [msg appendData:pl];
     ssize_t w = write(fd, msg.bytes, msg.length);
     if (w < 0) { close(fd); return [NSString stringWithFormat:@"❌ write QueryType errno=%d", errno]; }
-    [out appendFormat:@"✅ QueryType 已发送 (%zd 字节)
-", w];
-    uint8_t lh[4]; ssize_t got = 0;
+    [out appendFormat:@"✅ QueryType 已发送 (%zd 字节)\n", w];
+    uint8_t lh[4];
+    ssize_t got = 0;
     while (got < 4) {
         ssize_t n = read(fd, lh + got, 4 - got);
         if (n <= 0) { close(fd); return [NSString stringWithFormat:@"❌ 读长度头失败 got=%zd errno=%d", got, errno]; }
         got += n;
     }
-    uint32_t rlen; memcpy(&rlen, lh, 4); rlen = ntohl(rlen);
-    [out appendFormat:@"✅ 响应长度: %u
-", rlen];
+    uint32_t rlen;
+    memcpy(&rlen, lh, 4);
+    rlen = ntohl(rlen);
+    [out appendFormat:@"✅ 响应长度: %u\n", rlen];
     if (rlen > 0 && rlen < 1048576) {
         NSMutableData *body = [NSMutableData dataWithCapacity:rlen];
         uint8_t buf[8192];
@@ -218,8 +201,7 @@ extern "C" NSString *AXTestLockdownTCP(void) {
             [body appendBytes:buf length:n];
         }
         id obj = [NSPropertyListSerialization propertyListWithData:body options:0 format:nil error:nil];
-        [out appendFormat:@"响应: %@
-", obj];
+        [out appendFormat:@"响应: %@\n", obj];
     }
     close(fd);
     return out;
