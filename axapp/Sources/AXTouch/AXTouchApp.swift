@@ -131,9 +131,9 @@ func AXReadLogJSON(_ name: String, _ maxKB: Int) -> String {
     let from: UInt64 = size > want ? size - want : 0
     _ = try? fh.seek(toOffset: from)
 
-    /* readToEnd() 返回 Data? 且 throws ⇒ try? 会套成 Data??，这里显式展平 */
+    /* readToEnd() 返回 Data? 且 throws ⇒ Swift 5 的 try? 自动展平成 Data? */
     var data = Data()
-    if let maybe = try? fh.readToEnd(), let got = maybe { data = got }
+    if let got = try? fh.readToEnd() { data = got }
     let d = data
 
     /* 从中间截断可能切在多字节字符中间：丢掉开头最多 3 字节直到能解码 */
