@@ -77,7 +77,31 @@ final class WDAHost {
 
     /// 第 4 步：启动 WDA HTTP server
     func startServer() {
-        append("--- 启动 FBWebServer ---")
+        append("--- 4a 测试本机 socket ---")
+        for sockPath in ["/var/run/usbmuxd", "/var/run/lockdown.sock"] {
+            let fd = socket(AF_UNIX, SOCK_STREAM, 0)
+            guard fd >= 0 else { append("❌ socket() 失败 errno=\(errno)"); continue }
+            var addr = sockaddr_un()
+            addr.sun_family = sa_family_t(AF_UNIX)
+            let pathBytes = Array(sockPath.utf8CString)
+            withUnsafeMutableBytes(of: &addr.sun_path) { dest in
+                let cnt = min(pathBytes.count, dest.count - 1)
+                dest.baseAddress!.copyBytes(from: pathBytes.prefix(cnt), to: 0)
+            }
+            let r = withUnsafePointer(to: &addr) { ptr in
+                ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                    connect(fd, sa, socklen_t(MemoryLayout<sockaddr_un>.size))
+                }
+            }
+            if r == 0 {
+                append("✅[4] connect \(sockPath) 成功!!")
+                close(fd)
+            } else {
+                append("❌[4] connect \(sockPath) errno=\(errno) (\(String(cString: strerror(errno))))")
+                close(fd)
+            }
+        }
+        append("--- 4b 启动 FBWebServer ---")
         if let err = AXStartWDAServer() {
             append("❌[4] 异常:")
             append(String(err.prefix(600)))
