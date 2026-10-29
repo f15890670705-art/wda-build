@@ -1,4 +1,6 @@
 #import <Foundation/Foundation.h>
+#import <UIKit/UIKit.h>
+#import "AXMainViewController.h"
 NSString *AXSafeCall(void (^block)(void));
 NSString *AXStartWDAServer(void);
 NSString *AXProbeDaemonSession(void);
