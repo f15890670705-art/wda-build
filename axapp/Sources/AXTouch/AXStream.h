@@ -6,6 +6,12 @@
 
 NS_ASSUME_NONNULL_BEGIN
 
+/* ★ 必须：本头会被 .mm（C++ 编译）和 .m / Swift 桥接（C 编译）同时包含。
+   不加 extern "C" 两边符号名不同，链接期就是 undefined symbols。 */
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /// 启动推流服务（监听 port，默认 27184）
 BOOL AXStreamStart(uint16_t port);
 
@@ -20,5 +26,9 @@ NSDictionary *AXStreamStats(void);
 
 /// 设置编码参数（码率 bps、目标帧率、最长边像素）
 void AXStreamSetParams(int bitrateBps, int fps, int maxSide);
+
+#ifdef __cplusplus
+}
+#endif
 
 NS_ASSUME_NONNULL_END
