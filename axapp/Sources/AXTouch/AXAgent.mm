@@ -86,6 +86,15 @@ static void ALog(NSString *fmt, ...) {
     }
 }
 
+/* AXStream.mm 用的日志入口（ALog 是 static，跨文件用不了） */
+extern "C" void ALogShim(NSString *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    ALog(@"%@", s);
+}
+
 #pragma mark - 动态调用小工具
 
 /* 定义在文件后部（录屏探针那节），这里先声明 */
