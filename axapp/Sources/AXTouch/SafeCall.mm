@@ -83,3 +83,30 @@ extern "C" void AXStartWDAServerThread(NSString **outLog) {
     t.name = @"WDA-Server-Thread";
     [t start];
 }
+
+extern "C" void AXLoadXCTestThread(void) {
+    NSThread *t = [[NSThread alloc] initWithBlock:^{
+        NSString *fwDir = [NSString stringWithFormat:@"%@/Frameworks", [[NSBundle mainBundle] bundlePath]];
+        setenv("DYLD_FRAMEWORK_PATH", [fwDir UTF8String], 1);
+        NSArray *order = @[@"Testing", @"XCTestCore", @"XCTAutomationSupport", @"XCTest",
+                           @"XCTestSupport", @"XCUIAutomation", @"XCUnit", @"WebDriverAgentLib"];
+        for (NSString *name in order) {
+            NSString *path = [NSString stringWithFormat:@"%@/%@.framework/%@", fwDir, name, name];
+            dlerror();
+            if (!dlopen([path UTF8String], RTLD_NOW | RTLD_GLOBAL)) {
+                const char *e = dlerror();
+                NSLog(@"[WDA-Thread] ❌ %@: %s", name, e ? e : "?");
+            } else {
+                NSLog(@"[WDA-Thread] ✅ %@", name);
+            }
+        }
+        if (NSClassFromString(@"FBWebServer")) {
+            NSString *e = AXStartWDAServer();
+            NSLog(@"[WDA-Thread] server: %@", e ? e : @"✅ 已启动");
+        }
+        // 永不退出：所有 XPC 对象保活
+        while (YES) { [NSThread sleepForTimeInterval:86400.0]; }
+    }];
+    t.name = @"WDA-Load-Thread";
+    [t start];
+}
