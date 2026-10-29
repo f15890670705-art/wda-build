@@ -157,8 +157,90 @@ extern "C" NSString *AXTestLocalSocket(void) {
     return out;
 }
 
-/// 测试 ::1:62078 lockdown TCP（AScript 内核路线的第一跳）
+extern "C" NSString *AXScanLoopbackPorts(void);
+
+/// 对一个端口发 lockdown QueryType，返回响应描述（nil=不是 lockdown）
+static NSString *queryLockdownPort(int port) {
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) return nil;
+    struct sockaddr_in6 addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons((uint16_t)port);
+    inet_pton(AF_INET6, "::1", &addr.sin6_addr);
+    // 连接带超时，避免卡死
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int r = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (r != 0 && errno == EINPROGRESS) {
+        fd_set wset; FD_ZERO(&wset); FD_SET(fd, &wset);
+        struct timeval tv = {1, 0};
+        if (select(fd + 1, NULL, &wset, NULL, &tv) <= 0) { close(fd); return nil; }
+        int err = 0; socklen_t elen = sizeof(err);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+        if (err != 0) { close(fd); return nil; }
+    } else if (r != 0) {
+        close(fd);
+        return nil;
+    }
+    fcntl(fd, F_SETFL, flags);
+
+    NSDictionary *q = @{@"Label": @"axtouch-poc", @"Request": @"QueryType"};
+    NSData *pl = [NSPropertyListSerialization dataWithPropertyList:q format:NSPropertyListBinaryFormat_v1_0 options:0 error:nil];
+    uint32_t len = htonl((uint32_t)pl.length);
+    NSMutableData *msg = [NSMutableData dataWithBytes:&len length:4];
+    [msg appendData:pl];
+    if (write(fd, msg.bytes, msg.length) < 0) { close(fd); return nil; }
+
+    // 读长度头（1 秒超时）
+    fd_set rset; FD_ZERO(&rset); FD_SET(fd, &rset);
+    struct timeval rtv = {1, 0};
+    if (select(fd + 1, &rset, NULL, NULL, &rtv) <= 0) { close(fd); return nil; }
+    uint8_t lh[4];
+    ssize_t got = 0;
+    while (got < 4) {
+        ssize_t n = read(fd, lh + got, 4 - got);
+        if (n <= 0) { close(fd); return nil; }
+        got += n;
+    }
+    uint32_t rlen;
+    memcpy(&rlen, lh, 4);
+    rlen = ntohl(rlen);
+    if (rlen == 0 || rlen > 1048576) { close(fd); return nil; }
+    NSMutableData *body = [NSMutableData dataWithCapacity:rlen];
+    uint8_t buf[8192];
+    while (body.length < rlen) {
+        ssize_t n = read(fd, buf, MIN((uint32_t)sizeof(buf), rlen - (uint32_t)body.length));
+        if (n <= 0) break;
+        [body appendBytes:buf length:n];
+    }
+    close(fd);
+    id obj = [NSPropertyListSerialization propertyListWithData:body options:0 format:nil error:nil];
+    return obj ? [NSString stringWithFormat:@"%@", obj] : nil;
+}
+
+/// 对候选端口逐个发 lockdown QueryType，找出真正的 lockdown
 extern "C" NSString *AXTestLockdownTCP(void) {
+    NSMutableString *out = [NSMutableString string];
+    // 先扫一遍可达端口，再对每个发 QueryType
+    NSString *ports = AXScanLoopbackPorts();
+    [out appendFormat:@"可达端口: %@\n", ports];
+    NSArray *items = [ports componentsSeparatedByString:@" "];
+    for (NSString *it in items) {
+        int port = [it intValue];
+        if (port <= 0) continue;
+        NSString *resp = queryLockdownPort(port);
+        if (resp) {
+            [out appendFormat:@"✅ 端口 %d 是 lockdown!\n响应: %@\n", port, resp];
+        } else {
+            [out appendFormat:@"端口 %d: 非 lockdown\n", port];
+        }
+    }
+    return out;
+}
+
+/// 旧的单端口版本（保留对照，不再调用）
+extern "C" NSString *AXTestLockdownTCP_legacy_49152(void) {
     NSMutableString *out = [NSMutableString string];
     int fd = socket(AF_INET6, SOCK_STREAM, 0);
     if (fd < 0) return [NSString stringWithFormat:@"socket(AF_INET6) 失败 errno=%d", errno];
