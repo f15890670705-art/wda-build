@@ -72,3 +72,17 @@ NSString *AXStartWDAServer(void) {
         ((void (*)(id, SEL))objc_msgSend)(server, sel);
     });
 }
+
+/// 常驻线程启动 WDA server：线程永不退出，autoreleasepool 永不 pop，
+/// WebDriverAgentLib 内部的 NSXPCConnection 就不会被释放（避免 _xpc_api_misuse 崩溃）。
+void AXStartWDAServerThread(NSString **outLog) {
+    NSThread *t = [[NSThread alloc] initWithBlock:^{
+        NSString *err = AXStartWDAServer();
+        if (outLog) { *outLog = err ? [NSString stringWithFormat:@"❌ %@", err]
+                                    : @"✅ startHTTPServer 已调用（线程保持运行）"; }
+        // 线程挂起但不 pop autorelease pool，保住所有 XPC 连接
+        while (YES) { [NSThread sleepForTimeInterval:86400.0]; }
+    }];
+    t.name = @"WDA-Server-Thread";
+    [t start];
+}
