@@ -288,8 +288,9 @@ static BOOL AXAgentBootstrap(void) {
             SEL rs = NSSelectorFromString(@"requestAutomationSessionForTestTargetWithPID:preferredBackendPath:reply:");
             if (session && [session respondsToSelector:rs]) {
                 @try {
-                    void (^reply)(id) = ^(id err) {
-                        ALog(@"  📥 requestAutomationSession reply: %@", err ?: @"(nil)");
+                    void (^reply)(id) = ^(id a) {
+                        // 参数可能是 BOOL/NSError*/裸指针，绝不能用 %@ 格式化（会访问野指针崩）
+                        ALog(@"  📥 requestAutomationSession reply 收到（%@）", a ? @"非空" : @"空");
                     };
                     void (*fp)(id, SEL, int, id, id) = (void (*)(id, SEL, int, id, id))objc_msgSend;
                     fp(session, rs, (int)pid, nil, reply);
@@ -322,7 +323,7 @@ static BOOL AXAgentBootstrap(void) {
             SEL bs = NSSelectorFromString(@"requestBackgroundAssertionForPID:reply:");
             if ([session respondsToSelector:bs]) {
                 @try {
-                    void (^reply)(id) = ^(id a) { ALog(@"  📥 backgroundAssertion reply: %@", a ?: @"(nil)"); };
+                    void (^reply)(id) = ^(id a) { ALog(@"  📥 backgroundAssertion reply 收到（%@）", a ? @"非空" : @"空"); };
                     void (*fp)(id, SEL, int, id) = (void (*)(id, SEL, int, id))objc_msgSend;
                     fp(session, bs, (int)pid, reply);
                     ALog(@"  ✅ requestBackgroundAssertion 已发出");
@@ -453,8 +454,8 @@ extern "C" BOOL AXAgentTap(double x, double y) {
             return NO;
         }
         void (*fp4)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
-        fp4(gSession, syn, rec, ^(NSError *err) {
-            replyDesc = err ? err.localizedDescription : @"(成功)";
+        fp4(gSession, syn, rec, ^(id err) {
+            replyDesc = err ? @"返回错误对象" : @"(nil=成功)";
             dispatch_semaphore_signal(sem);
         });
         long waited = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 10 * NSEC_PER_SEC));
