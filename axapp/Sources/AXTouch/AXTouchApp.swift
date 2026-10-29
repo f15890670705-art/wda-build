@@ -5,8 +5,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "24"
-    static let tag = "v2.0-b24"
+    static let build = "25"
+    static let tag = "v2.0-b25"
 }
 
 /// 分步加载：启动只开 socket，其余全部手动触发，崩溃点一目了然。
@@ -19,7 +19,7 @@ final class WDAHost {
 
     func append(_ s: String) {
         log.append(s)
-        print("[WDHost] \(s)")
+        NSLog("[WDHost] %@@", s)   // NSLog 才进 syslog，print 不进
     }
 
     func clear() { log.removeAll() }
