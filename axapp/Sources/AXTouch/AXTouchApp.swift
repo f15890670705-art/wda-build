@@ -5,8 +5,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "29"
-    static let tag = "v2.0-b29"
+    static let build = "30"
+    static let tag = "v2.0-b30"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -161,6 +161,14 @@ struct ContentView: View {
                     let r = AXTestLocalSocket() ?? "nil"
                     WDAHost.shared.append(r)
                     log = r
+                }
+                    .buttonStyle(.bordered)
+                Button("7 扫描") {
+                    DispatchQueue.global().async {
+                        let r = AXScanLoopbackPorts() ?? "nil"
+                        WDAHost.shared.append("::1 可达端口: \(r)")
+                        FileLog.write("::1 端口扫描结果: \(r)")
+                    }
                 }
                     .buttonStyle(.bordered)
                 Button("6 lockdown") {
