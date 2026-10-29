@@ -22,3 +22,4 @@ BOOL AXAgentSwipe(double x1, double y1, double x2, double y2, double dur);
 BOOL AXAgentLongPress(double x, double y, double dur);
 NSString *AXAgentShot(double maxSide, double quality);
 NSString *AXAgentProbeRecording(void);
+NSString *AXAgentDumpTree(int maxNodes);
