@@ -25,3 +25,4 @@ NSString *AXAgentProbeRecording(void);
 NSString *AXAgentDumpTree(int maxNodes);
 BOOL AXAgentSetAppStateTimeout(double v);
 NSString *AXAgentShotLowLevel(int mode, double quality);
+#import "AXStream.h"
