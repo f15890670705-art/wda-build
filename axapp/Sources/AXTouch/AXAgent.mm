@@ -38,6 +38,7 @@
 #import <Foundation/Foundation.h>
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
+#import <objc/runtime.h>
 #import <dlfcn.h>
 #import <unistd.h>
 #import <stdarg.h>
@@ -590,4 +591,121 @@ extern "C" NSString *AXAgentShot(double maxSide, double quality) {
              (t1 - t0) * 1000.0, (t2 - t1) * 1000.0);
         return [jpeg base64EncodedStringWithOptions:0];
     }
+}
+
+
+#pragma mark - 7. 录屏流探针（runtime dump + 试调私有 API）
+
+static void AXDumpClass(NSString *name) {
+    Class cls = NSClassFromString(name);
+    if (!cls) { ALog(@"  [dump] %@ → 不存在", name); return; }
+    ALog(@"  [dump] %@", name);
+
+    unsigned int n = 0;
+    Method *ms = class_copyMethodList(cls, &n);
+    NSMutableString *sb = [NSMutableString string];
+    for (unsigned i = 0; i < n; i++) {
+        [sb appendFormat:@"%@ |", NSStringFromSelector(method_getName(ms[i]))];
+        if (sb.length > 900) break;
+    }
+    free(ms);
+    ALog(@"     方法(%u): %@", n, sb.length ? sb : @"(无)");
+
+    unsigned int ivn = 0;
+    Ivar *iv = class_copyIvarList(cls, &ivn);
+    NSMutableString *s2 = [NSMutableString string];
+    for (unsigned i = 0; i < ivn; i++) {
+        const char *nm = ivar_getName(iv[i]);
+        const char *tp = ivar_getTypeEncoding(iv[i]);
+        [s2 appendFormat:@"%s(%s) |", nm ? nm : "?", tp ? tp : "?"];
+        if (s2.length > 600) break;
+    }
+    free(iv);
+    ALog(@"     成员(%u): %@", ivn, s2.length ? s2 : @"(无)");
+}
+
+extern "C" NSString *AXAgentProbeRecording(void) {
+    ALog(@"===== 录屏流探针开始 =====");
+    if (!gReady || !gSession) { ALog(@"❌ 会话未就绪"); return @"not ready"; }
+
+    SEL sSupp = NSSelectorFromString(@"supportsScreenRecording");
+    SEL sActive = NSSelectorFromString(@"isScreenRecordingActive");
+    SEL sPref = NSSelectorFromString(@"preferScreenshotsOverScreenRecording");
+    ALog(@"会话 respondsToSelector:");
+    ALog(@"   supportsScreenRecording            = %d", (int)[gSession respondsToSelector:sSupp]);
+    ALog(@"   isScreenRecordingActive            = %d", (int)[gSession respondsToSelector:sActive]);
+    ALog(@"   preferScreenshotsOverScreenRecording = %d", (int)[gSession respondsToSelector:sPref]);
+
+    if ([gSession respondsToSelector:sSupp]) {
+        @try {
+            BOOL b = ((BOOL (*)(id, SEL))objc_msgSend)(gSession, sSupp);
+            ALog(@"   supportsScreenRecording 返回值 = %d", (int)b);
+        } @catch (NSException *e) { ALog(@"   调用异常: %@", e.reason); }
+    }
+    if ([gSession respondsToSelector:sActive]) {
+        @try {
+            BOOL b = ((BOOL (*)(id, SEL))objc_msgSend)(gSession, sActive);
+            ALog(@"   isScreenRecordingActive 返回值 = %d", (int)b);
+        } @catch (NSException *e) { ALog(@"   调用异常: %@", e.reason); }
+    }
+
+    ALog(@"--- 类结构 ---");
+    AXDumpClass(@"XCTScreenRecordingRequest");
+    AXDumpClass(@"XCTAttachmentFuture");
+    AXDumpClass(@"XCUILocalDeviceScreenRecordingIPCInterface");
+    AXDumpClass(@"XCUILocalDeviceScreenDataSource");
+
+    // 试构造 request
+    Class reqCls = NSClassFromString(@"XCTScreenRecordingRequest");
+    id req = nil;
+    if (reqCls) {
+        @try {
+            req = [[reqCls alloc] init];
+            ALog(@"✅ [[XCTScreenRecordingRequest alloc] init] = %p", (__bridge void *)req);
+            // 打印所有可读属性值
+            unsigned int pn = 0;
+            objc_property_t *props = class_copyPropertyList(reqCls, &pn);
+            for (unsigned i = 0; i < pn; i++) {
+                const char *nm = property_getName(props[i]);
+                @try {
+                    id v = [req valueForKey:[NSString stringWithUTF8String:nm]];
+                    ALog(@"     属性 %s = %@", nm, v);
+                } @catch (NSException *e) { ALog(@"     属性 %s → %@", nm, e.reason); }
+            }
+            free(props);
+        } @catch (NSException *e) {
+            ALog(@"❌ request init 异常: %@ / %@", e.name, e.reason);
+        }
+    }
+
+    // 真调一次
+    SEL start = NSSelectorFromString(@"startScreenRecordingWithRequest:withReply:");
+    ALog(@"startScreenRecordingWithRequest:withReply: 存在 = %d", (int)[gSession respondsToSelector:start]);
+    if (req && [gSession respondsToSelector:start]) {
+        @try {
+            void (^reply)(id, id) = ^(id future, id err) {
+                ALog(@"  📥 录屏 reply: future=%@(%@)  err=%@",
+                     future ? NSStringFromClass([future class]) : @"nil",
+                     future ?: @"",
+                     err ?: @"nil");
+                if (future) {
+                    AXDumpClass(NSStringFromClass([future class]));
+                    @try {
+                        if ([future respondsToSelector:NSSelectorFromString(@"isFulfilled")]) {
+                            BOOL f = ((BOOL (*)(id, SEL))objc_msgSend)(future, NSSelectorFromString(@"isFulfilled"));
+                            ALog(@"     future.isFulfilled = %d", (int)f);
+                        }
+                    } @catch (NSException *e) { ALog(@"     future 探测异常: %@", e.reason); }
+                }
+            };
+            void (*fp)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
+            fp(gSession, start, req, reply);
+            ALog(@"✅ 已发起 startScreenRecording（等 3 秒看回调）");
+            [NSThread sleepForTimeInterval:3.0];
+        } @catch (NSException *e) {
+            ALog(@"❌ startScreenRecording 异常: %@ / %@", e.name, e.reason);
+        }
+    }
+    ALog(@"===== 录屏流探针结束 =====");
+    return @"probe done";
 }
