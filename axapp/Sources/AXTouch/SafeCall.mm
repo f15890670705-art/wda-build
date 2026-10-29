@@ -280,32 +280,27 @@ extern "C" NSString *AXBootstrapProbe(void) {
         BOOL isDir;
         if ([fm fileExistsAtPath:p isDirectory:&isDir] && isDir) {
             ddiMounted = YES;
-            [out appendFormat:@"✅ DDI 已挂载: %@
-", p];
+            [out appendFormat:@"✅ DDI 已挂载: %@\n", p];
         }
     }
-    if (!ddiMounted) [out appendString:@"❌ DDI 未挂载（/Developer 路径全部不存在）
-"];
+    if (!ddiMounted) [out appendString:@"❌ DDI 未挂载（/Developer 路径全部不存在）\n"];
 
     // 2) 本机网卡 IPv6 地址（AScript 的 mDNS/连接用）
-    [out appendString:@"== 本机 IPv6 地址 ==
-"];
+    [out appendString:@"== 本机 IPv6 地址 ==\n"];
     struct ifaddrs *ifap = NULL, *ifa = NULL;
     if (getifaddrs(&ifap) == 0) {
         for (ifa = ifap; ifa; ifa = ifa->ifa_next) {
             if (ifa->ifa_addr && ifa->ifa_addr->sa_family == AF_INET6) {
                 char host[128] = {0};
                 getnameinfo(ifa->ifa_addr, sizeof(struct sockaddr_in6), host, sizeof(host), NULL, 0, NI_NUMERICHOST);
-                [out appendFormat:@"%@: %s
-", ifa->ifa_name, host];
+                [out appendFormat:@"%@: %s\n", ifa->ifa_name, host];
             }
         }
         freeifaddrs(ifap);
     }
 
     // 3) mDNS 查询 untrusted.tunnelservice（异步，5 秒窗口）
-    [out appendString:@"== mDNS 查询 untrusted.tunnelservice（5 秒）==
-"];
+    [out appendString:@"== mDNS 查询 untrusted.tunnelservice（5 秒）==\n"];
     dispatch_group_t g = dispatch_group_create();
     dispatch_group_enter(g);
     __block DNSServiceRef sd = NULL;
@@ -322,7 +317,6 @@ extern "C" NSString *AXBootstrapProbe(void) {
         dispatch_group_leave(g);
     });
     dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC));
-    [out appendString:@"mDNS 窗口结束
-"];
+    [out appendString:@"mDNS 窗口结束\n"];
     return out;
 }
