@@ -37,6 +37,7 @@
 #import <netinet/tcp.h>
 #import <arpa/inet.h>
 #import <unistd.h>
+#import <sys/time.h>
 #import <fcntl.h>
 #import <errno.h>
 #import <string.h>
