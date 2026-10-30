@@ -1410,6 +1410,8 @@ static int              g_maxSide = 720;
 
 static volatile long long g_ptsMs = 0;         /* 真实墙钟毫秒，严格单调 */
 static volatile BOOL    g_needConfig = YES;    /* 首帧 / 编码器重建后要发 SPS/PPS */
+static volatile int     g_force_key = 0;       /* ★ 新连接 → 强制下一帧 IDR（照 mirror_stream v46：
+                                                  PC 解码器必须从 IDR 起步，否则永远黑屏） */
 static volatile int     g_sentFrames = 0;
 static volatile int     g_lastErr = 0;
 static NSString         *g_lastErrMsg = nil;
@@ -1541,29 +1543,29 @@ static void AXVTCompressionCallback(void *outRefCon, void *srcFrameRefCon,
        NSDictionary 会一直堆着不释放（120 帧后闪退的原因之一） */
     @autoreleasepool {
 
-    /* 首次（或重建后）先补 SPS/PPS：CONFIG 包 */
-    if (g_needConfig) {
+    /* ★ 照 mirror_stream.m 的逻辑：把 SPS/PPS（type 7/8）拆出来存 cfg，其余 NAL 拼 au；
+       关键帧时先发 CONFIG 再发 au —— PC 端把 CONFIG 缓存并拼到每帧前。
+       新连接后 g_force_key 强制 IDR + 立即发 CONFIG，PC 无需等待周期关键帧。 */
+    NSMutableData *cfg = [NSMutableData data];
+    NSMutableData *au = [NSMutableData data];
+    BOOL isKey = NO;
+    BOOL haveParams = NO;
+
+    {
         CMFormatDescriptionRef fmt = CMSampleBufferGetFormatDescription(sbuf);
-        if (fmt) {
-            size_t cnt = 0;
-            if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, 0, NULL, NULL, &cnt, NULL) == noErr && cnt > 0) {
-                NSMutableData *cfg = [NSMutableData data];
-                for (size_t i = 0; i < cnt; i++) {
-                    const uint8_t *ps = NULL;
-                    size_t psLen = 0;
-                    if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, i, &ps, &psLen, NULL, NULL) == noErr && ps && psLen) {
-                        uint8_t sc[4] = {0, 0, 0, 1};
-                        [cfg appendBytes:sc length:4];
-                        [cfg appendBytes:ps length:psLen];
-                    }
-                }
-                if (cfg.length) {
-                    AXSendPacket((uint64_t)1 << 62, cfg.bytes, cfg.length);   /* CONFIG */
-                    ALogShim(@"📺 已发 SPS/PPS %lu 字节", (unsigned long)cfg.length);
+        size_t cnt = 0;
+        if (fmt && CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, 0, NULL, NULL, &cnt, NULL) == noErr && cnt > 0) {
+            haveParams = YES;
+            for (size_t i = 0; i < cnt; i++) {
+                const uint8_t *ps = NULL;
+                size_t psLen = 0;
+                if (CMVideoFormatDescriptionGetH264ParameterSetAtIndex(fmt, i, &ps, &psLen, NULL, NULL) == noErr && ps && psLen) {
+                    uint8_t sc[4] = {0, 0, 0, 1};
+                    [cfg appendBytes:sc length:4];
+                    [cfg appendBytes:ps length:psLen];
                 }
             }
         }
-        g_needConfig = NO;
     }
 
     /* 取 NAL（VT 输出已是 Annex-B，带起始码） */
@@ -1587,24 +1589,40 @@ static void AXVTCompressionCallback(void *outRefCon, void *srcFrameRefCon,
             off += 4;
             if (n == 0 || off + n > total) break;
             uint8_t sc[4] = {0, 0, 0, 1};
-            [nal appendBytes:sc length:4];
-            [nal appendBytes:p + off length:n];
+            [au appendBytes:sc length:4];
+            [au appendBytes:p + off length:n];
+            uint8_t nt = (uint8_t)(p[off] & 0x1F);
+            if (nt == 7 || nt == 8) {            /* SPS / PPS */
+                [cfg appendBytes:sc length:4];
+                [cfg appendBytes:p + off length:n];
+            }
+            if (nt == 5) isKey = YES;            /* IDR */
             off += n;
         }
     }
-    if (nal.length == 0) return;
+    if (au.length == 0) return;
+    if (g_needConfig && haveParams) {
+        [au insertData:cfg atIndex:0];           /* 首帧把 SPS/PPS 拼进 AU，保证解码器能起步 */
+        g_needConfig = NO;
+    }
 
-    /* 关键帧判断 */
-    BOOL keyframe = YES;
+    /* 关键帧判断：NAL 里有 IDR 就算（跟 ios-daemon 一致，不依赖 NotSync 附件） */
     CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sbuf, false);
     if (atts && CFArrayGetCount(atts) > 0) {
         NSDictionary *d = (__bridge NSDictionary *)CFArrayGetValueAtIndex(atts, 0);
-        if (d && [d objectForKey:(__bridge id)kCMSampleAttachmentKey_NotSync]) keyframe = NO;
+        if (d && [d objectForKey:(__bridge id)kCMSampleAttachmentKey_NotSync]
+            && [(NSNumber *)[d objectForKey:(__bridge id)kCMSampleAttachmentKey_NotSync] boolValue])
+            isKey = isKey;                       /* NotSync=1 时以 NAL 扫描结果为准 */
     }
 
-    uint64_t pts = (uint64_t)(AXNextPts() & 0x1FFFFFFFFFFFFFFFULL);   /* 低 61 位 */
-    if (keyframe) pts |= ((uint64_t)1 << 61);
-    AXSendPacket(pts, nal.bytes, nal.length);
+    uint64_t ptsUs = (uint64_t)(AXNextPts() * 1000);              /* ★ 微秒（与安卓一致） */
+    uint64_t flags = isKey ? ((uint64_t)1 << 61) : 0;
+    if (isKey && cfg.length > 0) {
+        AXSendPacket((uint64_t)1 << 62, cfg.bytes, cfg.length);   /* ★ 关键帧前先发 CONFIG */
+        ALogShim(@"📺 关键帧，已发 CONFIG %lu 字节", (unsigned long)cfg.length);
+    }
+    uint64_t ptsAndFlags = (ptsUs & ~((uint64_t)1 << 63 | (uint64_t)1 << 62 | (uint64_t)1 << 61)) | flags;
+    AXSendPacket(ptsAndFlags, au.bytes, au.length);
     g_sentFrames++;
     }   /* @autoreleasepool */
 }
@@ -1738,6 +1756,10 @@ static void *AXEncodeLoop(void *arg) {
                 usleep(50 * 1000);
                 continue;
             }
+            if (g_clientCount > 0 && g_force_key == 0 && g_sentFrames == 0) {
+                /* 首帧也强制 IDR */
+                g_force_key = 1;
+            }
 
             long long t0 = AXNowMs();
             CGSize px = CGSizeZero;
@@ -1813,12 +1835,17 @@ static void *AXEncodeLoop(void *arg) {
             CGImageRelease(img);
             long long t2 = AXNowMs();
 
-            /* 不再每帧强制 IDR：VT 会话首帧自动是 IDR，之后靠 MaxKeyFrameInterval(10s)
-               周期性插入。每帧 60KB 会直接把 WiFi 打爆（20fps×60KB=1.2MB/s）并阻塞 send。 */
+            /* 不再每帧强制 IDR；新连接时 g_force_key 置位一次（照 mirror_stream v46） */
+            CFDictionaryRef fp = NULL;
+            if (g_force_key) {
+                fp = (__bridge CFDictionaryRef)@{ (NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES };
+                g_force_key = 0;
+                ALogShim(@"🎬 新连接，本帧强制 IDR");
+            }
             CMTime pcm = CMTimeMake(AXNextPts(), 1000);
             VTEncodeInfoFlags flags = 0;
             OSStatus es = VTCompressionSessionEncodeFrame(g_vt, pb, pcm, kCMTimeInvalid,
-                                                          NULL, NULL, &flags);
+                                                          fp, NULL, &flags);
             CVPixelBufferRelease(pb);
             if (es != noErr) {
                 AXSetErr((int)es, @"EncodeFrame 失败");
@@ -1891,6 +1918,7 @@ static void *AXAcceptLoop(void *arg) {
             AXSendPreamble(fd, g_encW, g_encH, g_maxSide);
             AXSendSessionHeader(g_encW, g_encH);
             g_needConfig = YES;   /* 新客户端要重新收一份 SPS/PPS */
+            g_force_key = 1;      /* ★ 新连接强制下一帧 IDR（照 mirror_stream v46） */
             g_preambleSent = 1;
         }
     }
