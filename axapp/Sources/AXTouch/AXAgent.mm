@@ -75,30 +75,50 @@ static NSString *AXLogPath(void) {
     return p;
 }
 
+/* ★ 2026-10-31 修「运行日志满屏乱码」的根因：
+   以前 ALog 不加锁，控制队列 / 编码循环 / VT 回调多个线程同时
+   「seek 到末尾 + writeData」，写到一半被别的线程插进来 → 字节交错，
+   一个汉字的 3 个字节被拆到两处 → 文件里出现非法 UTF-8 序列。
+   只要有一处坏字节，日志页整块 UTF-8 解码就失败（以前还会退化成 Latin1，整页花）。
+   现在：全局锁串行化 + 复用 NSDateFormatter（顺带省掉每行一次 formatter 创建）。 */
+static NSLock *gLogLock = nil;
+static NSDateFormatter *gLogDF = nil;
+
 static void ALog(NSString *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
-    NSLog(@"[AXAgent] %@", s);
+    NSLog(@"%@", s);
 
-    NSDateFormatter *df = [[NSDateFormatter alloc] init];
-    df.dateFormat = @"HH:mm:ss.SSS";
-    NSString *line = [NSString stringWithFormat:@"%@ %@\n", [df stringFromDate:[NSDate date]], s];
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        gLogLock = [NSLock new];
+        gLogDF = [NSDateFormatter new];
+        gLogDF.dateFormat = @"HH:mm:ss.SSS";
+    });
 
-    NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
-    NSString *path = AXLogPath();
-    NSFileManager *fm = [NSFileManager defaultManager];
-    if (![fm fileExistsAtPath:path]) {
-        [d writeToFile:path atomically:YES];
-        return;
+    [gLogLock lock];
+    @try {
+        NSString *line = [NSString stringWithFormat:@"%@ %@\n",
+                          [gLogDF stringFromDate:[NSDate date]], s];
+        NSData *d = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSString *path = AXLogPath();
+        NSFileManager *fm = [NSFileManager defaultManager];
+        if (![fm fileExistsAtPath:path]) {
+            [d writeToFile:path atomically:YES];
+        } else {
+            NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+            if (fh) {
+                [fh seekToEndOfFile];
+                [fh writeData:d];
+                [fh closeFile];
+            }
+        }
+    } @catch (NSException *e) {
+        /* 日志失败绝不能影响主流程 */
     }
-    NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
-    if (fh) {
-        @try { [fh seekToEndOfFile]; [fh writeData:d]; }
-        @catch (NSException *e) { }
-        [fh closeFile];
-    }
+    [gLogLock unlock];
 }
 
 /* AXStream.mm 用的日志入口（ALog 是 static，跨文件用不了） */
