@@ -494,36 +494,6 @@ static NSDictionary *AXLockdownRoundtrip2(const char *host, int port, NSDictiona
     }
     [d appendFormat:@"write✅ "];
 
-    int flags = fcntl(fd, F_GETFL, 0);
-    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
-    int r = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
-    if (r != 0 && errno == EINPROGRESS) {
-        fd_set wset; FD_ZERO(&wset); FD_SET(fd, &wset);
-        struct timeval tv = {2, 0};
-        if (select(fd + 1, NULL, &wset, NULL, &tv) <= 0) { close(fd); return nil; }
-        int err = 0; socklen_t elen = sizeof(err);
-        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
-        if (err != 0) { close(fd); return nil; }
-    } else if (r != 0) {
-        close(fd); return nil;
-    }
-    fcntl(fd, F_SETFL, flags);
-
-    /* ★ 恢复阻塞后必须给收发加超时：否则对端收了请求不回（比如非 lockdown 服务）
-       read 会永远阻塞 —— b57 上线即把控制队列卡死的根因 */
-    struct timeval iotv = {3, 0};
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &iotv, sizeof(iotv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &iotv, sizeof(iotv));
-
-    NSData *pl = [NSPropertyListSerialization dataWithPropertyList:req
-                                                            format:NSPropertyListBinaryFormat_v1_0
-                                                           options:0 error:nil];
-    if (!pl.length) { close(fd); return nil; }
-    uint32_t len = htonl((uint32_t)pl.length);
-    NSMutableData *msg = [NSMutableData dataWithBytes:&len length:4];
-    [msg appendData:pl];
-    if (write(fd, msg.bytes, msg.length) != (ssize_t)msg.length) { close(fd); return nil; }
-
     uint8_t lh[4];
     ssize_t got = 0;
     while (got < 4) {
