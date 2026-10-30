@@ -165,6 +165,7 @@ static NSString *AXLanIP(void) {
 @property (nonatomic, strong) AXInfoRow *devOS;
 @property (nonatomic, strong) AXInfoRow *devScreen;
 @property (nonatomic, strong) AXInfoRow *devPort;
+@property (nonatomic, strong) AXInfoRow *devUDID;
 
 @property (nonatomic, strong) UIImageView *preview;
 @property (nonatomic, strong) UILabel     *frameStat;
@@ -192,6 +193,7 @@ static NSString *AXLanIP(void) {
 - (void)didTapTree;
 - (void)didTapServer;
 - (void)didTapStream;
+- (void)didTapEditUDID;
 - (void)didTapShot;
 - (void)didTapBurst;
 - (void)didTapDiag:(UIButton *)sender;
@@ -407,10 +409,17 @@ static NSString *AXLanIP(void) {
     self.devOS     = [[AXInfoRow alloc] initWithKey:@"系统版本"];
     self.devScreen = [[AXInfoRow alloc] initWithKey:@"屏幕像素"];
     self.devPort   = [[AXInfoRow alloc] initWithKey:@"控制端口"];
+    // ★ 设备 ID：普通 App 拿不到真 UDID，由人填一次（存 Keychain，重装仍在）。
+    //   preamble 里带着它，PC 才能把 USB 与无线认成同一台。
+    self.devUDID   = [[AXInfoRow alloc] initWithKey:@"设备 ID"];
+    self.devUDID.valueLabel.text = @"点此输入";
+    self.devUDID.userInteractionEnabled = YES;
+    [self.devUDID addGestureRecognizer:[[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(didTapEditUDID)]];
     [self.cardDevice addSubview:self.devName];
     [self.cardDevice addSubview:self.devOS];
     [self.cardDevice addSubview:self.devScreen];
     [self.cardDevice addSubview:self.devPort];
+    [self.cardDevice addSubview:self.devUDID];
 
     [NSLayoutConstraint activateConstraints:@[
         [badge.topAnchor     constraintEqualToAnchor:self.cardDevice.topAnchor constant:16],
@@ -436,7 +445,12 @@ static NSString *AXLanIP(void) {
         [self.devPort.leadingAnchor   constraintEqualToAnchor:self.cardDevice.leadingAnchor constant:16],
         [self.devPort.trailingAnchor  constraintEqualToAnchor:self.cardDevice.trailingAnchor constant:-16],
         [self.devPort.heightAnchor    constraintEqualToConstant:24],
-        [self.devPort.bottomAnchor    constraintEqualToAnchor:self.cardDevice.bottomAnchor constant:-16],
+
+        [self.devUDID.topAnchor       constraintEqualToAnchor:self.devPort.bottomAnchor constant:10],
+        [self.devUDID.leadingAnchor   constraintEqualToAnchor:self.cardDevice.leadingAnchor constant:16],
+        [self.devUDID.trailingAnchor  constraintEqualToAnchor:self.cardDevice.trailingAnchor constant:-16],
+        [self.devUDID.heightAnchor    constraintEqualToConstant:24],
+        [self.devUDID.bottomAnchor    constraintEqualToAnchor:self.cardDevice.bottomAnchor constant:-16],
     ]];
 }
 
@@ -618,6 +632,29 @@ static NSString *AXLanIP(void) {
 
 #pragma mark - 刷新
 
+- (void)didTapEditUDID {
+    NSString *cur = AXStreamCurrentUDID() ?: @"";
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"设备 ID（UDID）"
+                                                               message:@"填这台 iPhone 的真实 UDID，例如 00008120-000E29E20A80201E。\n保存后推流会用它，PC 才能把 USB 与无线认成同一台。"
+                                                        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.text = cur;
+        tf.placeholder = @"00008120-000E29E20A80201E";
+        tf.autocapitalizationType = UITextAutocapitalizationTypeAllCharacters;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+    }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    __weak typeof(self) ws = self;
+    [ac addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NSString *v = ac.textFields.firstObject.text ?: @"";
+        AXStreamSetUDIDPersist(v);
+        __strong typeof(ws) ss = ws;
+        [ss refreshAll];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
 - (void)refreshAll {
     BOOL ready = AXAgentIsReady();
     self.statusText.text = ready ? @"AGENT READY" : @"会话未就绪";
@@ -644,6 +681,11 @@ static NSString *AXLanIP(void) {
     CGFloat sc = [UIScreen mainScreen].scale;
     self.devScreen.valueLabel.text = [NSString stringWithFormat:@"%.0f x %.0f",
                                       px.width * sc, px.height * sc];
+    {
+        NSString *u = AXStreamCurrentUDID() ?: @"";
+        self.devUDID.valueLabel.text = u.length ? u : @"点此输入";
+        self.devUDID.valueLabel.textColor = u.length ? ATText() : ATSubText();
+    }
     self.devPort.valueLabel.text   = @"10010 (TCP/JSON)";
 }
 
