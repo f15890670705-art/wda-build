@@ -30,5 +30,12 @@ NSString *AXLockdownUDIDResult(void);
 BOOL AXAgentSetAppStateTimeout(double v);
 BOOL AXAgentIsBootstrapping(void);
 BOOL AXAgentPressHome(void);
+BOOL AXAgentPinch(double cx, double cy, double startGap, double endGap, double dur);
+BOOL AXAgentTypeText(NSString *text);
+BOOL AXAgentKey(NSString *key, unsigned long mods);
+BOOL AXAgentPaste(NSString *text);
+BOOL AXAgentPasteboardSet(NSString *text);
+NSString *AXAgentPasteboardGet(void);
+NSString *AXAgentTouchSeq(int mode, double x1, double y1, double x2, double y2, int steps, int gapMs);
 NSString *AXAgentShotLowLevel(int mode, double quality);
 #import "AXStream.h"
