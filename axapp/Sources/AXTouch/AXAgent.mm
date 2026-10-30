@@ -548,6 +548,22 @@ extern "C" void AXAgentStartSticky(void) {
 #pragma mark - 5. 手势（swipe / longpress / 任意轨迹）
 
 /// xy: [x0,y0, x1,y1, ...]  t: 每个点的时间偏移(秒)，最后一个点是 liftUp
+/* 按 Home 键（用自动化会话里的 XCUIDevice.pressButton:），用于自己复现"退到后台" */
+extern "C" BOOL AXAgentPressHome(void) {
+    if (!gReady) { ALog(@"❌ pressHome: 会话未就绪"); return NO; }
+    Class scrCls = NSClassFromString(@"XCUIScreen");
+    if (!scrCls) return NO;
+    id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+    if (!screen) return NO;
+    id dev = ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device"));
+    if (!dev) { ALog(@"❌ pressHome: 无 device"); return NO; }
+    SEL pb = NSSelectorFromString(@"pressButton:");
+    if (![dev respondsToSelector:pb]) { ALog(@"❌ pressHome: 无 pressButton:"); return NO; }
+    ((void (*)(id, SEL, long))objc_msgSend)(dev, pb, 1);   /* XCUIDeviceButtonHome = 1 */
+    ALog(@"🏠 pressHome 已发送");
+    return YES;
+}
+
 extern "C" BOOL AXAgentGesture(const double *xy, const double *t, int n) {
     if (!gReady || !gSession) { ALog(@"❌ gesture 失败：会话未就绪"); return NO; }
     if (n < 2) { ALog(@"❌ gesture 失败：点数不足"); return NO; }
@@ -1770,8 +1786,7 @@ static void AXVTCompressionCallback(void *outRefCon, void *srcFrameRefCon,
 }
 
 static OSType g_vtFmt = 0;      /* 当前 VT 会话的源像素格式 */
-static int g_forceSW = 0;        /* 1=强制软件编码（后台被收回硬编时的兜底） */
-static long long g_vtDropAt = 0; /* 上次丢弃会话的时间：短时间内反复失效就切软编 */
+static long long g_vtDropAt = 0; /* 上次丢弃会话的时间（诊断用） */
 
 /* 丢弃当前会话：下次 AXVTEnsureWithFormat 会重建。
    ★ 必须同时清 preamble 标记：新会话的 SPS/PPS 变了，客户端要重新收一遍。 */
@@ -1804,13 +1819,8 @@ static BOOL AXVTEnsureWithFormat(int w, int h, OSType fmt) {
         (NSString *)kCVPixelBufferWidthKey: @(w),
         (NSString *)kCVPixelBufferHeightKey: @(h),
     };
-    NSDictionary *encSpec = nil;
-    if (g_forceSW) {
-        encSpec = @{ (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO };
-    }
     OSStatus st = VTCompressionSessionCreate(NULL, (int32_t)w, (int32_t)h,
-                                             kCMVideoCodecType_H264,
-                                             (__bridge CFDictionaryRef)encSpec,
+                                             kCMVideoCodecType_H264, NULL,
                                              (__bridge CFDictionaryRef)srcAttrs,
                                              NULL, AXVTCompressionCallback, NULL, &g_vt);
     if (st != noErr || !g_vt) {
@@ -1829,7 +1839,7 @@ static BOOL AXVTEnsureWithFormat(int w, int h, OSType fmt) {
     g_encW = w; g_encH = h; g_vtFmt = fmt;
     g_needConfig = YES;
     g_ptsMs = 0;
-    ALogShim(@"✅ VT 会话建立 %dx%d%s", w, h, g_forceSW ? "（软件编码）" : "");
+    ALogShim(@"✅ VT 会话建立 %dx%d fmt=%u vt=%p", w, h, (unsigned)fmt, (void *)g_vt);
     ALogShim(@"✅ VT 编码器就绪 %dx%d fmt=%u  %d kbps  %d fps", w, h, (unsigned)fmt,
              g_bitrate / 1000, g_fps);
     return YES;
@@ -1946,6 +1956,19 @@ static void *AXEncodeLoop(void *arg) {
             CGSize px = CGSizeZero;
             NSData *enc = AXGrabEncodedData(&px);
             if (!enc) {
+                /* 采集失败：把 AXSetErr 记的原因打出来（每 20 次打一条，别刷爆日志） */
+                static int miss = 0;
+                miss++;
+                if (miss % 20 == 1) {
+                    ALogShim(@"⚠️ 采集失败第%d次: %@  state=%ld",
+                             miss, AXAgentLastError() ?: @"?", (long)[UIApplication sharedApplication].applicationState);
+                }
+                if ((AXNowMs() - statT0) >= 5000) {
+                    ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d 采集失败=%d vt=%p %dx%d",
+                             (long)[UIApplication sharedApplication].applicationState,
+                             g_clientCount, g_sentFrames, miss, (void *)g_vt, g_encW, g_encH);
+                    statT0 = AXNowMs();
+                }
                 usleep(30 * 1000);
                 continue;
             }
@@ -2034,10 +2057,9 @@ static void *AXEncodeLoop(void *arg) {
                    以前这里只记错误不重建，会话一废整条流就永远停住（sent 卡死）→ 现在重建。 */
                 long long nowMs = AXNowMs();
                 if (es == kVTInvalidSessionErr || es == kVTParameterErr) {
-                    if (g_vtDropAt > 0 && nowMs - g_vtDropAt < 5000 && !g_forceSW) {
-                        g_forceSW = 1;
-                        ALogShim(@"🔧 5 秒内连续失效 → 切换到软件编码");
-                    }
+                    ALogShim(@"❌ EncodeFrame st=%d vt=%p %dx%d 距上次丢弃 %lldms",
+                             (int)es, (void *)g_vt, g_encW, g_encH,
+                             g_vtDropAt ? (nowMs - g_vtDropAt) : -1LL);
                     g_vtDropAt = nowMs;
                     AXVTDrop("EncodeFrame 返回无效会话");
                 }
@@ -2048,6 +2070,14 @@ static void *AXEncodeLoop(void *arg) {
 
             frameCount++;
             statFrames++;
+            if ((AXNowMs() - statT0) >= 5000) {
+                ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d fps=%d vt=%p %dx%d",
+                         (long)[UIApplication sharedApplication].applicationState,
+                         g_clientCount, g_sentFrames,
+                         (int)(statFrames * 1000 / MAX(1, (AXNowMs() - statT0))),
+                         (void *)g_vt, g_encW, g_encH);
+                statT0 = AXNowMs(); statFrames = 0;
+            }
             if (frameCount % 30 == 0) {
                 long long el = AXNowMs() - t0;
                 ALogShim(@"🎬 第 %d 帧  抓%.0f 转%.0f 提交%.0f ms  %dx%d  已发%d",
@@ -2179,6 +2209,29 @@ static NSData *AXSilentWav(void) {
 static AXBGKeeper *g_bgKeeper = nil;
 static CLLocationManager *g_locMgr = nil;
 static CBCentralManager *g_btMgr = nil;
+
+/* 应用前后台切换打点：用来判断"流断"到底是 App 被挂起，还是编码/采集出错 */
+static void AXInstallLifecycleLog(void) {
+    static int done = 0;
+    if (done) return;
+    done = 1;
+    NSNotificationCenter *nc = [NSNotificationCenter defaultCenter];
+    void (^logState)(NSString *) = ^(NSString *tag) {
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ALogShim(@"📱 生命周期: %@  state=%ld  clients=%d  frames=%d  vt=%p",
+                     tag, (long)[UIApplication sharedApplication].applicationState,
+                     g_clientCount, g_sentFrames, (void *)g_vt);
+        });
+    };
+    [nc addObserverForName:UIApplicationWillResignActiveNotification object:nil queue:nil
+                 usingBlock:^(NSNotification *n) { logState(@"willResignActive"); }];
+    [nc addObserverForName:UIApplicationDidEnterBackgroundNotification object:nil queue:nil
+                 usingBlock:^(NSNotification *n) { logState(@"didEnterBackground"); }];
+    [nc addObserverForName:UIApplicationWillEnterForegroundNotification object:nil queue:nil
+                 usingBlock:^(NSNotification *n) { logState(@"willEnterForeground"); }];
+    [nc addObserverForName:UIApplicationDidBecomeActiveNotification object:nil queue:nil
+                 usingBlock:^(NSNotification *n) { logState(@"didBecomeActive"); }];
+}
 
 static void AXStartKeepAlive(void) {
     if (g_keepAliveOn) return;
@@ -2388,7 +2441,8 @@ BOOL AXStreamStart(uint16_t port) {
     g_sentFrames = 0;
     g_encW = g_encH = 0;
 
-    AXStartKeepAlive();   /* ★ 先让 App 能在后台活下去，否则后台一挂流就断 */
+    AXInstallLifecycleLog();
+    AXStartKeepAlive();   /* 后台保活（音频/定位/蓝牙） */
     pthread_create(&g_acceptTid, NULL, AXAcceptLoop, NULL);
     if (g_scheme == 1) {
         ALogShim(@"🎥 采集方案：ReplayKit");
