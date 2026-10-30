@@ -46,6 +46,8 @@
 #import <Security/Security.h>
 #import <ReplayKit/ReplayKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CoreBluetooth/CoreBluetooth.h>
+#import <CoreLocation/CoreLocation.h>
 #import "AXStream.h"
 #import <sys/time.h>
 #import <signal.h>
@@ -2119,6 +2121,31 @@ static NSData *AXSilentWav(void) {
     return d;
 }
 
+/* AS 方案：后台模式多路并联，哪条通了都活着。
+   - audio：静音循环（最省电，不弹权限）
+   - location：CLLocationManager 持续定位（最稳，需「始终允许」）
+   - bluetooth-central：CBCentralManager 周期扫描（无状态栏提示，需蓝牙权限） */
+@interface AXBGKeeper : NSObject <CLLocationManagerDelegate, CBCentralManagerDelegate>
+@end
+
+@implementation AXBGKeeper
+- (void)locationManager:(CLLocationManager *)m didUpdateLocations:(NSArray<CLLocation *> *)locs { }
+- (void)locationManager:(CLLocationManager *)m didFailWithError:(NSError *)e { }
+- (void)locationManagerDidChangeAuthorization:(CLLocationManager *)m {
+    ALogShim(@"📍 定位授权状态=%d", (int)m.authorizationStatus);
+}
+- (void)centralManagerDidUpdateState:(CBCentralManager *)c {
+    ALogShim(@"📶 蓝牙状态=%ld", (long)c.state);
+    if (c.state == CBManagerStatePoweredOn) {
+        [c scanForPeripheralsWithServices:@[[CBUUID UUIDWithString:@"FFF0"]] options:nil];
+    }
+}
+@end
+
+static AXBGKeeper *g_bgKeeper = nil;
+static CLLocationManager *g_locMgr = nil;
+static CBCentralManager *g_btMgr = nil;
+
 static void AXStartKeepAlive(void) {
     if (g_keepAliveOn) return;
     g_keepAliveOn = 1;
@@ -2147,6 +2174,33 @@ static void AXStartKeepAlive(void) {
         BOOL ok = [g_keepAlivePlayer play];
         ALogShim(@"🔋 后台常驻已开启（音频 ok=%d cat/act err=%@/%@）", ok,
                  e1.localizedDescription ?: @"ok", e2.localizedDescription ?: @"ok");
+
+        /* ② 定位保活（最稳；需要「始终允许」权限，状态栏会有定位箭头） */
+        if (!g_bgKeeper) g_bgKeeper = [AXBGKeeper new];
+        if (!g_locMgr) {
+            g_locMgr = [CLLocationManager new];
+            g_locMgr.delegate = g_bgKeeper;
+            g_locMgr.desiredAccuracy = kCLLocationAccuracyThreeKilometers;
+            g_locMgr.distanceFilter = 1000;
+            g_locMgr.pausesLocationUpdatesAutomatically = NO;
+            @try { g_locMgr.allowsBackgroundLocationUpdates = YES; } @catch (NSException *e) {
+                ALogShim(@"⚠️ allowsBackgroundLocationUpdates 设置失败: %@", e.reason);
+            }
+            [g_locMgr requestAlwaysAuthorization];
+        }
+        [g_locMgr startUpdatingLocation];
+        ALogShim(@"📍 定位保活已启动（授权=%d）", (int)g_locMgr.authorizationStatus);
+
+        /* ③ 蓝牙中心保活（无状态栏提示，需蓝牙权限） */
+        if (!g_btMgr) {
+            g_btMgr = [[CBCentralManager alloc] initWithDelegate:g_bgKeeper
+                                                           queue:dispatch_get_main_queue()
+                                                         options:@{CBCentralManagerOptionShowPowerAlertKey: @NO}];
+        }
+        if (g_btMgr.state == CBManagerStatePoweredOn) {
+            [g_btMgr scanForPeripheralsWithServices:@[[CBUUID UUIDWithString:@"FFF0"]] options:nil];
+        }
+        ALogShim(@"📶 蓝牙保活已启动（状态=%ld）", (long)g_btMgr.state);
     });
 }
 
@@ -2155,6 +2209,8 @@ static void AXStopKeepAlive(void) {
     g_keepAliveOn = 0;
     dispatch_async(dispatch_get_main_queue(), ^{
         if (g_keepAlivePlayer) { [g_keepAlivePlayer stop]; }
+        if (g_locMgr) [g_locMgr stopUpdatingLocation];
+        if (g_btMgr) [g_btMgr stopScan];
         if (g_bgTask != UIBackgroundTaskInvalid) {
             [[UIApplication sharedApplication] endBackgroundTask:g_bgTask];
             g_bgTask = UIBackgroundTaskInvalid;
