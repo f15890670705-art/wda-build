@@ -66,6 +66,8 @@
 #import <ImageIO/ImageIO.h>
 #import <CoreVideo/CoreVideo.h>
 #import <VideoToolbox/VideoToolbox.h>
+#import <mach/mach.h>
+#import <mach/mach_time.h>
 
 static id  gSession = nil;
 static BOOL gReady = NO;
@@ -1863,10 +1865,25 @@ static volatile int     g_clientCount = 0;
 
 static VTCompressionSessionRef g_vt = NULL;
 static int              g_encW = 0, g_encH = 0;
+/* ★ 编码输入的像素缓冲池 + 复用的色彩空间（避免每帧分配 IOSurface） */
+static CVPixelBufferPoolRef g_pbPool = NULL;
+static int              g_pbPoolW = 0, g_pbPoolH = 0;
+static CGColorSpaceRef  g_rgbCS = NULL;
 /* ★ maxSide 变更后要求下一帧按新值重算编码尺寸。
    不能直接把 g_encW/g_encH 清 0 —— accept 侧发 preamble 用的就是它们，
    清 0 会让新客户端收到 0x0 的 preamble。 */
 static volatile int     g_encDirty = 0;
+/* ★ 2026-10-31 发热定位用「分段跑」开关（10010 的 {"cmd":"bench","mode":N}）。
+   手机烫的时候靠猜没用，把链路一段段摘掉看温度才准：
+     0 = 正常全链路（默认）
+     1 = 只截图      —— 只调 AXGrabEncodedData，拿到 NSData 直接丢；不解码、不编码、不发送
+     2 = 截图+解码+缩放 —— 再往下走到 CVPixelBuffer 写好；不编码、不发送
+     3 = 只编码发送  —— 完全不截图，用池里一块内存反复编码发出去（黑帧）
+     4 = 空转        —— 什么都不做，只留心跳（测量底线）
+   对比 0/1/2/3/4 时的 thermalState + 自身 CPU 就能指出热源在 daemon 截图、App 缩放，还是编码发送。 */
+static volatile int     g_benchMode = 0;
+/* 上一帧的屏幕像素尺寸（bench=3 时不能截图，要靠它算编码尺寸） */
+static CGSize           g_lastPxSize = {0, 0};
 static int              g_bitrate = 2000000;   /* 2 Mbps */
 static int              g_fps = 20;
 static int              g_maxSide = 720;
@@ -1909,6 +1926,40 @@ static long long AXNowMs(void) {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (long long)tv.tv_sec * 1000LL + tv.tv_usec / 1000;
+}
+
+/* 本进程 CPU 占用（两次调用之间的平均百分比）。bench 各模式对比用 ——
+   task_basic_info 给的是累计 CPU 时间，必须自己求差，单次读数没有意义。 */
+static double AXSelfCPUPercent(void) {
+    static uint64_t lastCPU = 0, lastUs = 0;
+    struct task_basic_info_64 ti;
+    mach_msg_type_number_t cnt = TASK_BASIC_INFO_64_COUNT;
+    if (task_info(mach_task_self(), TASK_BASIC_INFO_64, (task_info_t)&ti, &cnt) != KERN_SUCCESS) {
+        return -1.0;
+    }
+    uint64_t cpu = (uint64_t)ti.user_time.seconds * 1000000ULL + (uint64_t)ti.user_time.microseconds
+                 + (uint64_t)ti.system_time.seconds * 1000000ULL + (uint64_t)ti.system_time.microseconds;
+    static mach_timebase_info_data_t tb;
+    if (tb.denom == 0) mach_timebase_info(&tb);
+    uint64_t nowUs = mach_absolute_time() * tb.numer / tb.denom / 1000ULL;
+    double pct = -1.0;
+    if (lastUs && nowUs > lastUs) {
+        pct = (double)(cpu - lastCPU) * 100.0 / (double)(nowUs - lastUs);
+    }
+    lastCPU = cpu; lastUs = nowUs;
+    return pct;
+}
+
+/* 系统热压力等级（公开 API）：nominal → fair → serious → critical */
+static const char *AXThermalStateStr(void) {
+    switch ([NSProcessInfo processInfo].thermalState) {
+        case NSProcessInfoThermalStateNominal:  return "nominal";
+        case NSProcessInfoThermalStateFair:     return "fair";
+        case NSProcessInfoThermalStateSerious:  return "serious";
+        case NSProcessInfoThermalStateCritical: return "critical";
+        default: break;
+    }
+    return "?";
 }
 
 /* 严格单调递增（同毫秒内 +1），照 mirror_stream.m v33 的 PTS 处理 */
@@ -2320,6 +2371,32 @@ static void *AXEncodeLoop(void *arg) {
                 usleep(50 * 1000);
                 continue;
             }
+            /* ★ 发热定位：空转档 —— 什么都不做，只留心跳（这是温度/CPU 的底线基准） */
+            if (g_benchMode == 4) {
+                usleep(30 * 1000);
+                continue;
+            }
+            /* ★ 发热定位：只截图档 —— 只把截图调出来就丢，不解码、不缩放、不编码、不发送。
+               如果这一档就已经烫，说明热源在 daemon 的全屏拍照本身，后面怎么优化都没用。 */
+            if (g_benchMode == 1) {
+                long long g0 = AXNowMs();
+                CGSize gp = CGSizeZero;
+                NSData *ge = AXGrabEncodedData(&gp);
+                g_lastGrabMs = AXNowMs() - g0;
+                if (ge) { g_lastImgBytes = (long long)ge.length; g_lastPxSize = gp; }
+                statFrames++;
+                if ((AXNowMs() - statT0) >= 5000) {
+                    ALogShim(@"❤️[bench1 只截图] fps=%d 图%luKB 截%lldms 热=%s cpu=%.0f%%",
+                             (int)(statFrames * 1000 / MAX(1, (AXNowMs() - statT0))),
+                             (unsigned long)(g_lastImgBytes / 1024), g_lastGrabMs,
+                             AXThermalStateStr(), AXSelfCPUPercent());
+                    statT0 = AXNowMs(); statFrames = 0;
+                }
+                long long iv = 1000 / MAX(1, g_fps);
+                long long spent = AXNowMs() - g0;
+                if (iv > spent) usleep((useconds_t)((iv - spent) * 1000));
+                continue;
+            }
             /* 刚提交过手势 → 短暂停采，让 daemon 优先处理合成事件（否则点击要排队）
                ★ 但这个窗口绝不能挡住输入唤醒：它是"让资源"，不是"让用户等"。
                用户在这个窗口里又动了一下手指，说明他要的是立刻看到反应 → 立即结束停采。 */
@@ -2339,13 +2416,25 @@ static void *AXEncodeLoop(void *arg) {
 
             long long t0 = AXNowMs();
             CGSize px = CGSizeZero;
-            NSData *enc = AXGrabEncodedData(&px);
+            NSData *enc = nil;
+            if (g_benchMode == 3) {
+                /* ★ 发热定位：只编码发送档 —— 完全不碰截图 daemon。
+                   第一次没有尺寸时借拍一张拿 px，之后一直用缓存尺寸。 */
+                px = g_lastPxSize;
+                if (px.width <= 0 || px.height <= 0) {
+                    enc = AXGrabEncodedData(&px);
+                    g_lastPxSize = px;
+                }
+            } else {
+                enc = AXGrabEncodedData(&px);
+                if (px.width > 0 && px.height > 0) g_lastPxSize = px;
+            }
             /* ★ 截图耗时（XPC 往返 + 图片回传）此前从未统计，心跳里只看到"解"和"绘"，
                很容易误判成采集很快。整屏截一张是 3.6MP、JPEG 约 200KB / TIFF 约 10MB，
                这一段的耗时往往是整帧里最大的一块，必须打出来。 */
             g_lastGrabMs = AXNowMs() - t0;
             if (enc) g_lastImgBytes = (long long)enc.length;
-            if (!enc) {
+            if (!enc && g_benchMode != 3) {
                 /* 采集失败：把 AXSetErr 记的原因打出来（每 20 次打一条，别刷爆日志） */
                 static int miss = 0;
                 miss++;
@@ -2402,7 +2491,7 @@ static void *AXEncodeLoop(void *arg) {
                这时还按目标帧率全屏截图 + 缩放 + 编码，纯粹在烧电发热；
                连续 4 帧不变就把帧率压到 2fps，一旦有变化（手指一动/画面一动）立刻恢复。
                下限保 2fps：PC 侧 15 秒收不到帧会判死重连，不能真的停。 */
-            if (lastEnc && enc.length == lastEnc.length &&
+            if (enc && lastEnc && enc.length == lastEnc.length &&
                 memcmp(enc.bytes, lastEnc.bytes, enc.length) == 0) {
                 if (staticStreak < 1000) staticStreak++;
             } else {
@@ -2416,53 +2505,113 @@ static void *AXEncodeLoop(void *arg) {
                长边缩放（JPEG 走 DCT scaling，1/2、1/4 直接出），解码和缩放合并成一步。
                失败（格式不支持缩略图路径）再退回原来的全解 + 重采样。 */
             long long tDec0 = AXNowMs();
-            CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)enc, NULL);
             CGImageRef img = NULL;
-            if (src) {
-                if (g_decodeThumb) {
-                    NSDictionary *thumbOpts = @{
-                        (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
-                        (id)kCGImageSourceCreateThumbnailWithTransform:   @NO,
-                        (id)kCGImageSourceThumbnailMaxPixelSize:          @(MAX(tw, th)),
-                    };
-                    img = CGImageSourceCreateThumbnailAtIndex(src, 0,
-                                                              (__bridge CFDictionaryRef)thumbOpts);
+            if (enc) {
+                CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)enc, NULL);
+                if (src) {
+                    if (g_decodeThumb) {
+                        NSDictionary *thumbOpts = @{
+                            (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+                            (id)kCGImageSourceCreateThumbnailWithTransform:   @NO,
+                            (id)kCGImageSourceThumbnailMaxPixelSize:          @(MAX(tw, th)),
+                        };
+                        img = CGImageSourceCreateThumbnailAtIndex(src, 0,
+                                                                  (__bridge CFDictionaryRef)thumbOpts);
+                    }
+                    if (!img) img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
+                    CFRelease(src);
                 }
-                if (!img) img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
-                CFRelease(src);
             }
-            if (!img) { usleep(20 * 1000); continue; }
+            if (!img && g_benchMode != 3) { usleep(20 * 1000); continue; }
             long long tDec1 = AXNowMs();
 
+            /* ★★ 2026-10-31 降耗：像素缓冲改为 pool 复用。
+               以前每帧 CVPixelBufferCreate 一个新 IOSurface（460x1000x4 = 1.84MB），
+               编码完再 Release —— 20fps 就是每秒 20 次「内核态分配 1.84MB + 释放」，
+               这部分开销全算在「绘」里，而且会带来内存压力和调度抖动。
+               pool 用尽（VT 还没吃完）时退回直接创建，绝不因为池空而卡帧。 */
             CVPixelBufferRef pb = NULL;
-            NSDictionary *pbAttrs = @{
-                (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
-                (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-            };
-            CVReturn cr = CVPixelBufferCreate(kCFAllocatorDefault, tw, th,
-                                              kCVPixelFormatType_32BGRA,
-                                              (__bridge CFDictionaryRef)pbAttrs, &pb);
-            if (cr != kCVReturnSuccess || !pb) {
-                CGImageRelease(img);
-                AXSetErr((int)cr, @"CVPixelBufferCreate 失败");
+            BOOL poolReady = (g_pbPool != NULL && g_pbPoolW == tw && g_pbPoolH == th);
+            if (poolReady) {
+                /* 池里有空闲 buffer 就直接取；取不到（VT 还没吃完）留到下面兜底，不重建池 */
+                CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g_pbPool, &pb);
+            }
+            if (!pb && !poolReady) {
+                if (g_pbPool) { CFRelease(g_pbPool); g_pbPool = NULL; g_pbPoolW = g_pbPoolH = 0; }
+                NSDictionary *poolAttrs = @{
+                    (NSString *)kCVPixelBufferPoolMinimumBufferCountKey: @(4),
+                };
+                NSDictionary *bufAttrs = @{
+                    (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+                    (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                    (NSString *)kCVPixelBufferWidthKey: @(tw),
+                    (NSString *)kCVPixelBufferHeightKey: @(th),
+                };
+                if (CVPixelBufferPoolCreate(kCFAllocatorDefault,
+                                            (__bridge CFDictionaryRef)poolAttrs,
+                                            (__bridge CFDictionaryRef)bufAttrs,
+                                            &g_pbPool) == kCVReturnSuccess && g_pbPool) {
+                    g_pbPoolW = tw; g_pbPoolH = th;
+                    CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g_pbPool, &pb);
+                }
+            }
+            if (!pb) {
+                /* 兜底：pool 不可用时仍能出帧 */
+                NSDictionary *pbAttrs = @{
+                    (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+                    (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                };
+                CVPixelBufferCreate(kCFAllocatorDefault, tw, th,
+                                    kCVPixelFormatType_32BGRA,
+                                    (__bridge CFDictionaryRef)pbAttrs, &pb);
+            }
+            if (!pb) {
+                if (img) CGImageRelease(img);
+                AXSetErr(-1, @"拿不到 CVPixelBuffer");
                 usleep(50 * 1000);
                 continue;
             }
             CVPixelBufferLockBaseAddress(pb, 0);
             void *base = CVPixelBufferGetBaseAddress(pb);
             size_t bpr = CVPixelBufferGetBytesPerRow(pb);
-            CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-            CGContextRef ctx = CGBitmapContextCreate(base, tw, th, 8, bpr, cs,
+            if (!g_rgbCS) g_rgbCS = CGColorSpaceCreateDeviceRGB();
+            CGContextRef ctx = CGBitmapContextCreate(base, tw, th, 8, bpr, g_rgbCS,
                 kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
-            CGColorSpaceRelease(cs);
             if (ctx) {
-                CGContextDrawImage(ctx, CGRectMake(0, 0, tw, th), img);
+                if (img) {
+                    /* ★ 缩小时用低质量插值：默认是高质量重采样（kCGInterpolationDefault），
+                       把 3.6MP 缩到 46 万像素时开销很大；投屏画面本身还要过 H.264，
+                       低插值带来的那点差别在上屏后基本不可见。 */
+                    CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+                    CGContextDrawImage(ctx, CGRectMake(0, 0, tw, th), img);
+                } else {
+                    /* bench=3（只测编码发送）：没有截图，无脑填黑，码率稳定、和真实静止画面接近 */
+                    memset(base, 0, bpr * (size_t)th);
+                }
                 CGContextRelease(ctx);
             }
             CVPixelBufferUnlockBaseAddress(pb, 0);
-            CGImageRelease(img);
+            if (img) CGImageRelease(img);
             g_lastDecMs  = tDec1 - tDec0;      /* 解码（含 DCT 缩放） */
             g_lastDrawMs = AXNowMs() - tDec1;  /* 转 CVPixelBuffer + 重采样 */
+
+            /* ★ 发热定位：截图+解码+缩放都做完了，但不编码不发送 ——
+               用来把「App 端像素处理」的成本从「编码发送」里分出来。 */
+            if (g_benchMode == 2) {
+                CVPixelBufferRelease(pb);
+                statFrames++;
+                if ((AXNowMs() - statT0) >= 5000) {
+                    ALogShim(@"❤️[bench2 到缩放为止] fps=%d 图%luKB 截%lldms 绘%lldms 热=%s cpu=%.0f%%",
+                             (int)(statFrames * 1000 / MAX(1, (AXNowMs() - statT0))),
+                             (unsigned long)(g_lastImgBytes / 1024), g_lastGrabMs, g_lastDrawMs,
+                             AXThermalStateStr(), AXSelfCPUPercent());
+                    statT0 = AXNowMs(); statFrames = 0;
+                }
+                long long iv2 = 1000 / MAX(1, g_fps);
+                long long sp2 = AXNowMs() - t0;
+                if (iv2 > sp2) usleep((useconds_t)((iv2 - sp2) * 1000));
+                continue;
+            }
 
             /* 不再每帧强制 IDR；新连接时 g_force_key 置位一次（照 mirror_stream v46） */
             CFDictionaryRef fp = NULL;
@@ -2495,12 +2644,13 @@ static void *AXEncodeLoop(void *arg) {
             frameCount++;
             statFrames++;
             if ((AXNowMs() - statT0) >= 5000) {
-                ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d fps=%d 图%luKB 截%lldms 解%lldms 绘%lldms 静止%d vt=%p %dx%d",
+                ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d fps=%d 图%luKB 截%lldms 解%lldms 绘%lldms 静止%d 热=%s cpu=%.0f%% bench=%d vt=%p %dx%d",
                          (long)[UIApplication sharedApplication].applicationState,
                          g_clientCount, g_sentFrames,
                          (int)(statFrames * 1000 / MAX(1, (AXNowMs() - statT0))),
                          (unsigned long)(g_lastImgBytes / 1024),
                          g_lastGrabMs, g_lastDecMs, g_lastDrawMs, staticStreak,
+                         AXThermalStateStr(), AXSelfCPUPercent(), g_benchMode,
                          (void *)g_vt, g_encW, g_encH);
                 statT0 = AXNowMs(); statFrames = 0;
             }
@@ -2508,13 +2658,16 @@ static void *AXEncodeLoop(void *arg) {
             /* 节奏控制（2026-10-31 改）：按「下一帧的绝对时刻」排程。
                旧写法 sleep(预算 - 本帧耗时) 会把抖动一点点累积，实测帧率比目标低 10~20%；
                而且一旦某帧超预算就完全不等，等于放开跑、把带宽打满。 */
-            /* ★ 输入唤醒：只要收到触控（g_inputKick），立刻抓一帧并解除静止降帧。
-               不做这个的话，静止时是 2fps，手指点下去要等最多 0.5 秒画面才动，
-               用户感受就是"点了半天才反应"。 */
+            /* ★ 输入唤醒：只要收到触控（g_inputKick），本轮**跳过节拍等待**、立刻抓下一帧。
+               ★★ 2026-10-31 修：以前这里只写 nextTick = AXNowMs()，可下面紧接着就是
+               nextTick += intervalMs，等于「设成现在」再「加 50ms」—— 照样睡满一整帧，
+               这个唤醒从加上那天起就没生效过。以前静止降帧到 2fps 时，500ms 的大头
+               把这点 50ms 盖住了，所以一直没人发现。 */
+            BOOL kickNow = NO;
             if (g_inputKick) {
                 g_inputKick = 0;
                 staticStreak = 0;
-                nextTick = AXNowMs();
+                kickNow = YES;
             }
 
             int fpsNow = (g_fps > 0 ? g_fps : 20);
@@ -2525,6 +2678,11 @@ static void *AXEncodeLoop(void *arg) {
             long long intervalMs = 1000 / fpsNow;
             nextTick += intervalMs;
             long long nowPace = AXNowMs();
+            if (kickNow) {
+                /* 不睡：这一帧就是被输入唤醒的，晚一帧用户就多一帧的等待。
+                   nextTick 对齐到现在，避免下一轮补帧连发。 */
+                nextTick = nowPace;
+            }
             if (nextTick > nowPace) {
                 /* 分段睡：中间一旦有触控就提前醒来，别死等满一整帧间隔 */
                 long long remain = nextTick - nowPace;
@@ -3465,6 +3623,13 @@ void AXStreamStop(void) {
         g_vt = NULL;
     }
     g_encW = g_encH = 0;
+    /* 释放像素缓冲池（下次 Start 会按新尺寸重建） */
+    if (g_pbPool) {
+        CVPixelBufferPoolFlush(g_pbPool, kCVPixelBufferPoolFlushExcessBuffers);
+        CFRelease(g_pbPool);
+        g_pbPool = NULL;
+    }
+    g_pbPoolW = g_pbPoolH = 0;
     g_preambleSent = 0;
     ALogShim(@"🛑 推流服务已停止");
 }
@@ -3568,6 +3733,18 @@ void AXStreamSetStaticFps(int fps) {
     if (fps > 60) fps = 60;
     g_staticFps = fps;
     ALogShim(@"❄️ 静止下限帧率 = %dfps", g_staticFps);
+}
+
+/* 发热定位：分段跑（0=正常 1=只截图 2=到缩放为止 3=只编码发送 4=空转） */
+void AXStreamSetBenchMode(int m) {
+    if (m < 0) m = 0;
+    if (m > 4) m = 4;
+    g_benchMode = m;
+    static const char *names[] = {
+        "正常全链路", "只截图（不解码不编码不发送）",
+        "截图+解码+缩放（不编码不发送）", "只编码发送（不截图）", "空转（只心跳）"
+    };
+    ALogShim(@"🧪 bench = %d（%s）", m, names[m]);
 }
 
 void AXStreamSetDecodeMode(int thumb) {
