@@ -18,6 +18,7 @@ extern BOOL AXAgentIsReady(void);
 extern NSString *AXAgentLastError(void);
 extern NSString *AXAgentLogPath(void);
 extern void AXAgentStartSticky(void);
+extern BOOL AXAgentIsBootstrapping(void);
 extern NSString *AXAgentShot(double maxSide, double quality);
 extern NSString *AXAgentProbeRecording(void);
 extern NSString *AXAgentDumpTree(int maxNodes);
