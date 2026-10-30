@@ -472,6 +472,25 @@ extern "C" BOOL AXAgentIsReady(void) { return gReady && gSession != nil; }
 extern "C" NSString *AXAgentLastError(void) { return gLastError; }
 extern "C" NSString *AXAgentLogPath(void) { return AXLogPath(); }
 
+/* 清空运行日志（10010 的 {"cmd":"logclear"}）。
+   ★ 现在日志是每行 fopen→seek→write→close，文件只增不减，跑一天能到几十 MB，
+   PC 端拉日志也慢。这里直接截断成空文件（原子写，不留半截）。
+   截断前先记一条，方便确认"是我清的、不是日志丢了"。 */
+extern "C" BOOL AXAgentLogClear(long long *outFreedBytes) {
+    NSString *path = AXLogPath();
+    unsigned long long before = 0;
+    NSDictionary *attr = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:NULL];
+    if (attr) before = [attr fileSize];
+
+    ALog(@"🧹 清空日志（清前 %.1f KB）", before / 1024.0);
+
+    NSError *err = nil;
+    BOOL ok = [[NSData data] writeToFile:path options:NSDataWritingAtomic error:&err];
+    if (outFreedBytes) *outFreedBytes = (long long)before;
+    if (!ok) ALog(@"❌ 清日志失败: %@", err.localizedDescription);
+    return ok;
+}
+
 extern "C" BOOL AXAgentBootstrapNow(void) {
     return AXAgentBootstrap();
 }
@@ -1844,13 +1863,19 @@ static volatile int     g_clientCount = 0;
 
 static VTCompressionSessionRef g_vt = NULL;
 static int              g_encW = 0, g_encH = 0;
+/* ★ maxSide 变更后要求下一帧按新值重算编码尺寸。
+   不能直接把 g_encW/g_encH 清 0 —— accept 侧发 preamble 用的就是它们，
+   清 0 会让新客户端收到 0x0 的 preamble。 */
+static volatile int     g_encDirty = 0;
 static int              g_bitrate = 2000000;   /* 2 Mbps */
 static int              g_fps = 20;
 static int              g_maxSide = 720;
 
 static volatile long long g_ptsMs = 0;         /* 真实墙钟毫秒，严格单调 */
 static volatile BOOL    g_needConfig = YES;    /* 首帧 / 编码器重建后要发 SPS/PPS */
-static volatile double g_imgQuality = 0.70;   /* 截图压缩质量（0~1） */
+static volatile double g_imgQuality = 0.10;   /* 截图压缩质量（0~1）。用户指定 0.1：
+                                                 全屏 JPEG 从 139KB 级降到几十 KB，
+                                                 daemon 编码和 XPC 回传都更快（这是每帧最大的一块）。 */
 static volatile int    g_decodeThumb = 0;     /* 0=全解+CGContext(默认)  1=ImageIO thumbnail */
 static volatile int    g_inputKick   = 0;
 static volatile long long g_capPauseUntil = 0;  /* 到此时刻前暂停抓图，先把 daemon 让给合成事件 */
@@ -2340,12 +2365,16 @@ static void *AXEncodeLoop(void *arg) {
 
             /* 目标编码尺寸：长边 = maxSide，保持比例、对齐到偶数 */
             int tw = g_encW, th = g_encH;
-            if (tw == 0 || th == 0) {
-                /* ★ 按「短边」缩放：竖屏手机的短边就是宽度，这样 720 表示"宽 720"，
-                   1290x2796 → 720x1560（之前按长边算成了 332x720，preamble 却报 720x1560，
-                   PC 端按错误的宽高解码 → 花屏/黑屏） */
-                CGFloat shortSide = MIN(px.width, px.height);
-                CGFloat k = shortSide > 0 ? (CGFloat)g_maxSide / shortSide : 1.0;
+            if (tw == 0 || th == 0 || g_encDirty) {
+                g_encDirty = 0;
+                /* ★★ 按「长边」缩放，必须与 PC 端 fitSize() 完全一致。
+                   PC 端 fitSize 就是 long = max(w,h); scale = max/long。
+                   以前这里算的是**短边**（1290x2796 + maxSide=1000 → 编成 1000x2166），
+                   而 PC 端收到后又按长边缩到 462x1000 —— 等于设备白编了 4.7 倍像素，
+                   传过来再整块丢掉，白白吃掉每帧 20~30ms（日志里「绘」偏大就是这么来的）。
+                   现在 1290x2796 + maxSide=1000 → 462x1000，两端一致，不再二次缩放。 */
+                CGFloat longSide = MAX(px.width, px.height);
+                CGFloat k = longSide > 0 ? (CGFloat)g_maxSide / longSide : 1.0;
                 if (k > 1.0) k = 1.0;
                 tw = (int)(round(px.width * k)); th = (int)(round(px.height * k));
                 tw &= ~1; th &= ~1;   /* 偶数（H.264 要求） */
@@ -2745,9 +2774,16 @@ typedef struct {
 } AXTestProfile;
 
 static const AXTestProfile kAXProfiles[] = {
-    { "系统截图 · JPEG 0.70（默认）", 0, "public.jpeg", 0.70 },
-    { "系统截图 · JPEG 0.40（极速）", 0, "public.jpeg", 0.40 },
-    { "系统截图 · TIFF 未压缩",       0, "public.tiff", 1.00 },
+    /* ★★ 2026-10-31：TIFF 档彻底移除。原因：
+       TIFF 是未压缩位图，整屏一张 10567KB，daemon 编码 + XPC 回传实测能到 2299ms/帧，
+       用户一直以为"卡"是别的毛病，其实就在这。
+       ★ 更要命的是档位会存进 NSUserDefaults（kAXSchemeKey），每次「重启投屏服务」
+       都按存下来的索引重新应用一次 —— 用户早先点过一次 TIFF，之后就一直恢复成 TIFF，
+       手动用 quality 命令改成 JPEG 也会被下一次重启覆盖掉。
+       这里保持索引数量不变（避免历史存档越界），但把 TIFF 位置换成 JPEG 0.70。 */
+    { "系统截图 · JPEG 0.10（默认）", 0, "public.jpeg", 0.10 },
+    { "系统截图 · JPEG 0.40",        0, "public.jpeg", 0.40 },
+    { "系统截图 · JPEG 0.70",        0, "public.jpeg", 0.70 },
     { "系统截图 · PNG 无损",          0, "public.png",  1.00 },
     { "系统录屏",                     1, "public.jpeg", 0.70 },
 };
@@ -2904,6 +2940,9 @@ static void AXApplyVideoParams(uint32_t fps, uint32_t bitrateBps, uint32_t maxSi
     if (maxSide > 0 && (int)maxSide != g_maxSide) {
         g_maxSide = (int)maxSide;
         g_force_key = 1;
+        /* ★ 必须让主循环重算编码尺寸：主循环是「tw = g_encW; 只有 tw==0 才按 maxSide 重算」，
+           不标脏的话下一帧照样拿旧尺寸去 AXVTEnsure（还会命中 early-return），调 maxSide 等于没调。 */
+        g_encDirty = 1;
         AXVTDrop("分辨率变更");
     }
     ALogShim(@"🎚 画质参数 fps=%d  %dkbps  maxSide=%d", g_fps, g_bitrate / 1000, g_maxSide);
