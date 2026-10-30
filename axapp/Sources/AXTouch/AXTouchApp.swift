@@ -6,8 +6,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "60"
-    static let tag = "v2.0-b60"
+    static let build = "61"
+    static let tag = "v2.0-b61"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -271,13 +271,16 @@ final class ControlServer {
                     let lr = AXLockdownUDIDResult() ?? "idle"
                     let ld: [String: Any] = ["ok": true, "result": lr]
                     resp = (try? String(data: JSONSerialization.data(withJSONObject: ld), encoding: .utf8)) ?? "{\"ok\":false}"
+                case "getudid":
+                    let cur = AXStreamCurrentUDID() ?? ""
+                    resp = "{\"ok\":true,\"udid\":\"\(cur)\"}"
                 case "devinfo":
                     DispatchQueue.global().async { _ = AXProbeDeviceInfo() }
                     resp = "{\"ok\":true,\"note\":\"结果看 agent.log\"}"
                 case "udid":
                     /* {"cmd":"udid","v":"00008120-xxxx"} —— PC 端把真 UDID 传给手机侧 */
                     let uv = (obj["v"] as? String) ?? ""
-                    AXStreamSetUDID(uv)
+                    AXStreamSetUDIDPersist(uv)   /* ★ 持久化：重装/重启都还在 */
                     resp = "{\"ok\":true,\"udid\":\"\(uv)\"}"
                 case "stream":
                     /* {"cmd":"stream","op":"start|stop|status"} */
