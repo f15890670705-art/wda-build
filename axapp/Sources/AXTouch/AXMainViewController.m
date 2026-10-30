@@ -192,6 +192,7 @@ static NSString *AXLanIP(void) {
 - (void)refreshAll;
 - (void)didTapRefresh;
 - (void)didTapRebuild;
+- (void)didTapRestartStream;
 - (void)didTapLogs;
 - (void)didTapTree;
 - (void)didTapServer;
@@ -513,8 +514,10 @@ static NSString *AXLanIP(void) {
     AXChipBadge *badge = [AXChipBadge badgeWithText:@"  控制  " fg:ATPurple() bg:ATPurpleBg()];
     [self.cardControl addSubview:badge];
 
-    self.rebuildBtn = [self buildBigButton:@"重建会话" bg:ATPurple() fg:[UIColor whiteColor]];
-    [self.rebuildBtn addTarget:self action:@selector(didTapRebuild) forControlEvents:UIControlEventTouchUpInside];
+    /* 2026-10-30 用户要求：会话是启动时自动建的，「重建会话」没意义 →
+       改成「重启服务」＝把投屏服务（27184 监听 + 编码器）停掉再起来。 */
+    self.rebuildBtn = [self buildBigButton:@"重启服务" bg:ATPurple() fg:[UIColor whiteColor]];
+    [self.rebuildBtn addTarget:self action:@selector(didTapRestartStream) forControlEvents:UIControlEventTouchUpInside];
 
     UIButton *logs = [self buildBigButton:@"📄  运行日志" bg:ATGreen() fg:[UIColor whiteColor]];
     [logs addTarget:self action:@selector(didTapLogs) forControlEvents:UIControlEventTouchUpInside];
@@ -689,8 +692,9 @@ static NSString *AXLanIP(void) {
                                       [UIDevice currentDevice].systemVersion];
     CGSize px = [UIScreen mainScreen].bounds.size;
     CGFloat sc = [UIScreen mainScreen].scale;
-    self.devScreen.valueLabel.text = [NSString stringWithFormat:@"%.0f x %.0f",
-                                      px.width * sc, px.height * sc];
+    /* 点位 × 缩放倍数，读数更直观（例：430×932(@3x)） */
+    self.devScreen.valueLabel.text = [NSString stringWithFormat:@"%.0f×%.0f(@%.0fx)",
+                                      px.width, px.height, sc];
     {
         NSString *u = AXStreamCurrentUDID() ?: @"";
         self.devUDID.valueLabel.text = u.length ? u : @"点此输入";
@@ -710,6 +714,28 @@ static NSString *AXLanIP(void) {
     if (once) return;
     once = YES;
     [self autoStartStreamIfNeeded];   /* 不点按钮，进来就投 */
+}
+
+- (void)didTapRestartStream {
+    BOOL was = AXStreamIsRunning();
+    self.rebuildBtn.enabled = NO;      /* 防连点：重启期间禁用 */
+    AXStreamStop();
+    self.statusText.text = @"投屏服务重启中…";
+    self.statusText.textColor = ATSubText();
+    NSLog(@"[stream] 重启服务：wasRunning=%d", was);
+    __weak typeof(self) ws = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        __strong typeof(ws) ss = ws;
+        if (!ss) return;
+        BOOL ok = AXStreamStart(27184);
+        ss.rebuildBtn.enabled = YES;
+        ss.statusText.text = ok ? @"投屏服务已重启" : @"重启失败";
+        ss.statusText.textColor = ok ? ATGreen() : ATRed();
+        NSLog(@"[stream] 重启服务结果 ok=%d", ok);
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [ss refreshAll]; });
+    });
 }
 
 - (void)didTapRebuild {
