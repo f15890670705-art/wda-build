@@ -30,6 +30,12 @@ void AXStreamSetUDIDPersist(NSString *udid);
 /// 当前生效的 UDID（空串＝还没有）
 NSString *AXStreamCurrentUDID(void);
 
+/// 采集方案：0=XCUITest(截图) 1=ReplayKit。仅在 Start 之前设置有效。
+void AXStreamSetScheme(int s);
+int  AXStreamGetScheme(void);
+/// 实际生效的方案：0=XCUITest 1=ReplayKit 2=ReplayKit 拿不到帧已回退 XCUITest
+int  AXStreamActiveScheme(void);
+
 /// 统计：fps / 码率 / 客户端数 / 编码尺寸 / 最近错误
 NSDictionary *AXStreamStats(void);
 
