@@ -129,19 +129,9 @@ static NSString *AXDocsDir(void) {
         long long consumed = 0;
         BOOL eof = YES;
         if (data.length) {
-            consumed = (long long)data.length;
-            /* 尝试完整 UTF-8 解码；失败则丢尾部最多 3 字节再试（避免切在多字节字符中间） */
-            NSUInteger tryLen = data.length;
-            for (int i = 0; i < 4 && tryLen > 0; i++) {
-                NSData *sub = [data subdataWithRange:NSMakeRange(0, tryLen)];
-                NSString *s = [[NSString alloc] initWithData:sub encoding:NSUTF8StringEncoding];
-                if (s) { text = s; consumed = (long long)tryLen; break; }
-                tryLen -= 1;
-            }
-            if (text.length == 0) {
-                /* 兜底：容忍非法字节 */
-                text = [[NSString alloc] initWithData:data encoding:NSISOLatin1StringEncoding] ?: @"";
-            }
+            NSUInteger used = 0;
+            text = AXDecodeUTF8Lossy(data, &used);
+            consumed = (long long)used;
             eof = (data.length < chunk);
         }
 
@@ -178,6 +168,69 @@ static NSString *AXDocsDir(void) {
 @end
 
 #pragma mark - 文件列表页
+
+/* ★ 2026-10-31 修「日志满屏乱码」：
+   旧逻辑=「整块 UTF-8 解码，失败就丢尾部几字节再试，还不行就整体 Latin1」。
+   两个问题：① 从文件中间读时**开头**就切在多字节字符上，丢尾部永远救不回来；
+            ② Latin1 兜底会把**整页**中文变成乱码（Latin1 解 UTF-8 中文必花）。
+   现在：先丢开头最多 3 字节重试（并按行首对齐），再不行逐序列扫描、坏字节换 '?'，
+   其余照常解码 —— 一处坏字节只坏一个字，不会污染全篇。 */
+static NSString *AXDecodeUTF8Lossy(NSData *data, NSUInteger *consumedOut) {
+    if (consumedOut) *consumedOut = 0;
+    if (data.length == 0) return @"";
+    const NSUInteger n = data.length;
+
+    /* 起点对齐到行首：从中间读时第一行必然是半截，跳过它更整齐 */
+    NSUInteger start = 0;
+    {
+        const uint8_t *p = (const uint8_t *)data.bytes;
+        NSUInteger nl = NSNotFound;
+        for (NSUInteger i = 0; i < MIN(n, (NSUInteger)4096); i++) {
+            if (p[i] == '\n') { nl = i; break; }
+        }
+        if (nl != NSNotFound) start = nl + 1;
+    }
+
+    for (NSUInteger skip = start; skip <= start + 3 && skip < n; skip++) {
+        NSData *sub = [data subdataWithRange:NSMakeRange(skip, n - skip)];
+        NSString *r = [[NSString alloc] initWithData:sub encoding:NSUTF8StringEncoding];
+        if (r) { if (consumedOut) *consumedOut = n; return r; }
+        /* 尾部可能也切在多字节字符上：最多退 3 字节 */
+        for (NSUInteger tail = 1; tail <= 3 && sub.length > tail; tail++) {
+            NSData *sub2 = [sub subdataWithRange:NSMakeRange(0, sub.length - tail)];
+            NSString *r2 = [[NSString alloc] initWithData:sub2 encoding:NSUTF8StringEncoding];
+            if (r2) { if (consumedOut) *consumedOut = n - tail; return r2; }
+        }
+    }
+
+    /* 中途有非法字节：逐序列扫描，坏字节替换成 '?'，好的照常保留 */
+    const uint8_t *p = (const uint8_t *)data.bytes;
+    NSMutableData *clean = [NSMutableData dataWithCapacity:n];
+    NSUInteger i = 0;
+    while (i < n) {
+        uint8_t c = p[i];
+        NSUInteger len = 0;
+        if (c < 0x80) len = 1;
+        else if ((c & 0xE0) == 0xC0) len = 2;
+        else if ((c & 0xF0) == 0xE0) len = 3;
+        else if ((c & 0xF8) == 0xF0) len = 4;
+        BOOL ok = (len > 0 && i + len <= n);
+        if (ok) {
+            for (NSUInteger k = 1; k < len; k++) {
+                if ((p[i + k] & 0xC0) != 0x80) { ok = NO; break; }
+            }
+        }
+        if (ok) {
+            [clean appendBytes:p + i length:len];
+            i += len;
+        } else {
+            [clean appendBytes:"?" length:1];
+            i += 1;
+        }
+    }
+    if (consumedOut) *consumedOut = n;
+    return [[NSString alloc] initWithData:clean encoding:NSUTF8StringEncoding] ?: @"";
+}
 
 @interface AXLogViewerViewController () <UITableViewDataSource, UITableViewDelegate>
 @property (nonatomic, strong) UITableView *table;
