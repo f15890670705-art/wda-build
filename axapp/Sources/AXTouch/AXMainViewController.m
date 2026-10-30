@@ -749,10 +749,10 @@ static NSString *AXLanIP(void) {
                            dispatch_get_main_queue(), ^{
                 int act = AXStreamActiveScheme();
                 if (act == 2) {
-                    ss.statusText.text = @"ReplayKit 拿不到帧，已回退 XCUITest";
+                    ss.statusText.text = @"录屏拿不到画面，已自动切回截图";
                     ss.statusText.textColor = ATBrown();
                 } else if (act == 1) {
-                    ss.statusText.text = @"ReplayKit 投屏中";
+                    ss.statusText.text = @"系统录屏投屏中";
                     ss.statusText.textColor = ATGreen();
                 }
                 [ss refreshAll];
@@ -809,14 +809,14 @@ static NSString *AXLanIP(void) {
 /* 下拉框内容：当前选中的打勾 */
 - (void)refreshSchemeButton {
     NSInteger cur = [[NSUserDefaults standardUserDefaults] integerForKey:kAXSchemeKey];
-    NSString *t = (cur == 1) ? @"ReplayKit（系统录屏）" : @"XCUITest（截图）";
+    NSString *t = (cur == 1) ? @"系统录屏" : @"系统截图";
     [self.schemeBtn setTitle:[NSString stringWithFormat:@"%@    ▾", t] forState:UIControlStateNormal];
 
     __weak typeof(self) ws = self;
-    UIAction *a0 = [UIAction actionWithTitle:@"XCUITest（截图）" image:nil identifier:nil
+    UIAction *a0 = [UIAction actionWithTitle:@"系统截图" image:nil identifier:nil
                                      handler:^(UIAction *a) { __strong typeof(ws) ss = ws; [ss selectScheme:0]; }];
     a0.state = (cur == 0) ? UIMenuElementStateOn : UIMenuElementStateOff;
-    UIAction *a1 = [UIAction actionWithTitle:@"ReplayKit（系统录屏）" image:nil identifier:nil
+    UIAction *a1 = [UIAction actionWithTitle:@"系统录屏" image:nil identifier:nil
                                      handler:^(UIAction *a) { __strong typeof(ws) ss = ws; [ss selectScheme:1]; }];
     a1.state = (cur == 1) ? UIMenuElementStateOn : UIMenuElementStateOff;
     self.schemeBtn.menu = [UIMenu menuWithTitle:@"选择投屏方案" children:@[a0, a1]];
@@ -826,8 +826,8 @@ static NSString *AXLanIP(void) {
 - (void)selectScheme:(NSInteger)i {
     [[NSUserDefaults standardUserDefaults] setInteger:(i == 1 ? 1 : 0) forKey:kAXSchemeKey];
     [self refreshSchemeButton];
-    self.statusText.text = (i == 1) ? @"已选 ReplayKit，点「重启服务」生效"
-                                   : @"已选 XCUITest，点「重启服务」生效";
+    self.statusText.text = (i == 1) ? @"已选系统录屏，点「重启服务」生效"
+                                   : @"已选系统截图，点「重启服务」生效";
     self.statusText.textColor = ATSubText();
     NSLog(@"[scheme] 选择 %ld（等重启服务生效）", (long)i);
 }
