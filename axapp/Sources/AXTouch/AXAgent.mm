@@ -855,8 +855,46 @@ static void AXDumpNode(id elem, int depth, int *count, int maxNodes) {
 /* ★ 探测设备标识：XCUIScreen.device（XCUIDevice）的 uniqueIdentifier。
    mirror_stream 那套私有 IOKit 我们用不了，但自动化会话里的 XCUIDevice 可能
    曝光了设备标识 —— 有它就不需要 PC 端经 10010 传 UDID 了。 */
+/* ★ MobileGestalt 试探：普通签名大概率 NULL，但一次构建能验证全部 key */
+extern "C" NSString *AXTryMobileGestalt(void) {
+    ALogShim(@"===== MobileGestalt 试探 =====");
+    void *h = dlopen("/usr/lib/libMobileGestalt.dylib", RTLD_NOW);
+    if (!h) { ALogShim(@"  ❌ libMobileGestalt 打不开: %s", dlerror()); return @"no lib"; }
+    typedef CFTypeRef (*MGFn)(CFStringRef);
+    MGFn fn = (MGFn)dlsym(h, "MGCopyAnswer");
+    if (!fn) { ALogShim(@"  ❌ 无 MGCopyAnswer"); return @"no fn"; }
+
+    NSString *keys[] = { @"UniqueDeviceID", @"UniqueDeviceIDData", @"SerialNumber",
+                         @"ProductType", @"ModelNumber", @"MobileEquipmentIdentifier",
+                         @"InternationalMobileSubscriberIdentity", @"DeviceName",
+                         @"ProductVersion", @"BuildVersion", @"CPUArchitecture" };
+    NSString *found = nil;
+    for (NSString *k in keys) {
+        @try {
+            CFTypeRef v = fn((__bridge CFStringRef)k);
+            NSString *desc = @"(NULL)";
+            if (v) {
+                if (CFGetTypeID(v) == CFStringGetTypeID()) desc = [(__bridge NSString *)v copy];
+                else if (CFGetTypeID(v) == CFDataGetTypeID()) desc = [NSString stringWithFormat:@"<data %lu>", (unsigned long)CFDataGetLength((CFDataRef)v)];
+                else desc = NSStringFromClass([(__bridge id)v class]);
+            }
+            ALogShim(@"  · %@ → %@", k, desc);
+            if (v && found == nil && [k isEqualToString:@"UniqueDeviceID"] && desc.length > 5) found = desc;
+            if (v && CFGetTypeID(v)) CFRelease(v);
+        } @catch (NSException *e) { ALogShim(@"  · %@ 异常: %@", k, e.reason); }
+    }
+    return found ?: @"gestalt-no-udid";
+}
+
 extern "C" NSString *AXProbeDeviceInfo(void) {
     ALogShim(@"===== 设备标识探测 =====");
+    ALogShim(@"--- 0) MobileGestalt ---");
+    NSString *g = AXTryMobileGestalt();
+    if (g && ![g hasPrefix:@"gestalt-"] && ![g hasPrefix:@"no "]) {
+        ALogShim(@"✅ MobileGestalt 给出了 UDID，直接采用");
+        AXStreamSetUDID(g);
+        return g;
+    }
     if (!gReady) { ALogShim(@"❌ 会话未就绪"); return @"not ready"; }
 
     Class scrCls = NSClassFromString(@"XCUIScreen");
