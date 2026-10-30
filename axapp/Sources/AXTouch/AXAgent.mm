@@ -1536,6 +1536,9 @@ static void AXVTCompressionCallback(void *outRefCon, void *srcFrameRefCon,
         if (status != noErr) AXSetErr((int)status, @"VT 编码失败");
         return;
     }
+    /* ★ VT 回调跑在自己的线程，没有 autorelease pool：每帧创建的 NSMutableData/
+       NSDictionary 会一直堆着不释放（120 帧后闪退的原因之一） */
+    @autoreleasepool {
 
     /* 首次（或重建后）先补 SPS/PPS：CONFIG 包 */
     if (g_needConfig) {
@@ -1568,8 +1571,27 @@ static void AXVTCompressionCallback(void *outRefCon, void *srcFrameRefCon,
     size_t len = CMBlockBufferGetDataLength(bb);
     if (len == 0) return;
 
-    NSMutableData *nal = [NSMutableData dataWithLength:len];
-    if (CMBlockBufferCopyDataBytes(bb, 0, len, nal.mutableBytes) != kCMBlockBufferNoErr) return;
+    NSMutableData *raw = [NSMutableData dataWithLength:len];
+    if (CMBlockBufferCopyDataBytes(bb, 0, len, raw.mutableBytes) != kCMBlockBufferNoErr) return;
+
+    /* ★ VT 输出的是 AVCC（每 NAL 前 4B 长度前缀），PC 端要 Annex-B（00 00 00 01）。
+       不转的话 PC 的 hasAnnexBStartCode 一检查就丢帧 → 黑屏。 */
+    NSMutableData *nal = [NSMutableData dataWithCapacity:len + 32];
+    {
+        const uint8_t *p = (const uint8_t *)raw.bytes;
+        size_t total = raw.length, off = 0;
+        while (off + 4 <= total) {
+            uint32_t n = ((uint32_t)p[off] << 24) | ((uint32_t)p[off + 1] << 16)
+                       | ((uint32_t)p[off + 2] << 8) | (uint32_t)p[off + 3];
+            off += 4;
+            if (n == 0 || off + n > total) break;
+            uint8_t sc[4] = {0, 0, 0, 1};
+            [nal appendBytes:sc length:4];
+            [nal appendBytes:p + off length:n];
+            off += n;
+        }
+    }
+    if (nal.length == 0) return;
 
     /* 关键帧判断 */
     BOOL keyframe = YES;
@@ -1583,6 +1605,7 @@ static void AXVTCompressionCallback(void *outRefCon, void *srcFrameRefCon,
     if (keyframe) pts |= ((uint64_t)1 << 61);
     AXSendPacket(pts, nal.bytes, nal.length);
     g_sentFrames++;
+    }   /* @autoreleasepool */
 }
 
 static BOOL AXVTEnsure(int w, int h) {
@@ -1727,16 +1750,14 @@ static void *AXEncodeLoop(void *arg) {
             /* 目标编码尺寸：长边 = maxSide，保持比例、对齐到偶数 */
             int tw = g_encW, th = g_encH;
             if (tw == 0 || th == 0) {
-                CGFloat longSide = MAX(px.width, px.height);
-                CGFloat k = longSide > 0 ? (CGFloat)g_maxSide / longSide : 1.0;
+                /* ★ 按「短边」缩放：竖屏手机的短边就是宽度，这样 720 表示"宽 720"，
+                   1290x2796 → 720x1560（之前按长边算成了 332x720，preamble 却报 720x1560，
+                   PC 端按错误的宽高解码 → 花屏/黑屏） */
+                CGFloat shortSide = MIN(px.width, px.height);
+                CGFloat k = shortSide > 0 ? (CGFloat)g_maxSide / shortSide : 1.0;
                 if (k > 1.0) k = 1.0;
-                /* 竖屏：宽 = min(px.w,px.h)*k，高 = max*k；横屏反过来 */
-                if (px.height >= px.width) {
-                    tw = (int)(round(px.width * k)); th = (int)(round(px.height * k));
-                } else {
-                    tw = (int)(round(px.width * k)); th = (int)(round(px.height * k));
-                }
-                tw &= ~1; th &= ~1;   /* 偶数 */
+                tw = (int)(round(px.width * k)); th = (int)(round(px.height * k));
+                tw &= ~1; th &= ~1;   /* 偶数（H.264 要求） */
                 if (tw < 16) tw = 16;
                 if (th < 16) th = 16;
             }
@@ -1791,14 +1812,12 @@ static void *AXEncodeLoop(void *arg) {
             CGImageRelease(img);
             long long t2 = AXNowMs();
 
-            /* 先强制每帧 IDR，跑通再开帧间预测 */
-            CFDictionaryRef frameProps = (__bridge CFDictionaryRef)@{
-                (NSString *)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES
-            };
+            /* 不再每帧强制 IDR：VT 会话首帧自动是 IDR，之后靠 MaxKeyFrameInterval(10s)
+               周期性插入。每帧 60KB 会直接把 WiFi 打爆（20fps×60KB=1.2MB/s）并阻塞 send。 */
             CMTime pcm = CMTimeMake(AXNextPts(), 1000);
             VTEncodeInfoFlags flags = 0;
             OSStatus es = VTCompressionSessionEncodeFrame(g_vt, pb, pcm, kCMTimeInvalid,
-                                                          frameProps, NULL, &flags);
+                                                          NULL, NULL, &flags);
             CVPixelBufferRelease(pb);
             if (es != noErr) {
                 AXSetErr((int)es, @"EncodeFrame 失败");
@@ -1843,6 +1862,11 @@ static void *AXAcceptLoop(void *arg) {
         }
         int one = 1;
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+        /* 发送超时 200ms：PC 端读得慢时宁可丢这个客户端，也不能把编码线程卡死 */
+        struct timeval sndTo;
+        sndTo.tv_sec = 0;
+        sndTo.tv_usec = 200 * 1000;
+        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &sndTo, sizeof(sndTo));
         char ip[64] = {0};
         inet_ntop(AF_INET, &addr.sin_addr, ip, sizeof(ip));
         ALogShim(@"📡 PC 连上来了 %s", ip);
@@ -1860,13 +1884,14 @@ static void *AXAcceptLoop(void *arg) {
         g_clientCount++;
         pthread_mutex_unlock(&g_clientMu);
 
-        /* 立刻发 preamble（用当前编码尺寸；还没编码过就先给 0，PC 会等 session 头修正） */
-        int w = g_encW > 0 ? g_encW : g_maxSide;
-        int h = g_encH > 0 ? g_encH : (int)(g_maxSide * 2796.0 / 1290.0);
-        AXSendPreamble(fd, w, h, g_maxSide);
-        AXSendSessionHeader(w, h);
-        g_needConfig = YES;
-        g_preambleSent = 1;
+        /* 已有编码尺寸就直接发 preamble；没有就等编码循环第一帧算出来再发
+           （★ 之前这里用 maxSide 硬凑 720x1560，和真实编码尺寸 332x720 不符 → 黑屏） */
+        if (g_encW > 0 && g_encH > 0) {
+            AXSendPreamble(fd, g_encW, g_encH, g_maxSide);
+            AXSendSessionHeader(g_encW, g_encH);
+            g_needConfig = YES;   /* 新客户端要重新收一份 SPS/PPS */
+            g_preambleSent = 1;
+        }
     }
     ALogShim(@"📡 accept 循环退出");
     return NULL;
