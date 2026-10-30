@@ -173,6 +173,7 @@ static NSString *AXLanIP(void) {
 @property (nonatomic, strong) UIButton    *burstBtn;
 
 @property (nonatomic, strong) UIButton *streamBtn;
+@property (nonatomic, strong) UIButton *rebuildBtn;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) BOOL burstRunning;
 
@@ -516,8 +517,8 @@ static NSString *AXLanIP(void) {
     AXChipBadge *badge = [AXChipBadge badgeWithText:@"  控制  " fg:ATPurple() bg:ATPurpleBg()];
     [self.cardControl addSubview:badge];
 
-    UIButton *rebuild = [self buildBigButton:@"重建会话" bg:ATPurple() fg:[UIColor whiteColor]];
-    [rebuild addTarget:self action:@selector(didTapRebuild) forControlEvents:UIControlEventTouchUpInside];
+    self.rebuildBtn = [self buildBigButton:@"重建会话" bg:ATPurple() fg:[UIColor whiteColor]];
+    [self.rebuildBtn addTarget:self action:@selector(didTapRebuild) forControlEvents:UIControlEventTouchUpInside];
 
     UIButton *logs = [self buildBigButton:@"📄  运行日志" bg:ATGreen() fg:[UIColor whiteColor]];
     [logs addTarget:self action:@selector(didTapLogs) forControlEvents:UIControlEventTouchUpInside];
@@ -528,7 +529,7 @@ static NSString *AXLanIP(void) {
     self.streamBtn = [self buildBigButton:@"开始投屏" bg:ATBlue() fg:[UIColor whiteColor]];
     [self.streamBtn addTarget:self action:@selector(didTapStream) forControlEvents:UIControlEventTouchUpInside];
 
-    UIStackView *row1 = [self stackWith:@[rebuild, logs]];
+    UIStackView *row1 = [self stackWith:@[self.rebuildBtn, logs]];
     UIStackView *row2 = [self stackWith:@[rec, self.streamBtn]];
     [self.cardControl addSubview:row1];
     [self.cardControl addSubview:row2];
@@ -696,10 +697,27 @@ static NSString *AXLanIP(void) {
 - (void)didTapRefresh { [self refreshAll]; }
 
 - (void)didTapRebuild {
+    /* ★ 幂等：连点不再叠加常驻线程 / 覆盖会话 */
+    if (AXAgentIsBootstrapping()) {
+        self.statusText.text = @"正在建立会话，请稍候…";
+        return;
+    }
+    if (AXAgentIsReady()) {
+        self.statusText.text = @"会话已就绪，无需重建";
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ [self refreshAll]; });
+        return;
+    }
     AXAgentStartSticky();
     self.statusText.text = @"重建中…";
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{ [self refreshAll]; });
+    self.rebuildBtn.enabled = NO;
+    self.rebuildBtn.alpha = 0.5;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        self.rebuildBtn.enabled = YES;
+        self.rebuildBtn.alpha = 1.0;
+        [self refreshAll];
+    });
 }
 
 - (void)didTapLogs {
