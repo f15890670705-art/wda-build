@@ -1769,7 +1769,24 @@ static void AXVTCompressionCallback(void *outRefCon, void *srcFrameRefCon,
     }   /* @autoreleasepool */
 }
 
-static OSType g_vtFmt = 0;   /* 当前 VT 会话的源像素格式 */
+static OSType g_vtFmt = 0;      /* 当前 VT 会话的源像素格式 */
+static int g_forceSW = 0;        /* 1=强制软件编码（后台被收回硬编时的兜底） */
+static long long g_vtDropAt = 0; /* 上次丢弃会话的时间：短时间内反复失效就切软编 */
+
+/* 丢弃当前会话：下次 AXVTEnsureWithFormat 会重建。
+   ★ 必须同时清 preamble 标记：新会话的 SPS/PPS 变了，客户端要重新收一遍。 */
+static void AXVTDrop(const char *why) {
+    if (g_vt) {
+        VTCompressionSessionCompleteFrames(g_vt, kCMTimeInvalid);
+        VTCompressionSessionInvalidate(g_vt);
+        CFRelease(g_vt);
+        g_vt = NULL;
+    }
+    g_vtFmt = 0;
+    g_encW = g_encH = 0;
+    g_preambleSent = 0;
+    ALogShim(@"♻️ 编码会话已丢弃（%s），下一帧重建", why ? why : "?");
+}
 
 /* 按指定源像素格式建会话：XCUITest 路径喂 BGRA，ReplayKit 路径喂它自己给的 420f/420v。
    格式不匹配 VT 会直接拒绝编码，所以必须跟着首帧格式走。 */
@@ -1787,8 +1804,13 @@ static BOOL AXVTEnsureWithFormat(int w, int h, OSType fmt) {
         (NSString *)kCVPixelBufferWidthKey: @(w),
         (NSString *)kCVPixelBufferHeightKey: @(h),
     };
+    NSDictionary *encSpec = nil;
+    if (g_forceSW) {
+        encSpec = @{ (NSString *)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @NO };
+    }
     OSStatus st = VTCompressionSessionCreate(NULL, (int32_t)w, (int32_t)h,
-                                             kCMVideoCodecType_H264, NULL,
+                                             kCMVideoCodecType_H264,
+                                             (__bridge CFDictionaryRef)encSpec,
                                              (__bridge CFDictionaryRef)srcAttrs,
                                              NULL, AXVTCompressionCallback, NULL, &g_vt);
     if (st != noErr || !g_vt) {
@@ -1807,6 +1829,7 @@ static BOOL AXVTEnsureWithFormat(int w, int h, OSType fmt) {
     g_encW = w; g_encH = h; g_vtFmt = fmt;
     g_needConfig = YES;
     g_ptsMs = 0;
+    ALogShim(@"✅ VT 会话建立 %dx%d%s", w, h, g_forceSW ? "（软件编码）" : "");
     ALogShim(@"✅ VT 编码器就绪 %dx%d fmt=%u  %d kbps  %d fps", w, h, (unsigned)fmt,
              g_bitrate / 1000, g_fps);
     return YES;
@@ -2006,8 +2029,19 @@ static void *AXEncodeLoop(void *arg) {
                                                           fp, NULL, &flags);
             CVPixelBufferRelease(pb);
             if (es != noErr) {
-                AXSetErr((int)es, @"EncodeFrame 失败");
-                usleep(20 * 1000);
+                AXSetErr((int)es, [NSString stringWithFormat:@"EncodeFrame 失败 st=%d", (int)es]);
+                /* ★ -12903 = kVTInvalidSessionErr：会话被系统作废（后台收回硬编/重建失败等）。
+                   以前这里只记错误不重建，会话一废整条流就永远停住（sent 卡死）→ 现在重建。 */
+                long long nowMs = AXNowMs();
+                if (es == kVTInvalidSessionErr || es == kVTParameterErr) {
+                    if (g_vtDropAt > 0 && nowMs - g_vtDropAt < 5000 && !g_forceSW) {
+                        g_forceSW = 1;
+                        ALogShim(@"🔧 5 秒内连续失效 → 切换到软件编码");
+                    }
+                    g_vtDropAt = nowMs;
+                    AXVTDrop("EncodeFrame 返回无效会话");
+                }
+                usleep(50 * 1000);
                 continue;
             }
             long long t3 = AXNowMs();
@@ -2257,9 +2291,14 @@ static void AXReplayKitHandler(CMSampleBufferRef sbuf, RPSampleBufferType type, 
         g_preambleSent = 1;
         ALogShim(@"📺 [RK] preamble 已发 %dx%d", w, h);
     }
-    VTCompressionSessionEncodeFrame(g_vt, pb,
+    OSStatus es = VTCompressionSessionEncodeFrame(g_vt, pb,
                                     CMSampleBufferGetPresentationTimeStamp(sbuf),
                                     kCMTimeInvalid, NULL, NULL, NULL);
+    if (es != noErr) {
+        ALogShim(@"❌ [RK] EncodeFrame 失败 st=%d → 丢弃会话重建", (int)es);
+        AXVTDrop("ReplayKit 编码失败");
+        return;
+    }
     g_rkFrames++;
 }
 
