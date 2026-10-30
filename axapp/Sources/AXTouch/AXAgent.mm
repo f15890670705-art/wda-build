@@ -515,8 +515,12 @@ static BOOL AXTapCore(double x, double y) {
             return NO;
         }
         void (*fp4)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
+        long long synT0 = AXSeqMs();
         fp4(gSession, syn, rec, completion);
-        ALog(@"  ✅ tap(%.1f, %.1f) 已提交合成事件", x, y);
+        long long synMs = AXSeqMs() - synT0;
+        /* 合成调用本身若很慢（>100ms），说明卡在 daemon 或 CPU 被采集循环占满 */
+        if (synMs > 100) ALog(@"⏱ tap 合成耗时 %lldms（CPU 忙/daemon 慢）", synMs);
+        else             ALog(@"  ✅ tap(%.1f, %.1f) 已提交（%lldms）", x, y, synMs);
         return YES;
     } @catch (NSException *e) {
         ALog(@"❌ tap 异常: %@ / %@", e.name, e.reason);
@@ -3054,6 +3058,17 @@ static void AXTouchCommit(void) {
 }
 
 static void AXTouchHandle(const uint8_t *b) {
+    /* ★ 延迟诊断：相邻两条触控消息的到达间隔。若这里就 >500ms，说明慢在 PC 侧发送，
+       不怪我们；若间隔很小但动作不生效，那问题在我们合成/系统处理。 */
+    {
+        static long long lastMs = 0;
+        long long now = AXSeqMs();
+        if (lastMs > 0) {
+            long long dt = now - lastMs;
+            if (dt > 300) ALog(@"⏱ 触控到达间隔 %lldms（action=%d）", dt, b[0]);
+        }
+        lastMs = now;
+    }
     g_inputKick = 1;      /* 手指一动就让编码循环马上抓一帧（静止降帧时否则要等 0.5s 才有反馈） */
     int     action = b[0];
     int64_t pid    = 0;
@@ -3218,6 +3233,15 @@ static void AXCtrlHandleClient(int fd) {
     close(fd);
 }
 
+static volatile int g_ctrlClientFd = -1;   /* 当前在服务的控制连接 */
+
+static void *AXCtrlConnThread(void *arg) {
+    int fd = (int)(intptr_t)arg;
+    AXCtrlHandleClient(fd);                 /* 内部负责 close(fd) */
+    if (g_ctrlClientFd == fd) g_ctrlClientFd = -1;
+    return NULL;
+}
+
 static void *AXCtrlAcceptLoop(void *arg) {
     (void)arg;
     while (g_ctrlRun) {
@@ -3233,7 +3257,19 @@ static void *AXCtrlAcceptLoop(void *arg) {
         setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
         struct timeval tv = {0, 300 * 1000};
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        AXCtrlHandleClient(fd);       /* 控制只有一路，同步处理即可 */
+
+        /* ★ 新连接顶掉旧连接：PC 每次重连视频（重启服务/切档位/断线）都会新开控制连接。
+           以前这里是同步处理，旧连接只要还开着，新连接就永远卡在 TCP backlog 里进不来 ——
+           表现就是"PC 上显示已连接、点了完全没反应"。 */
+        int oldFd = g_ctrlClientFd;
+        if (oldFd >= 0 && oldFd != fd) {
+            ALog(@"🎛 新连接顶掉旧连接 fd=%d → %d", oldFd, fd);
+            shutdown(oldFd, SHUT_RDWR);
+        }
+        g_ctrlClientFd = fd;
+        pthread_t tid;
+        pthread_create(&tid, NULL, AXCtrlConnThread, (void *)(intptr_t)fd);
+        pthread_detach(tid);
     }
     return NULL;
 }
