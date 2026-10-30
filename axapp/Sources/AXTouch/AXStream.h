@@ -32,9 +32,22 @@ NSString *AXStreamCurrentUDID(void);
 
 /// 采集方案：0=XCUITest(截图) 1=ReplayKit。仅在 Start 之前设置有效。
 void AXStreamSetScheme(int s);
+
+/* 测试档位（临时）：采集方式 + 截图编码格式 + 质量 的组合 */
+int         AXStreamProfileCount(void);
+const char *AXStreamProfileName(int idx);
+const char *AXStreamProfileDesc(int idx);
+int         AXStreamProfileCapture(int idx);
+void        AXStreamApplyProfile(int idx);
 int  AXStreamGetScheme(void);
 /// 实际生效的方案：0=XCUITest 1=ReplayKit 2=ReplayKit 拿不到帧已回退 XCUITest
 int  AXStreamActiveScheme(void);
+
+/// 截图质量参数（0~1，默认 1.0）。调低可能让 daemon 改用 JPEG 编码，IPC 更快
+void AXStreamSetImgQuality(double q);
+
+/// 截图编码格式（UTI）：public.jpeg（默认，支持 DCT 缩放解码）或 public.png
+void AXStreamSetImgFormat(NSString *uti);
 
 /// 统计：fps / 码率 / 客户端数 / 编码尺寸 / 最近错误
 NSDictionary *AXStreamStats(void);
