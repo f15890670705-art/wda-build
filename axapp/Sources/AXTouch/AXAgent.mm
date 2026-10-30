@@ -44,6 +44,7 @@
 #import <stdarg.h>
 #import <ctype.h>
 #import <Security/Security.h>
+#import <ReplayKit/ReplayKit.h>
 #import "AXStream.h"
 #import <sys/time.h>
 #import <signal.h>
@@ -1526,6 +1527,12 @@ static pthread_t        g_acceptTid;
 static pthread_t        g_encTid;
 static pthread_mutex_t  g_clientMu = PTHREAD_MUTEX_INITIALIZER;
 static int              g_clients[4] = {-1, -1, -1, -1};
+
+/* 采集方案（提前声明：编码循环里要读它） */
+static volatile int g_scheme = 0;       /* 0=XCUITest(截图)  1=ReplayKit */
+static volatile int g_rkFrames = 0;
+static volatile int g_rkFallback = 0;   /* 1=ReplayKit 拿不到帧，已自动回退 */
+static void AXReplayKitStopInternal(void);
 static volatile int     g_clientCount = 0;
 
 static VTCompressionSessionRef g_vt = NULL;
@@ -1758,8 +1765,13 @@ static void AXVTCompressionCallback(void *outRefCon, void *srcFrameRefCon,
     }   /* @autoreleasepool */
 }
 
-static BOOL AXVTEnsure(int w, int h) {
-    if (g_vt && g_encW == w && g_encH == h) return YES;
+static OSType g_vtFmt = 0;   /* 当前 VT 会话的源像素格式 */
+
+/* 按指定源像素格式建会话：XCUITest 路径喂 BGRA，ReplayKit 路径喂它自己给的 420f/420v。
+   格式不匹配 VT 会直接拒绝编码，所以必须跟着首帧格式走。 */
+static BOOL AXVTEnsureWithFormat(int w, int h, OSType fmt) {
+    if (fmt == 0) fmt = kCVPixelFormatType_32BGRA;
+    if (g_vt && g_encW == w && g_encH == h && g_vtFmt == fmt) return YES;
     if (g_vt) {
         VTCompressionSessionCompleteFrames(g_vt, kCMTimeInvalid);
         VTCompressionSessionInvalidate(g_vt);
@@ -1767,7 +1779,7 @@ static BOOL AXVTEnsure(int w, int h) {
         g_vt = NULL;
     }
     NSDictionary *srcAttrs = @{
-        (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (NSString *)kCVPixelBufferPixelFormatTypeKey: @(fmt),
         (NSString *)kCVPixelBufferWidthKey: @(w),
         (NSString *)kCVPixelBufferHeightKey: @(h),
     };
@@ -1777,7 +1789,7 @@ static BOOL AXVTEnsure(int w, int h) {
                                              NULL, AXVTCompressionCallback, NULL, &g_vt);
     if (st != noErr || !g_vt) {
         AXSetErr((int)st, [NSString stringWithFormat:@"VTCompressionSessionCreate 失败 st=%d", (int)st]);
-        ALogShim(@"❌ VT 创建失败 st=%d w=%d h=%d", (int)st, w, h);
+        ALogShim(@"❌ VT 创建失败 st=%d w=%d h=%d fmt=%u", (int)st, w, h, (unsigned)fmt);
         return NO;
     }
     VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
@@ -1788,12 +1800,18 @@ static BOOL AXVTEnsure(int w, int h) {
     VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@(g_bitrate));
     VTCompressionSessionPrepareToEncodeFrames(g_vt);
 
-    g_encW = w; g_encH = h;
+    g_encW = w; g_encH = h; g_vtFmt = fmt;
     g_needConfig = YES;
     g_ptsMs = 0;
-    ALogShim(@"✅ VT 编码器就绪 %dx%d  %d kbps  %d fps", w, h, g_bitrate / 1000, g_fps);
+    ALogShim(@"✅ VT 编码器就绪 %dx%d fmt=%u  %d kbps  %d fps", w, h, (unsigned)fmt,
+             g_bitrate / 1000, g_fps);
     return YES;
 }
+
+static BOOL AXVTEnsure(int w, int h) {
+    return AXVTEnsureWithFormat(w, h, kCVPixelFormatType_32BGRA);
+}
+
 
 /* ---------------- 采集：XCTest IPC 截图（与 shot2 同一条路） ---------------- */
 
@@ -1882,6 +1900,11 @@ static void *AXEncodeLoop(void *arg) {
 
     while (g_running) {
         @autoreleasepool {
+            if (g_scheme == 1) {
+                /* ReplayKit 模式：帧在采集回调里直接编码发送，这里不抓图、不占 CPU */
+                usleep(100 * 1000);
+                continue;
+            }
             if (g_clientCount <= 0) {
                 /* 没人看就不抓，省电省 CPU */
                 usleep(50 * 1000);
@@ -2061,6 +2084,93 @@ static void *AXAcceptLoop(void *arg) {
 
 static void AXLoadStoredUDIDIfNeeded(void);
 
+/* ---------------- 采集方案 B：ReplayKit ----------------
+   RPScreenRecorder 直接给 CMSampleBuffer（像素已在内存里，不用解码），喂给 VT 即可，
+   比 XCUITest 少一次"编码数据→解码→转 BGRA"。
+   代价：状态栏出现录屏标识；个别内容（DRM 视频）拿不到 → 由看门狗回退 XCUITest。 */
+void AXStreamSetScheme(int s) { g_scheme = (s == 1) ? 1 : 0; g_rkFallback = 0; }
+int  AXStreamGetScheme(void) { return g_scheme; }
+/* 供界面显示：0=XCUITest 1=ReplayKit 2=ReplayKit 失败已回退 */
+int  AXStreamActiveScheme(void) { return g_rkFallback ? 2 : g_scheme; }
+
+static void AXReplayKitStopInternal(void) {
+    RPScreenRecorder *r = [RPScreenRecorder sharedRecorder];
+    if (r.isRecording) {
+        [r stopCaptureWithHandler:^(NSError *e) {
+            ALogShim(@"🛑 ReplayKit 已停止（%@）", e ? e.localizedDescription : @"ok");
+        }];
+    }
+}
+
+static void AXReplayKitHandler(CMSampleBufferRef sbuf, RPSampleBufferType type, NSError *err) {
+    if (type != RPSampleBufferTypeVideo) return;
+    if (err) { ALogShim(@"❌ ReplayKit 帧错误: %@", err.localizedDescription); return; }
+    CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sbuf);
+    if (!pb) return;
+    int w = (int)CVPixelBufferGetWidth(pb);
+    int h = (int)CVPixelBufferGetHeight(pb);
+    if (w <= 0 || h <= 0) return;
+    if (!AXVTEnsureWithFormat(w, h, CVPixelBufferGetPixelFormatType(pb))) return;
+
+    if (!g_preambleSent) {
+        pthread_mutex_lock(&g_clientMu);
+        for (int i = 0; i < 4; i++) {
+            if (g_clients[i] >= 0) AXSendPreamble(g_clients[i], w, h, g_maxSide);
+        }
+        pthread_mutex_unlock(&g_clientMu);
+        AXSendSessionHeader(w, h);
+        g_preambleSent = 1;
+        ALogShim(@"📺 [RK] preamble 已发 %dx%d", w, h);
+    }
+    VTCompressionSessionEncodeFrame(g_vt, pb,
+                                    CMSampleBufferGetPresentationTimeStamp(sbuf),
+                                    kCMTimeInvalid, NULL, NULL, NULL);
+    g_rkFrames++;
+}
+
+/* 看门狗：3 秒没出帧就认定"这一路拿不到画面"，自动回退到 XCUITest 截图。
+   覆盖：权限没给、isAvailable=NO、DRM 内容、系统限制等。 */
+static void *AXReplayKitWatchdog(void *arg) {
+    (void)arg;
+    for (int i = 0; i < 30; i++) {
+        usleep(100 * 1000);
+        if (!g_running || g_scheme != 1) return NULL;
+        if (g_rkFrames > 0) return NULL;
+    }
+    ALogShim(@"⚠️ ReplayKit 3 秒内没有出帧 → 自动回退 XCUITest 截图方案");
+    AXReplayKitStopInternal();
+    g_scheme = 0;
+    g_rkFallback = 1;
+    return NULL;
+}
+
+static BOOL AXReplayKitStart(void) {
+    RPScreenRecorder *r = [RPScreenRecorder sharedRecorder];
+    if (!r.isAvailable) {
+        ALogShim(@"❌ ReplayKit 不可用（isAvailable=NO）→ 回退 XCUITest");
+        g_rkFallback = 1;
+        g_scheme = 0;
+        return NO;
+    }
+    r.microphoneEnabled = NO;
+    g_rkFrames = 0;
+    [r startCaptureWithHandler:^(CMSampleBufferRef sbuf, RPSampleBufferType t, NSError *e) {
+        @autoreleasepool { AXReplayKitHandler(sbuf, t, e); }
+    } completionHandler:^(NSError *e) {
+        if (e) {
+            ALogShim(@"❌ ReplayKit 启动失败: %@ → 回退 XCUITest", e.localizedDescription);
+            g_rkFallback = 1;
+            g_scheme = 0;
+        } else {
+            ALogShim(@"✅ ReplayKit 采集已启动（等首帧）");
+        }
+    }];
+    pthread_t tid;
+    pthread_create(&tid, NULL, AXReplayKitWatchdog, NULL);
+    pthread_detach(tid);
+    return YES;
+}
+
 BOOL AXStreamStart(uint16_t port) {
     if (g_running) return YES;
     AXLoadStoredUDIDIfNeeded();   /* ★ 用上次保存的真 UDID，别再用假 ID */
@@ -2105,6 +2215,12 @@ BOOL AXStreamStart(uint16_t port) {
     g_encW = g_encH = 0;
 
     pthread_create(&g_acceptTid, NULL, AXAcceptLoop, NULL);
+    if (g_scheme == 1) {
+        ALogShim(@"🎥 采集方案：ReplayKit");
+        AXReplayKitStart();      /* 失败会自动把 g_scheme 置 0（回退 XCUITest） */
+    } else {
+        ALogShim(@"🎥 采集方案：XCUITest 截图");
+    }
     pthread_create(&g_encTid, NULL, AXEncodeLoop, NULL);
     ALogShim(@"✅ 推流服务已在 0.0.0.0:%d 监听", port);
     return YES;
@@ -2113,6 +2229,7 @@ BOOL AXStreamStart(uint16_t port) {
 void AXStreamStop(void) {
     if (!g_running) return;
     g_running = NO;
+    AXReplayKitStopInternal();   /* 采集中就停掉，避免红条常驻 */
 
     if (g_listenFd >= 0) { close(g_listenFd); g_listenFd = -1; }
 
