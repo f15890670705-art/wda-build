@@ -55,6 +55,7 @@
 #import <string.h>
 #import <stdlib.h>
 #import <stdio.h>
+#import <time.h>
 #import <errno.h>
 #import <fcntl.h>
 #import <arpa/inet.h>
@@ -784,6 +785,20 @@ extern "C" BOOL AXAgentPasteboardSet(NSString *text) {
               中间每段从上一位置 move 到新位置
    两次都从 (x1,y1) 拖到 (x2,y2)，steps 段，段间停顿 gapMs。
    返回一段摘要（每段耗时），同时打日志 —— 判断依据就看"手指有没有真的跟着走"。 */
+/* 本文件后面的 AXNowMs 定义在流那一段，这里先用一个本地计时器（单调时钟） */
+static long long AXSeqMs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+/* 把一次拖动切成若干段分别 synthesizeEvent，用来验证 XCTest 是否支持
+   「跨 record 保持手指按下」：
+     mode 0 = 整段一条 record 一次提交（现在的正式做法，作为对照）
+     mode 1 = 分段提交：首段 beginsPersistentState、末段 endsPersistentState，
+              中间每段从上一位置 move 到新位置
+   两次都从 (x1,y1) 拖到 (x2,y2)，steps 段，段间停顿 gapMs。
+   返回值带每段耗时 —— 判断依据就看"手指有没有真的跟着走"。 */
 extern "C" NSString *AXAgentTouchSeq(int mode, double x1, double y1, double x2, double y2,
                                      int steps, int gapMs) {
     if (!gReady || !gSession) return @"not ready";
@@ -801,7 +816,7 @@ extern "C" NSString *AXAgentTouchSeq(int mode, double x1, double y1, double x2, 
     SEL addPath  = NSSelectorFromString(@"addPointerEventPath:");
     SEL initRec  = NSSelectorFromString(@"initWithName:interfaceOrientation:");
 
-    long long t0 = AXNowMs();
+    long long t0 = AXSeqMs();
 
     if (mode == 0) {
         double dur = steps * 0.02;
@@ -819,7 +834,7 @@ extern "C" NSString *AXAgentTouchSeq(int mode, double x1, double y1, double x2, 
         ((void (*)(id, SEL, double))objc_msgSend)(path, up, dur);
         ((void (*)(id, SEL, id))objc_msgSend)(rec, addPath, path);
         BOOL ok = AXSubmitEventRecord(rec, dur + 0.1);
-        long long el = AXNowMs() - t0;
+        long long el = AXSeqMs() - t0;
         ALog(@"🧪 [seq] mode=0 整段提交 steps=%d ok=%d %lldms", steps, ok, el);
         return [NSString stringWithFormat:@"mode=0 ok=%d %lldms", ok, el];
     }
@@ -828,7 +843,8 @@ extern "C" NSString *AXAgentTouchSeq(int mode, double x1, double y1, double x2, 
     NSMutableString *spent = [NSMutableString string];
     double px = x1, py = y1;
     BOOL anyFail = NO;
-    for (int i = 0; i <= steps; i++) {
+
+    for (int i = 0; i <= steps && !anyFail; i++) {
         @autoreleasepool {
             double k = (double)i / (double)steps;
             CGPoint p = CGPointMake(x1 + (x2 - x1) * k, y1 + (y2 - y1) * k);
@@ -837,30 +853,37 @@ extern "C" NSString *AXAgentTouchSeq(int mode, double x1, double y1, double x2, 
 
             id rec = ((id (*)(id, SEL, id, long))objc_msgSend)([recCls alloc], initRec,
                                                                @"AXSeqSeg", AXInterfaceOrientation());
-            if (!rec) { anyFail = YES; return; }
-            /* KVC 设置：类上确实有 setBeginsPersistentState: / setEndsPersistentState: */
-            if (first) [rec setValue:@YES forKey:@"beginsPersistentState"];
-            if (last)  [rec setValue:@YES forKey:@"endsPersistentState"];
+            if (!rec) {
+                anyFail = YES;
+            } else {
+                /* KVC：类上确实有 setBeginsPersistentState: / setEndsPersistentState: */
+                if (first) [rec setValue:@YES forKey:@"beginsPersistentState"];
+                if (last)  [rec setValue:@YES forKey:@"endsPersistentState"];
 
-            id path = ((id (*)(id, SEL, CGPoint, double))objc_msgSend)(
-                          [pathCls alloc], initPath, CGPointMake(px, py), 0.0);
-            if (!path) { anyFail = YES; return; }
-            if (!first) {
-                ((void (*)(id, SEL, CGPoint, double))objc_msgSend)(path, mv, p, 0.0);
-            }
-            if (last) {
-                ((void (*)(id, SEL, double))objc_msgSend)(path, up, 0.0);
-            }
-            ((void (*)(id, SEL, id))objc_msgSend)(rec, addPath, path);
+                id path = ((id (*)(id, SEL, CGPoint, double))objc_msgSend)(
+                              [pathCls alloc], initPath, CGPointMake(px, py), 0.0);
+                if (!path) {
+                    anyFail = YES;
+                } else {
+                    if (!first) {
+                        ((void (*)(id, SEL, CGPoint, double))objc_msgSend)(path, mv, p, 0.0);
+                    }
+                    if (last) {
+                        ((void (*)(id, SEL, double))objc_msgSend)(path, up, 0.0);
+                    }
+                    ((void (*)(id, SEL, id))objc_msgSend)(rec, addPath, path);
 
-            long long s0 = AXNowMs();
-            if (!AXSubmitEventRecord(rec, 0)) anyFail = YES;
-            [spent appendFormat:@"%lld,", AXNowMs() - s0];
+                    long long s0 = AXSeqMs();
+                    if (!AXSubmitEventRecord(rec, 0)) anyFail = YES;
+                    [spent appendFormat:@"%lld,", AXSeqMs() - s0];
+                }
+            }
             px = p.x; py = p.y;
             if (gapMs > 0) usleep((useconds_t)(gapMs * 1000));
         }
     }
-    long long el = AXNowMs() - t0;
+
+    long long el = AXSeqMs() - t0;
     ALog(@"🧪 [seq] mode=1 分段提交 %d 段 gap=%dms fail=%d 总%lldms 每段[%@]",
          steps + 1, gapMs, anyFail, el, spent);
     return [NSString stringWithFormat:@"mode=1 segs=%d fail=%d %lldms [%@]",
