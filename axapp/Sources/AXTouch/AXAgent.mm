@@ -496,10 +496,23 @@ extern "C" BOOL AXAgentTap(double x, double y) {
 
 /// 在永不退出、且不 pop autorelease pool 的线程里跑 bootstrap：
 /// XCTest 内部创建的 XPC 连接不会被释放，避免 _xpc_api_misuse 崩溃。
+/* 正在 bootstrap 的标志：防止连点「重建会话」叠加多条常驻线程、反复覆盖 gSession */
+static volatile int gStickyBusy = 0;
+
+extern "C" BOOL AXAgentIsBootstrapping(void) {
+    return gStickyBusy != 0;
+}
+
 extern "C" void AXAgentStartSticky(void) {
+    /* ★ 原子占位：已经在建就忽略（返回 YES 表示"这次没建"由调用方提示） */
+    if (__sync_lock_test_and_set(&gStickyBusy, 1)) {
+        ALog(@"⏳ 会话正在建立中，忽略重复的 bootstrap 请求");
+        return;
+    }
     NSThread *t = [[NSThread alloc] initWithBlock:^{
         ALog(@"常驻线程启动，开始 bootstrap");
         AXAgentBootstrap();
+        __sync_lock_release(&gStickyBusy);   /* 建完（无论成败）放开，允许失败后重试 */
         while (YES) { [NSThread sleepForTimeInterval:86400.0]; }
     }];
     t.name = @"AXAgent-Sticky";
