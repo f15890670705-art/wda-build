@@ -6,8 +6,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "71"
-    static let tag = "v2.0-b71"
+    static let build = "72"
+    static let tag = "v2.0-b72"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -219,6 +219,47 @@ final class ControlServer {
                                          (obj["x2"] as? Double) ?? 0, (obj["y2"] as? Double) ?? 0,
                                          (obj["duration"] as? Double) ?? 0.25)
                     resp = "{\"ok\":\(r)}"
+                case "pinch":
+                    /* {"cmd":"pinch","cx":215,"cy":466,"gap0":100,"gap1":300,"dur":0.35}
+                       gap0<gap1 = 双指张开(放大)；gap0>gap1 = 捏合(缩小) */
+                    let pin = AXAgentPinch((obj["cx"] as? Double) ?? 0,
+                                           (obj["cy"] as? Double) ?? 0,
+                                           (obj["gap0"] as? Double) ?? 200,
+                                           (obj["gap1"] as? Double) ?? 200,
+                                           (obj["dur"] as? Double) ?? 0.35)
+                    resp = "{\"ok\":\(pin)}"
+                case "text":
+                    /* {"cmd":"text","v":"hello"} —— ASCII 直打；中文用 paste */
+                    let tv = (obj["v"] as? String) ?? ""
+                    resp = "{\"ok\":\(AXAgentTypeText(tv))}"
+                case "key":
+                    /* {"cmd":"key","v":"\r","mods":0}   mods: Shift=131072 Cmd=1048576 */
+                    let kv = (obj["v"] as? String) ?? ""
+                    let md = (obj["mods"] as? Int) ?? 0
+                    resp = "{\"ok\":\(AXAgentKey(kv, UInt(max(0, md))))}"
+                case "paste":
+                    /* {"cmd":"paste","v":"中文内容"} —— 写剪贴板 + Cmd+V */
+                    let pv = (obj["v"] as? String) ?? ""
+                    resp = "{\"ok\":\(AXAgentPaste(pv))}"
+                case "pbset":
+                    resp = "{\"ok\":\(AXAgentPasteboardSet((obj["v"] as? String) ?? ""))}"
+                case "pbget":
+                    let pb = AXAgentPasteboardGet() ?? ""
+                    let pd: [String: Any] = ["ok": true, "text": pb]
+                    resp = (try? String(data: JSONSerialization.data(withJSONObject: pd), encoding: .utf8)) ?? "{\"ok\":false}"
+                case "touchseq":
+                    /* 流式触控实验：
+                       {"cmd":"touchseq","mode":0|1,"x1":100,"y1":300,"x2":300,"y2":700,"steps":12,"gap":20}
+                       mode 0 = 整段一次提交（对照）；mode 1 = 分段 + persistent state（实验） */
+                    let r = AXAgentTouchSeq(Int32((obj["mode"] as? Int) ?? 0),
+                                            (obj["x1"] as? Double) ?? 0,
+                                            (obj["y1"] as? Double) ?? 0,
+                                            (obj["x2"] as? Double) ?? 0,
+                                            (obj["y2"] as? Double) ?? 0,
+                                            Int32((obj["steps"] as? Int) ?? 12),
+                                            Int32((obj["gap"] as? Int) ?? 20)) ?? "nil"
+                    let d: [String: Any] = ["ok": true, "result": r]
+                    resp = (try? String(data: JSONSerialization.data(withJSONObject: d), encoding: .utf8)) ?? "{\"ok\":false}"
                 case "longpress":
                     let r = AXAgentLongPress((obj["x"] as? Double) ?? 0, (obj["y"] as? Double) ?? 0,
                                              (obj["duration"] as? Double) ?? 1.0)
@@ -284,6 +325,56 @@ final class ControlServer {
                     let uv = (obj["v"] as? String) ?? ""
                     AXStreamSetUDIDPersist(uv)   /* ★ 持久化：重装/重启都还在 */
                     resp = "{\"ok\":true,\"udid\":\"\(uv)\"}"
+                case "profile":
+                    /* 测试档位（临时）：
+                       {"cmd":"profile"}                    → 列出所有档位 + 当前值
+                       {"cmd":"profile","i":2}              → 切到 2 号档（采集变了会自动重启服务）
+                       {"cmd":"profile","i":4,"restart":1}  → 强制重启服务 */
+                    let cnt = Int(AXStreamProfileCount())
+                    let cur = UserDefaults.standard.integer(forKey: "axtouch.stream.scheme")
+                    if let idx = obj["i"] as? Int, idx >= 0 && idx < cnt {
+                        let capBefore = Int(AXStreamGetScheme())
+                        UserDefaults.standard.set(idx, forKey: "axtouch.stream.scheme")
+                        AXStreamApplyProfile(Int32(idx))
+                        let capNew = Int(AXStreamProfileCapture(Int32(idx)))
+                        let force = ((obj["restart"] as? Int) ?? 0) == 1
+                        let needRestart = force || (capBefore != capNew)
+                        if needRestart {
+                            AXStreamStop()
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                                _ = AXStreamStart(27184)
+                            }
+                        }
+                        let d: [String: Any] = [
+                            "ok": true, "i": idx,
+                            "name": String(cString: AXStreamProfileName(Int32(idx))),
+                            "desc": String(cString: AXStreamProfileDesc(Int32(idx))),
+                            "restarting": needRestart,
+                        ]
+                        resp = (try? String(data: JSONSerialization.data(withJSONObject: d), encoding: .utf8)) ?? "{\"ok\":false}"
+                    } else {
+                        var items = [[String: Any]]()
+                        for i in 0..<cnt {
+                            items.append([
+                                "i": i,
+                                "name": String(cString: AXStreamProfileName(Int32(i))),
+                                "desc": String(cString: AXStreamProfileDesc(Int32(i))),
+                                "capture": Int(AXStreamProfileCapture(Int32(i))),
+                            ])
+                        }
+                        let d: [String: Any] = ["ok": true, "count": cnt, "current": cur, "items": items]
+                        resp = (try? String(data: JSONSerialization.data(withJSONObject: d), encoding: .utf8)) ?? "{\"ok\":false}"
+                    }
+                case "quality":
+                    /* {"cmd":"quality","fps":30,"bitrate":2000000,"maxSide":720}
+                       只给需要的字段，0/缺省=保持。fps 与码率立刻生效，maxSide 变则重建编码会话 */
+                    let qf = (obj["fps"] as? Int) ?? 0
+                    let qb = (obj["bitrate"] as? Int) ?? 0
+                    let qm = (obj["maxSide"] as? Int) ?? 0
+                    if let iq = obj["imgq"] as? Double { AXStreamSetImgQuality(iq) }
+                    if let iu = obj["imguti"] as? String { AXStreamSetImgFormat(iu) }
+                    AXStreamSetParams(Int32(qb), Int32(qf), Int32(qm))
+                    resp = "{\"ok\":true,\"fps\":\(qf),\"bitrate\":\(qb),\"maxSide\":\(qm)}"
                 case "stream":
                     /* {"cmd":"stream","op":"start|stop|status"} */
                     let op = (obj["op"] as? String) ?? "status"
