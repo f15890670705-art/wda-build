@@ -24,6 +24,7 @@ NSString *AXAgentShot(double maxSide, double quality);
 NSString *AXAgentProbeRecording(void);
 NSString *AXAgentDumpTree(int maxNodes);
 NSString *AXProbeDeviceInfo(void);
+NSString *AXLockdownUDID(void);
 BOOL AXAgentSetAppStateTimeout(double v);
 NSString *AXAgentShotLowLevel(int mode, double quality);
 #import "AXStream.h"
