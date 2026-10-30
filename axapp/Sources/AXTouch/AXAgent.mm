@@ -476,7 +476,10 @@ extern "C" BOOL AXAgentBootstrapNow(void) {
     return AXAgentBootstrap();
 }
 
-extern "C" BOOL AXAgentTap(double x, double y) {
+/* 核心实现（提交完立刻返回，不等待）。控制通道必须用这个 ——
+   控制线程是串行的，这里一阻塞，后面的点击/滑动全在队列里排队，
+   表现就是"点了半天才反应"。 */
+static BOOL AXTapCore(double x, double y) {
     if (!gReady || !gSession) {
         ALog(@"❌ tap 失败：会话未就绪");
         return NO;
@@ -513,13 +516,19 @@ extern "C" BOOL AXAgentTap(double x, double y) {
         }
         void (*fp4)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
         fp4(gSession, syn, rec, completion);
-        [NSThread sleepForTimeInterval:0.4];
         ALog(@"  ✅ tap(%.1f, %.1f) 已提交合成事件", x, y);
         return YES;
     } @catch (NSException *e) {
         ALog(@"❌ tap 异常: %@ / %@", e.name, e.reason);
         return NO;
     }
+}
+
+/* 对外的 tap：给 10010 用，提交后等 0.1 秒让手势走完再回包 */
+extern "C" BOOL AXAgentTap(double x, double y) {
+    BOOL ok = AXTapCore(x, y);
+    if (ok) [NSThread sleepForTimeInterval:0.1];
+    return ok;
 }
 
 /// 在永不退出、且不 pop autorelease pool 的线程里跑 bootstrap：
@@ -567,7 +576,7 @@ extern "C" BOOL AXAgentPressHome(void) {
     return YES;
 }
 
-extern "C" BOOL AXAgentGesture(const double *xy, const double *t, int n) {
+static BOOL AXGestureCore(const double *xy, const double *t, int n) {
     if (!gReady || !gSession) { ALog(@"❌ gesture 失败：会话未就绪"); return NO; }
     if (n < 2) { ALog(@"❌ gesture 失败：点数不足"); return NO; }
     @try {
@@ -603,13 +612,19 @@ extern "C" BOOL AXAgentGesture(const double *xy, const double *t, int n) {
         if (![gSession respondsToSelector:syn]) { ALog(@"❌ gesture: 无 synthesizeEvent"); return NO; }
         void (^completion)(id) = ^(id err) { };
         ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, syn, rec, completion);
-        [NSThread sleepForTimeInterval:0.25];
         ALog(@"  ✅ gesture 已提交（%d 点，末点 %.2fs）", n, t[n-1]);
         return YES;
     } @catch (NSException *e) {
         ALog(@"❌ gesture 异常: %@ / %@", e.name, e.reason);
         return NO;
     }
+}
+
+/* 对外的 gesture：给 10010 用，提交后等 0.1 秒 */
+extern "C" BOOL AXAgentGesture(const double *xy, const double *t, int n) {
+    BOOL ok = AXGestureCore(xy, t, n);
+    if (ok) [NSThread sleepForTimeInterval:0.1];
+    return ok;
 }
 
 extern "C" BOOL AXAgentSwipe(double x1, double y1, double x2, double y2, double dur) {
@@ -1832,6 +1847,9 @@ static int              g_maxSide = 720;
 static volatile long long g_ptsMs = 0;         /* 真实墙钟毫秒，严格单调 */
 static volatile BOOL    g_needConfig = YES;    /* 首帧 / 编码器重建后要发 SPS/PPS */
 static volatile double g_imgQuality = 0.70;   /* 截图压缩质量（0~1） */
+static volatile int    g_decodeThumb = 0;     /* 0=全解+CGContext(默认)  1=ImageIO thumbnail */
+static volatile int    g_inputKick   = 0;     /* 有触控输入 → 让编码循环立刻出一帧 */
+static volatile int    g_staticDrop  = 1;     /* 1=静止画面自动降帧（默认开）；测试时可关 */
 static char           g_imgUTI[64] = "public.jpeg";  /* 截图编码格式：public.jpeg / public.png */
 static volatile long long g_lastImgBytes = 0; /* 上帧 IPC 返回的图片字节数 */
 static volatile long long g_lastDecMs = 0;    /* 上帧解码耗时（心跳里打出来） */
@@ -2340,13 +2358,15 @@ static void *AXEncodeLoop(void *arg) {
             CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)enc, NULL);
             CGImageRef img = NULL;
             if (src) {
-                NSDictionary *thumbOpts = @{
-                    (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
-                    (id)kCGImageSourceCreateThumbnailWithTransform:   @NO,
-                    (id)kCGImageSourceThumbnailMaxPixelSize:          @(MAX(tw, th)),
-                };
-                img = CGImageSourceCreateThumbnailAtIndex(src, 0,
-                                                          (__bridge CFDictionaryRef)thumbOpts);
+                if (g_decodeThumb) {
+                    NSDictionary *thumbOpts = @{
+                        (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+                        (id)kCGImageSourceCreateThumbnailWithTransform:   @NO,
+                        (id)kCGImageSourceThumbnailMaxPixelSize:          @(MAX(tw, th)),
+                    };
+                    img = CGImageSourceCreateThumbnailAtIndex(src, 0,
+                                                              (__bridge CFDictionaryRef)thumbOpts);
+                }
                 if (!img) img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
                 CFRelease(src);
             }
@@ -2427,16 +2447,37 @@ static void *AXEncodeLoop(void *arg) {
             /* 节奏控制（2026-10-31 改）：按「下一帧的绝对时刻」排程。
                旧写法 sleep(预算 - 本帧耗时) 会把抖动一点点累积，实测帧率比目标低 10~20%；
                而且一旦某帧超预算就完全不等，等于放开跑、把带宽打满。 */
+            /* ★ 输入唤醒：只要收到触控（g_inputKick），立刻抓一帧并解除静止降帧。
+               不做这个的话，静止时是 2fps，手指点下去要等最多 0.5 秒画面才动，
+               用户感受就是"点了半天才反应"。 */
+            if (g_inputKick) {
+                g_inputKick = 0;
+                staticStreak = 0;
+                nextTick = AXNowMs();
+            }
+
             int fpsNow = (g_fps > 0 ? g_fps : 20);
             if (fpsNow > 60) fpsNow = 60;
             if (fpsNow < 1)  fpsNow = 1;
             /* 画面静止超过 4 帧 → 2fps（只发心跳帧维持会话）；有变化立刻回到目标帧率 */
-            if (staticStreak >= 4 && fpsNow > 2) fpsNow = 2;
+            if (g_staticDrop && staticStreak >= 4 && fpsNow > 2) fpsNow = 2;
             long long intervalMs = 1000 / fpsNow;
             nextTick += intervalMs;
             long long nowPace = AXNowMs();
             if (nextTick > nowPace) {
-                usleep((useconds_t)((nextTick - nowPace) * 1000));
+                /* 分段睡：中间一旦有触控就提前醒来，别死等满一整帧间隔 */
+                long long remain = nextTick - nowPace;
+                while (remain > 0 && g_running) {
+                    if (g_inputKick) {
+                        g_inputKick = 0;
+                        staticStreak = 0;
+                        nextTick = AXNowMs();
+                        break;
+                    }
+                    long long stepMs = remain > 8 ? 8 : remain;
+                    usleep((useconds_t)(stepMs * 1000));
+                    remain -= stepMs;
+                }
             } else if (nowPace - nextTick > intervalMs * 3) {
                 nextTick = nowPace;      /* 落后超过 3 帧就不追，免得补帧连发 */
             }
@@ -2961,7 +3002,7 @@ static void AXTouchCommit(void) {
         int k = g_tpn[s];
         if (k <= 0) { AXTouchReset(); return; }
         if (k <= 2) {
-            AXAgentTap(g_tpts[s][0].x, g_tpts[s][0].y);
+            AXTapCore(g_tpts[s][0].x, g_tpts[s][0].y);
         } else {
             double xy[AX_TP_MAX * 2];
             double tt[AX_TP_MAX];
@@ -2970,7 +3011,7 @@ static void AXTouchCommit(void) {
                 xy[i * 2 + 1] = g_tpts[s][i].y;
                 tt[i]         = g_tpts[s][i].t;
             }
-            AXAgentGesture(xy, tt, k);
+            AXGestureCore(xy, tt, k);
         }
         AXTouchReset();
         return;
@@ -3013,6 +3054,7 @@ static void AXTouchCommit(void) {
 }
 
 static void AXTouchHandle(const uint8_t *b) {
+    g_inputKick = 1;      /* 手指一动就让编码循环马上抓一帧（静止降帧时否则要等 0.5s 才有反馈） */
     int     action = b[0];
     int64_t pid    = 0;
     for (int i = 0; i < 8; i++) pid = (pid << 8) | b[1 + i];
@@ -3402,6 +3444,16 @@ static void AXLoadStoredUDIDIfNeeded(void) {
         g_udidUserSet = 1;
         ALogShim(@"📺 已载入上次保存的设备 UDID = %s", g_udid);
     }
+}
+
+void AXStreamSetStaticDrop(int on) {
+    g_staticDrop = (on == 1) ? 1 : 0;
+    ALogShim(@"❄️ 静止自动降帧 = %@", g_staticDrop ? @"开" : @"关");
+}
+
+void AXStreamSetDecodeMode(int thumb) {
+    g_decodeThumb = (thumb == 1) ? 1 : 0;
+    ALogShim(@"🧩 解码路径 = %@", g_decodeThumb ? @"ImageIO thumbnail" : @"全解+CGContext");
 }
 
 void AXStreamSetImgFormat(NSString *uti) {
