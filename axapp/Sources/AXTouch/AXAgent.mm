@@ -852,6 +852,58 @@ static void AXDumpNode(id elem, int depth, int *count, int maxNodes) {
     }
 }
 
+/* ★ 探测设备标识：XCUIScreen.device（XCUIDevice）的 uniqueIdentifier。
+   mirror_stream 那套私有 IOKit 我们用不了，但自动化会话里的 XCUIDevice 可能
+   曝光了设备标识 —— 有它就不需要 PC 端经 10010 传 UDID 了。 */
+extern "C" NSString *AXProbeDeviceInfo(void) {
+    ALogShim(@"===== 设备标识探测 =====");
+    if (!gReady) { ALogShim(@"❌ 会话未就绪"); return @"not ready"; }
+
+    Class scrCls = NSClassFromString(@"XCUIScreen");
+    if (!scrCls) return @"no XCUIScreen";
+    id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+    if (!screen) return @"no screen";
+
+    /* 1) XCUIScreen.device */
+    SEL devSel = NSSelectorFromString(@"device");
+    id dev = nil;
+    if ([screen respondsToSelector:devSel]) {
+        dev = ((id (*)(id, SEL))objc_msgSend)(screen, devSel);
+        ALogShim(@"  · screen.device → %@ (%s)", dev ? @"有" : @"nil",
+                 dev ? object_getClassName(dev) : "-");
+    } else {
+        ALogShim(@"  · screen 无 device 属性");
+    }
+
+    /* 2) XCUIDevice sharedDevice 路线 */
+    Class devCls = NSClassFromString(@"XCUIDevice");
+    id sd = dev;
+    if (!sd && devCls) {
+        sd = AXShared(devCls, @[@"sharedDevice", @"localDevice"]);
+    }
+    if (!sd) { ALogShim(@"❌ 拿不到 XCUIDevice 实例"); return @"no device"; }
+
+    /* 3) uniqueIdentifier */
+    SEL uidSel = NSSelectorFromString(@"uniqueIdentifier");
+    if ([sd respondsToSelector:uidSel]) {
+        @try {
+            id v = ((id (*)(id, SEL))objc_msgSend)(sd, uidSel);
+            ALogShim(@"  ✅ uniqueIdentifier = %@", v);
+            if ([v isKindOfClass:[NSString class]] && ((NSString *)v).length > 0) {
+                AXStreamSetUDID(v);
+                ALogShim(@"  ✅ 已同步给 AXStream（preamble 将使用该标识）");
+                return v;
+            }
+        } @catch (NSException *e) { ALogShim(@"  ❌ uniqueIdentifier 异常: %@", e.reason); }
+    } else {
+        ALogShim(@"  · uniqueIdentifier 不存在");
+    }
+
+    /* 4) 顺带 dump 这个类，看还有没有别的标识接口 */
+    AXDumpClass(@"XCUIDevice");
+    return @"no uid";
+}
+
 /* 路线 B：直接用 XCUIApplication 拿 accessibilityElement（不走 XCAXClient_iOS） */
 static id AXElementViaXCUIApplication(void) {
     Class appCls = NSClassFromString(@"XCUIApplication");
