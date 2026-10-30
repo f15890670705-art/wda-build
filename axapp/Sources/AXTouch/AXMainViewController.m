@@ -739,12 +739,12 @@ static NSString *AXLanIP(void) {
         __strong typeof(ws) ss = ws;
         if (!ss) return;
         NSInteger i = [[NSUserDefaults standardUserDefaults] integerForKey:kAXSchemeKey];
-        AXStreamSetScheme((i == 1) ? 1 : 0);
+        AXStreamApplyProfile((int)i);                 /* 档位＝采集+编码，一起上 */
         BOOL ok = AXStreamStart(27184);
         ss.rebuildBtn.enabled = YES;
         ss.statusText.text = ok ? @"投屏服务已重启" : @"重启失败";
         /* ReplayKit 若 3 秒内拿不到帧，AXAgent 会自动回退 XCUITest，这里 3.5 秒后如实显示 */
-        if (i == 1) {
+        if (AXStreamProfileCapture((int)i) == 1) {
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{
                 int act = AXStreamActiveScheme();
@@ -806,36 +806,57 @@ static NSString *AXLanIP(void) {
     });
 }
 
-/* 下拉框内容：当前选中的打勾 */
+/* 下拉框内容：按 AXAgent 里的档位表动态生成（测试期一次性把几种拿流方式都列出来） */
 - (void)refreshSchemeButton {
     NSInteger cur = [[NSUserDefaults standardUserDefaults] integerForKey:kAXSchemeKey];
-    NSString *t = (cur == 1) ? @"系统录屏" : @"系统截图";
+    int cnt = AXStreamProfileCount();
+    if (cur < 0 || cur >= cnt) cur = 0;
+
+    NSString *t = [NSString stringWithUTF8String:AXStreamProfileName((int)cur)];
     [self.schemeBtn setTitle:[NSString stringWithFormat:@"%@    ▾", t] forState:UIControlStateNormal];
 
     __weak typeof(self) ws = self;
-    UIAction *a0 = [UIAction actionWithTitle:@"系统截图" image:nil identifier:nil
-                                     handler:^(UIAction *a) { __strong typeof(ws) ss = ws; [ss selectScheme:0]; }];
-    a0.state = (cur == 0) ? UIMenuElementStateOn : UIMenuElementStateOff;
-    UIAction *a1 = [UIAction actionWithTitle:@"系统录屏" image:nil identifier:nil
-                                     handler:^(UIAction *a) { __strong typeof(ws) ss = ws; [ss selectScheme:1]; }];
-    a1.state = (cur == 1) ? UIMenuElementStateOn : UIMenuElementStateOff;
-    self.schemeBtn.menu = [UIMenu menuWithTitle:@"选择投屏方案" children:@[a0, a1]];
+    NSMutableArray *items = [NSMutableArray array];
+    for (int i = 0; i < cnt; i++) {
+        NSString *nm = [NSString stringWithUTF8String:AXStreamProfileName(i)];
+        UIAction *a = [UIAction actionWithTitle:nm
+                                         image:nil
+                                    identifier:nil
+                                     handler:^(UIAction *act) {
+            __strong typeof(ws) ss = ws;
+            if (ss) [ss selectScheme:(NSInteger)i];
+        }];
+        a.state = (i == (int)cur) ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [items addObject:a];
+    }
+    self.schemeBtn.menu = [UIMenu menuWithTitle:@"投屏档位（测试）" children:items];
 }
 
-/* 选方案：只记下来，不重启（避免把正在投的画面断掉） */
+/* 选档位：编码参数（格式/质量）每帧读取 → 立刻生效；
+   采集方式变了（截图 ↔ 录屏）才需要点「重启服务」。 */
 - (void)selectScheme:(NSInteger)i {
-    [[NSUserDefaults standardUserDefaults] setInteger:(i == 1 ? 1 : 0) forKey:kAXSchemeKey];
+    int capBefore = AXStreamGetScheme();
+    [[NSUserDefaults standardUserDefaults] setInteger:i forKey:kAXSchemeKey];
+    AXStreamApplyProfile((int)i);
     [self refreshSchemeButton];
-    self.statusText.text = (i == 1) ? @"已选系统录屏，点「重启服务」生效"
-                                   : @"已选系统截图，点「重启服务」生效";
-    self.statusText.textColor = ATSubText();
-    NSLog(@"[scheme] 选择 %ld（等重启服务生效）", (long)i);
+
+    NSString *nm = [NSString stringWithUTF8String:AXStreamProfileName((int)i)];
+    BOOL needRestart = (capBefore != AXStreamProfileCapture((int)i));
+    if (needRestart) {
+        self.statusText.text = [NSString stringWithFormat:@"已选「%@」，点「重启服务」生效", nm];
+        self.statusText.textColor = ATBrown();
+    } else {
+        self.statusText.text = [NSString stringWithFormat:@"已切到「%@」（立即生效）", nm];
+        self.statusText.textColor = ATSubText();
+    }
+    NSLog(@"[scheme] 档位 %ld = %@  needRestart=%d  %s", (long)i, nm, needRestart,
+          AXStreamProfileDesc((int)i));
 }
 
 /* 进界面即开投屏：按保存的方案启动 */
 - (void)autoStartStreamIfNeeded {
     NSInteger i = [[NSUserDefaults standardUserDefaults] integerForKey:kAXSchemeKey];
-    AXStreamSetScheme((i == 1) ? 1 : 0);
+    AXStreamApplyProfile((int)i);
     if (!AXStreamIsRunning()) {
         BOOL ok = AXStreamStart(27184);
         NSLog(@"[stream] 自动启动投屏 scheme=%ld ok=%d", (long)i, ok);
