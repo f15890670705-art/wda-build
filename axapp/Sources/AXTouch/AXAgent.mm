@@ -1416,6 +1416,8 @@ static volatile int     g_sentFrames = 0;
 static volatile int     g_lastErr = 0;
 static NSString         *g_lastErrMsg = nil;
 static volatile int     g_preambleSent = 0;
+static char             g_udid[128] = {0};   /* ★ 真 UDID：PC 端靠它把 27184 的流
+                                                  关联到 usbmux 里的真设备（b54） */
 
 /* ---------------- 小工具 ---------------- */
 
@@ -1490,8 +1492,11 @@ static void AXSendPreamble(int fd, int w, int h, int maxSide) {
     AXPut32(b, (uint32_t)h); [d appendBytes:b length:4];
     AXPut32(b, (uint32_t)maxSide); [d appendBytes:b length:4];
 
-    /* UDID：普通 App 拿不到真 UDID，PC 端只是存起来备用、不校验 */
-    NSString *udid = [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"axtouch";
+    /* UDID：★ 必须发真 UDID（PC 端把 27184 的流关联到 usbmux 里的真机）。
+       普通 App 拿不到，由 PC 端经 10010 的 {"cmd":"udid"} 传进来；
+       没传过才退回 identifierForVendor（此时 PC 端会出现一台重复设备）。 */
+    NSString *udid = (g_udid[0] ? @(g_udid)
+                    : [[[UIDevice currentDevice] identifierForVendor] UUIDString] ?: @"axtouch");
     NSData *ud = [udid dataUsingEncoding:NSUTF8StringEncoding];
     AXPut32(b, (uint32_t)ud.length); [d appendBytes:b length:4];
     [d appendData:ud];
@@ -2001,6 +2006,16 @@ void AXStreamStop(void) {
 }
 
 BOOL AXStreamIsRunning(void) { return g_running; }
+
+/* ★ 设置真 UDID：普通 App 拿不到，由 PC 端经 10010 传进来。
+   preamble 里必须发真 UDID，否则 PC 端把流当成一台独立的"新设备"，
+   既关联不到 usbmux 里的真机，还会多出一台重复设备。 */
+void AXStreamSetUDID(NSString *udid) {
+    if (udid.length == 0 || udid.length >= sizeof(g_udid)) return;
+    memset(g_udid, 0, sizeof(g_udid));
+    memcpy(g_udid, udid.UTF8String, udid.length);
+    ALogShim(@"📺 已设置设备 UDID = %s", g_udid);
+}
 
 void AXStreamSetParams(int bitrateBps, int fps, int maxSide) {
     if (bitrateBps > 0) g_bitrate = bitrateBps;
