@@ -868,8 +868,10 @@ extern "C" NSString *AXTryMobileGestalt(void) {
                          @"ProductType", @"ModelNumber", @"MobileEquipmentIdentifier",
                          @"InternationalMobileSubscriberIdentity", @"DeviceName",
                          @"ProductVersion", @"BuildVersion", @"CPUArchitecture" };
+    int nk = (int)(sizeof(keys) / sizeof(keys[0]));
     NSString *found = nil;
-    for (NSString *k in keys) {
+    for (int ki = 0; ki < nk; ki++) {
+        NSString *k = keys[ki];
         @try {
             CFTypeRef v = fn((__bridge CFStringRef)k);
             NSString *desc = @"(NULL)";
