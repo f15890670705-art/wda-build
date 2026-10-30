@@ -424,14 +424,75 @@ extern "C" void AXStreamSetUDID(NSString *udid);
 
 /// 连接 ::1:port 发一个 lockdown 请求并读完整响应（nil=失败）
 /// 请求/响应都是 [4B 大端长度][二进制 plist]
+static NSDictionary *AXLockdownRoundtrip2(const char *host, int port, NSDictionary *req, NSString **diag);
+
 static NSDictionary *AXLockdownRoundtrip(int port, NSDictionary *req) {
-    int fd = socket(AF_INET6, SOCK_STREAM, 0);
-    if (fd < 0) return nil;
-    struct sockaddr_in6 addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sin6_family = AF_INET6;
-    addr.sin6_port = htons((uint16_t)port);
-    inet_pton(AF_INET6, "::1", &addr.sin6_addr);
+    return AXLockdownRoundtrip2("::1", port, req, nil);
+}
+
+static NSString *AXLocalIPv4(void) {
+    struct ifaddrs *addrs = NULL;
+    NSString *ip = nil;
+    if (getifaddrs(&addrs) == 0) {
+        for (struct ifaddrs *a = addrs; a; a = a->ifa_next) {
+            if (!a->ifa_addr || a->ifa_addr->sa_family != AF_INET) continue;
+            if (strcmp(a->ifa_name, "en0") != 0) continue;
+            char buf[INET_ADDRSTRLEN] = {0};
+            struct sockaddr_in *sin = (struct sockaddr_in *)a->ifa_addr;
+            if (inet_ntop(AF_INET, &sin->sin_addr, buf, sizeof(buf))) ip = @(buf);
+        }
+        freeifaddrs(addrs);
+    }
+    return ip;
+}
+
+/// 通用 lockdown 往返；diag 带回每一步状态（连接/发送/响应）
+static NSDictionary *AXLockdownRoundtrip2(const char *host, int port, NSDictionary *req, NSString **diag) {
+    NSMutableString *d = [NSMutableString string];
+    BOOL isV6 = strchr(host, ':') != NULL;
+    int fd = socket(isV6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { if (diag) *diag = @"socket失败"; return nil; }
+
+    struct timeval ctv = {2, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &ctv, sizeof(ctv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &ctv, sizeof(ctv));
+
+    int r;
+    if (isV6) {
+        struct sockaddr_in6 addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin6_family = AF_INET6;
+        addr.sin6_port = htons((uint16_t)port);
+        inet_pton(AF_INET6, host, &addr.sin6_addr);
+        r = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    } else {
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_port = htons((uint16_t)port);
+        inet_pton(AF_INET, host, &addr.sin_addr);
+        r = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    }
+    if (r != 0) {
+        int e = errno;
+        if (diag) *diag = [NSString stringWithFormat:@"connect失败 errno=%d(%s)", e, strerror(e)];
+        close(fd); return nil;
+    }
+    [d appendFormat:@"connect✅ "];
+
+    NSData *pl = [NSPropertyListSerialization dataWithPropertyList:req
+                                                            format:NSPropertyListBinaryFormat_v1_0
+                                                           options:0 error:nil];
+    if (!pl.length) { close(fd); if (diag) *diag = @"plist失败"; return nil; }
+    uint32_t len = htonl((uint32_t)pl.length);
+    NSMutableData *msg = [NSMutableData dataWithBytes:&len length:4];
+    [msg appendData:pl];
+    if (write(fd, msg.bytes, msg.length) != (ssize_t)msg.length) {
+        int e = errno;
+        if (diag) *diag = [d stringByAppendingFormat:@"write失败 errno=%d", e];
+        close(fd); return nil;
+    }
+    [d appendFormat:@"write✅ "];
 
     int flags = fcntl(fd, F_GETFL, 0);
     fcntl(fd, F_SETFL, flags | O_NONBLOCK);
@@ -479,10 +540,15 @@ static NSDictionary *AXLockdownRoundtrip(int port, NSDictionary *req) {
     uint8_t buf[16384];
     while (body.length < rlen) {
         ssize_t n = read(fd, buf, MIN((uint32_t)sizeof(buf), rlen - (uint32_t)body.length));
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (diag) *diag = [d stringByAppendingFormat:@"读响应中断(已收%luB errno=%d)", (unsigned long)body.length, errno];
+            close(fd); return nil;
+        }
         [body appendBytes:buf length:n];
     }
     close(fd);
+    [d appendFormat:@"resp=%luB", (unsigned long)body.length];
+    if (diag) *diag = d;
     return [NSPropertyListSerialization propertyListWithData:body options:0 format:nil error:nil];
 }
 
@@ -496,15 +562,30 @@ static BOOL AXIsLockdownResp(NSDictionary *r) {
 extern "C" NSString *AXLockdownUDID(void) {
     NSMutableString *out = [NSMutableString string];
 
-    /* 1) 认端口：62078 是 lockdown 标准端口；扫描兜底 */
+    /* 1) 认端口：62078 标准端口，地址试 ::1 / 127.0.0.1 / 本机 en0 IPv4
+       （b58 只试了 ::1 全军覆没 —— lockdown 未必绑 IPv6 回环） */
     int lport = 0;
-    for (int p : {62078, 49152}) {
-        NSDictionary *r = AXLockdownRoundtrip(p, @{@"Label": @"axtouch", @"ProtocolVersion": @"2", @"Request": @"QueryType"});
+    NSString *lanIP = AXLocalIPv4();
+    NSArray *targets = @[
+        @[@"::1",         @62078],
+        @[@"127.0.0.1",   @62078],
+        @[(lanIP ?: @""), @62078],
+        @[@"::1",         @49152],
+        @[@"127.0.0.1",   @49152],
+    ];
+    for (NSArray *t in targets) {
+        NSString *h = t[0];
+        int p = [t[1] intValue];
+        if (h.length == 0) continue;
+        NSString *dg = nil;
+        NSDictionary *r = AXLockdownRoundtrip2(h.UTF8String, p,
+            @{@"Label": @"axtouch", @"ProtocolVersion": @"2", @"Request": @"QueryType"}, &dg);
         if (AXIsLockdownResp(r)) {
-            [out appendFormat:@"✅ 端口 %d 是 lockdown (Type=%@)\n", p, r[@"Type"]];
+            [out appendFormat:@"✅ %@:%d 是 lockdown (Type=%@)\n", h, p, r[@"Type"]];
             lport = p;
             break;
         }
+        [out appendFormat:@"· %@:%d → %@\n", h, p, dg ?: @"无响应"];
     }
     if (!lport) {
         NSString *scan = AXScanLoopbackPorts() ?: @"";
