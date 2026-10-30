@@ -22,12 +22,13 @@ targets:
       - sdk: CoreMedia.framework
       - sdk: CoreVideo.framework
       - sdk: ImageIO.framework
+      - sdk: Security.framework
     info:
       path: Info.plist
       properties:
         CFBundleDisplayName: hbVideo
         CFBundleShortVersionString: "2.0"
-        CFBundleVersion: "60"
+        CFBundleVersion: "61"
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
