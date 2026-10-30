@@ -23,12 +23,14 @@ targets:
       - sdk: CoreVideo.framework
       - sdk: ImageIO.framework
       - sdk: Security.framework
+      - sdk: ReplayKit.framework
+      - sdk: AVFoundation.framework
     info:
       path: Info.plist
       properties:
         CFBundleDisplayName: hbVideo
         CFBundleShortVersionString: "2.0"
-        CFBundleVersion: "65"
+        CFBundleVersion: "66"
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
