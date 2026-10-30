@@ -49,6 +49,12 @@ void AXStreamSetImgQuality(double q);
 /// 截图编码格式（UTI）：public.jpeg（默认，支持 DCT 缩放解码）或 public.png
 void AXStreamSetImgFormat(NSString *uti);
 
+/// 解码路径：0=全解 + CGContext 重采样（默认）  1=ImageIO thumbnail 直解
+void AXStreamSetDecodeMode(int thumb);
+
+/// 静止画面自动降帧开关（默认开）。测试测量帧率时先关掉，否则静止画面恒为 2fps
+void AXStreamSetStaticDrop(int on);
+
 /// 统计：fps / 码率 / 客户端数 / 编码尺寸 / 最近错误
 NSDictionary *AXStreamStats(void);
 
