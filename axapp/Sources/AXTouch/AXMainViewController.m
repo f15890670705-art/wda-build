@@ -174,7 +174,7 @@ static NSString *AXLanIP(void) {
 @property (nonatomic, strong) UIButton    *shotBtn;
 @property (nonatomic, strong) UIButton    *burstBtn;
 
-@property (nonatomic, strong) UISegmentedControl *schemeSeg;
+@property (nonatomic, strong) UIButton *schemeBtn;
 @property (nonatomic, strong) UIButton *rebuildBtn;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) BOOL burstRunning;
@@ -196,7 +196,8 @@ static NSString *AXLanIP(void) {
 - (void)didTapLogs;
 - (void)didTapTree;
 - (void)didTapServer;
-- (void)didChangeScheme;
+- (void)refreshSchemeButton;
+- (void)selectScheme:(NSInteger)i;
 - (void)autoStartStreamIfNeeded;
 - (void)didTapEditUDID;
 - (void)didTapShot;
@@ -534,12 +535,21 @@ static NSString *AXLanIP(void) {
     schemeLabel.textColor = ATSubText();
     [self.cardControl addSubview:schemeLabel];
 
-    self.schemeSeg = [[UISegmentedControl alloc] initWithItems:@[@"XCUITest", @"ReplayKit"]];
-    self.schemeSeg.translatesAutoresizingMaskIntoConstraints = NO;
-    NSInteger saved = [[NSUserDefaults standardUserDefaults] integerForKey:kAXSchemeKey];
-    self.schemeSeg.selectedSegmentIndex = (saved == 1) ? 1 : 0;
-    [self.schemeSeg addTarget:self action:@selector(didChangeScheme) forControlEvents:UIControlEventValueChanged];
-    [self.cardControl addSubview:self.schemeSeg];
+    /* 下拉框（不是分段控件）：点开弹出菜单选方案。切换只存选择，
+       要生效点「重启服务」——避免误触把正在投的画面断掉。 */
+    self.schemeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.schemeBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    self.schemeBtn.backgroundColor = ATCard();
+    self.schemeBtn.layer.cornerRadius = 10;
+    self.schemeBtn.layer.borderWidth = 0.5;
+    self.schemeBtn.layer.borderColor = ATDivider().CGColor;
+    self.schemeBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    self.schemeBtn.contentEdgeInsets = UIEdgeInsetsMake(0, 12, 0, 12);
+    self.schemeBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    [self.schemeBtn setTitleColor:ATText() forState:UIControlStateNormal];
+    self.schemeBtn.showsMenuAsPrimaryAction = YES;
+    [self.cardControl addSubview:self.schemeBtn];
+    [self refreshSchemeButton];
 
     [NSLayoutConstraint activateConstraints:@[
         [badge.topAnchor     constraintEqualToAnchor:self.cardControl.topAnchor constant:16],
@@ -556,11 +566,11 @@ static NSString *AXLanIP(void) {
         [schemeLabel.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
         [schemeLabel.heightAnchor   constraintEqualToConstant:18],
 
-        [self.schemeSeg.topAnchor      constraintEqualToAnchor:schemeLabel.bottomAnchor constant:6],
-        [self.schemeSeg.leadingAnchor  constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
-        [self.schemeSeg.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
-        [self.schemeSeg.heightAnchor   constraintEqualToConstant:34],
-        [self.schemeSeg.bottomAnchor   constraintEqualToAnchor:self.cardControl.bottomAnchor constant:-16],
+        [self.schemeBtn.topAnchor      constraintEqualToAnchor:schemeLabel.bottomAnchor constant:6],
+        [self.schemeBtn.leadingAnchor  constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
+        [self.schemeBtn.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
+        [self.schemeBtn.heightAnchor   constraintEqualToConstant:36],
+        [self.schemeBtn.bottomAnchor   constraintEqualToAnchor:self.cardControl.bottomAnchor constant:-16],
     ]];
 }
 
@@ -728,9 +738,26 @@ static NSString *AXLanIP(void) {
                    dispatch_get_main_queue(), ^{
         __strong typeof(ws) ss = ws;
         if (!ss) return;
+        NSInteger i = [[NSUserDefaults standardUserDefaults] integerForKey:kAXSchemeKey];
+        AXStreamSetScheme((i == 1) ? 1 : 0);
         BOOL ok = AXStreamStart(27184);
         ss.rebuildBtn.enabled = YES;
         ss.statusText.text = ok ? @"投屏服务已重启" : @"重启失败";
+        /* ReplayKit 若 3 秒内拿不到帧，AXAgent 会自动回退 XCUITest，这里 3.5 秒后如实显示 */
+        if (i == 1) {
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.5 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                int act = AXStreamActiveScheme();
+                if (act == 2) {
+                    ss.statusText.text = @"ReplayKit 拿不到帧，已回退 XCUITest";
+                    ss.statusText.textColor = ATBrown();
+                } else if (act == 1) {
+                    ss.statusText.text = @"ReplayKit 投屏中";
+                    ss.statusText.textColor = ATGreen();
+                }
+                [ss refreshAll];
+            });
+        }
         ss.statusText.textColor = ok ? ATGreen() : ATRed();
         NSLog(@"[stream] 重启服务结果 ok=%d", ok);
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
@@ -779,33 +806,39 @@ static NSString *AXLanIP(void) {
     });
 }
 
-/* 切换方案：存选择 → 停旧方案 → 起新方案 */
-- (void)didChangeScheme {
-    NSInteger i = self.schemeSeg.selectedSegmentIndex;
-    [[NSUserDefaults standardUserDefaults] setInteger:i forKey:kAXSchemeKey];
-    AXStreamStop();
-    if (i == 0) {
-        BOOL ok = AXStreamStart(27184);
-        self.statusText.text = ok ? @"AGENT READY（XCUITest）" : @"投屏启动失败";
-        NSLog(@"[scheme] XCUITest start=%d", ok);
-    } else {
-        self.statusText.text = @"ReplayKit 方案：采集待接入";
-        self.statusText.textColor = ATBrown();
-        NSLog(@"[scheme] ReplayKit 采集尚未接入，投屏已停止");
-    }
-    [self refreshAll];
+/* 下拉框内容：当前选中的打勾 */
+- (void)refreshSchemeButton {
+    NSInteger cur = [[NSUserDefaults standardUserDefaults] integerForKey:kAXSchemeKey];
+    NSString *t = (cur == 1) ? @"ReplayKit（系统录屏）" : @"XCUITest（截图）";
+    [self.schemeBtn setTitle:[NSString stringWithFormat:@"%@    ▾", t] forState:UIControlStateNormal];
+
+    __weak typeof(self) ws = self;
+    UIAction *a0 = [UIAction actionWithTitle:@"XCUITest（截图）" image:nil identifier:nil
+                                     handler:^(UIAction *a) { __strong typeof(ws) ss = ws; [ss selectScheme:0]; }];
+    a0.state = (cur == 0) ? UIMenuElementStateOn : UIMenuElementStateOff;
+    UIAction *a1 = [UIAction actionWithTitle:@"ReplayKit（系统录屏）" image:nil identifier:nil
+                                     handler:^(UIAction *a) { __strong typeof(ws) ss = ws; [ss selectScheme:1]; }];
+    a1.state = (cur == 1) ? UIMenuElementStateOn : UIMenuElementStateOff;
+    self.schemeBtn.menu = [UIMenu menuWithTitle:@"选择投屏方案" children:@[a0, a1]];
 }
 
-/* 进界面即开投屏：默认方案 XCUITest → 直接起 27184 */
+/* 选方案：只记下来，不重启（避免把正在投的画面断掉） */
+- (void)selectScheme:(NSInteger)i {
+    [[NSUserDefaults standardUserDefaults] setInteger:(i == 1 ? 1 : 0) forKey:kAXSchemeKey];
+    [self refreshSchemeButton];
+    self.statusText.text = (i == 1) ? @"已选 ReplayKit，点「重启服务」生效"
+                                   : @"已选 XCUITest，点「重启服务」生效";
+    self.statusText.textColor = ATSubText();
+    NSLog(@"[scheme] 选择 %ld（等重启服务生效）", (long)i);
+}
+
+/* 进界面即开投屏：按保存的方案启动 */
 - (void)autoStartStreamIfNeeded {
     NSInteger i = [[NSUserDefaults standardUserDefaults] integerForKey:kAXSchemeKey];
-    if (i == 1) {
-        self.statusText.text = @"ReplayKit 方案：采集待接入";
-        return;
-    }
+    AXStreamSetScheme((i == 1) ? 1 : 0);
     if (!AXStreamIsRunning()) {
         BOOL ok = AXStreamStart(27184);
-        NSLog(@"[stream] 自动启动 XCUITest 投屏 = %d", ok);
+        NSLog(@"[stream] 自动启动投屏 scheme=%ld ok=%d", (long)i, ok);
     }
 }
 
