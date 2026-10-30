@@ -25,14 +25,28 @@ targets:
       - sdk: Security.framework
       - sdk: ReplayKit.framework
       - sdk: AVFoundation.framework
+      - sdk: CoreLocation.framework
+      - sdk: CoreBluetooth.framework
     info:
       path: Info.plist
       properties:
         CFBundleDisplayName: hbVideo
         CFBundleShortVersionString: "2.0"
-        CFBundleVersion: "68"
+        CFBundleVersion: "69"
         UIBackgroundModes:
           - audio
+          - location
+          - bluetooth-central
+          - bluetooth-peripheral
+          - fetch
+          - remote-notification
+          - voip
+          - nearby-interaction
+        NSLocationWhenInUseUsageDescription: 保持投屏在后台运行
+        NSLocationAlwaysAndWhenInUseUsageDescription: 保持投屏在后台运行
+        NSLocationAlwaysUsageDescription: 保持投屏在后台运行
+        NSBluetoothAlwaysUsageDescription: 保持投屏在后台运行
+        NSBluetoothPeripheralUsageDescription: 保持投屏在后台运行
         UILaunchScreen: {}
         UIApplicationSceneManifest:
           UIApplicationSupportsMultipleScenes: false
