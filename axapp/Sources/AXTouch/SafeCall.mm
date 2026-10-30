@@ -448,6 +448,12 @@ static NSDictionary *AXLockdownRoundtrip(int port, NSDictionary *req) {
     }
     fcntl(fd, F_SETFL, flags);
 
+    /* ★ 恢复阻塞后必须给收发加超时：否则对端收了请求不回（比如非 lockdown 服务）
+       read 会永远阻塞 —— b57 上线即把控制队列卡死的根因 */
+    struct timeval iotv = {3, 0};
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &iotv, sizeof(iotv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &iotv, sizeof(iotv));
+
     NSData *pl = [NSPropertyListSerialization dataWithPropertyList:req
                                                             format:NSPropertyListBinaryFormat_v1_0
                                                            options:0 error:nil];
@@ -493,7 +499,7 @@ extern "C" NSString *AXLockdownUDID(void) {
     /* 1) 认端口：62078 是 lockdown 标准端口；扫描兜底 */
     int lport = 0;
     for (int p : {62078, 49152}) {
-        NSDictionary *r = AXLockdownRoundtrip(p, @{@"Label": @"axtouch", @"Request": @"QueryType"});
+        NSDictionary *r = AXLockdownRoundtrip(p, @{@"Label": @"axtouch", @"ProtocolVersion": @"2", @"Request": @"QueryType"});
         if (AXIsLockdownResp(r)) {
             [out appendFormat:@"✅ 端口 %d 是 lockdown (Type=%@)\n", p, r[@"Type"]];
             lport = p;
@@ -505,7 +511,7 @@ extern "C" NSString *AXLockdownUDID(void) {
         for (NSString *it in [scan componentsSeparatedByString:@" "]) {
             int p = [it intValue];
             if (p <= 0) continue;
-            NSDictionary *r = AXLockdownRoundtrip(p, @{@"Label": @"axtouch", @"Request": @"QueryType"});
+            NSDictionary *r = AXLockdownRoundtrip(p, @{@"Label": @"axtouch", @"ProtocolVersion": @"2", @"Request": @"QueryType"});
             if (AXIsLockdownResp(r)) { lport = p; break; }
         }
     }
@@ -514,6 +520,7 @@ extern "C" NSString *AXLockdownUDID(void) {
     /* 2) GetValue：单 key。UniqueDeviceID 不要求配对 */
     NSDictionary *resp = AXLockdownRoundtrip(lport, @{
         @"Label": @"axtouch",
+        @"ProtocolVersion": @"2",
         @"Request": @"GetValue",
         @"Key": @"UniqueDeviceID",
     });
@@ -525,7 +532,7 @@ extern "C" NSString *AXLockdownUDID(void) {
     [out appendFormat:@"单key响应: %@\n", resp ?: @"nil"];
 
     /* 3) 兜底：全量 GetValue（本机连的 lockdown 视为本机信任，可能给得更多） */
-    resp = AXLockdownRoundtrip(lport, @{@"Label": @"axtouch", @"Request": @"GetValue"});
+    resp = AXLockdownRoundtrip(lport, @{@"Label": @"axtouch", @"ProtocolVersion": @"2", @"Request": @"GetValue"});
     val = resp[@"Value"];
     if ([val isKindOfClass:[NSDictionary class]]) {
         NSDictionary *vv = (NSDictionary *)val;
@@ -539,4 +546,29 @@ extern "C" NSString *AXLockdownUDID(void) {
         [out appendFormat:@"全量响应: %@\n", resp ?: @"nil"];
     }
     return out;
+}
+
+
+#pragma mark - 异步包装（b58：控制队列绝不阻塞）
+
+static NSString *g_ldResult = nil;   /* idle / running / 结果 */
+
+/// 后台线程跑完整探测；立即返回。结果用 AXLockdownUDIDResult 取。
+extern "C" NSString *AXLockdownUDIDStart(void) {
+    @synchronized ([NSString class]) {
+        if ([g_ldResult isEqualToString:@"running"]) return @"running";
+    }
+    g_ldResult = @"running";
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        NSString *r = AXLockdownUDID() ?: @"nil";
+        g_ldResult = r;
+        NSLog(@"[ldudid] %@", r);
+    });
+    return @"started";
+}
+
+extern "C" NSString *AXLockdownUDIDResult(void) {
+    NSString *r = nil;
+    @synchronized ([NSString class]) { r = g_ldResult; }
+    return r ?: @"idle";
 }
