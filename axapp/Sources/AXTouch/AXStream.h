@@ -55,6 +55,9 @@ void AXStreamSetDecodeMode(int thumb);
 /// 静止画面自动降帧开关（默认开）。测试测量帧率时先关掉，否则静止画面恒为 2fps
 void AXStreamSetStaticDrop(int on);
 
+/// 提交手势后暂停抓图的时长（毫秒，默认 200，0=关闭）。用于让 daemon 优先处理触摸
+void AXStreamSetPauseMs(int ms);
+
 /// 统计：fps / 码率 / 客户端数 / 编码尺寸 / 最近错误
 NSDictionary *AXStreamStats(void);
 
