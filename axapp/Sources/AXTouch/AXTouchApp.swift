@@ -375,6 +375,7 @@ final class ControlServer {
                     if let iu = obj["imguti"] as? String { AXStreamSetImgFormat(iu) }
                     if let dm = obj["dec"] as? String { AXStreamSetDecodeMode(dm == "thumb" ? 1 : 0) }
                     if let sd = obj["staticDrop"] as? Int { AXStreamSetStaticDrop(Int32(sd)) }
+                    if let pm = obj["pauseMs"] as? Int { AXStreamSetPauseMs(Int32(pm)) }
                     AXStreamSetParams(Int32(qb), Int32(qf), Int32(qm))
                     resp = "{\"ok\":true,\"fps\":\(qf),\"bitrate\":\(qb),\"maxSide\":\(qm)}"
                 case "stream":
