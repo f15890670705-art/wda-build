@@ -45,6 +45,7 @@
 #import <ctype.h>
 #import "AXStream.h"
 #import <sys/time.h>
+#import <signal.h>
 #import <string.h>
 #import <errno.h>
 #import <fcntl.h>
@@ -1440,7 +1441,7 @@ static BOOL AXWriteAll(int fd, const void *buf, size_t len) {
     const uint8_t *p = (const uint8_t *)buf;
     size_t off = 0;
     while (off < len) {
-        ssize_t n = send(fd, p + off, len - off, 0);
+        ssize_t n = send(fd, p + off, len - off, MSG_NOSIGNAL);
         if (n <= 0) {
             if (errno == EINTR) continue;
             return NO;
@@ -1930,6 +1931,10 @@ BOOL AXStreamStart(uint16_t port) {
         g_listenFd = -1;
         return NO;
     }
+
+    /* ★ 关键：PC 端断开后继续 send() 会触发 SIGPIPE，iOS 默认直接杀进程。
+       「电脑一打开手机就闪退」的根因就是它 —— 忽略掉，send 返回 EPIPE 走正常断开分支 */
+    signal(SIGPIPE, SIG_IGN);
 
     g_running = YES;
     g_ptsMs = 0;
