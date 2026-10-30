@@ -1798,9 +1798,15 @@ static void AXVTDrop(const char *why) {
         g_vt = NULL;
     }
     g_vtFmt = 0;
-    g_encW = g_encH = 0;
-    g_preambleSent = 0;
-    ALogShim(@"♻️ 编码会话已丢弃（%s），下一帧重建", why ? why : "?");
+    /* ★★ 2026-10-31 崩溃根因（PC 端闪退）：
+       以前这里把 g_preambleSent 清零 → 下一帧会对**已连接的客户端再发一遍 preamble**。
+       PC 的包解析器按 12B 包头读，preamble 的字节被当成包头 → 解出荒谬宽高
+       （实测 0x201fb3c2 × 0x40000000）→ image.NewRGBA 分配 1GB → makeslice panic 闪退。
+       preamble 是**连接级**的（只在 accept 时发一次），重建编码会话只需要重发 SPS/PPS：
+       g_needConfig=YES 会让下一个关键帧前自动补 CONFIG，这就够了。
+       g_encW/g_encH 也保留：新客户端连进来时 accept 那侧还要用它发 preamble。 */
+    g_needConfig = YES;
+    ALogShim(@"♻️ 编码会话已丢弃（%s），下一帧重建（不重发 preamble，只补 SPS/PPS）", why ? why : "?");
 }
 
 /* 按指定源像素格式建会话：XCUITest 路径喂 BGRA，ReplayKit 路径喂它自己给的 420f/420v。
