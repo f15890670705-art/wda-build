@@ -1602,7 +1602,7 @@ static void AXVTCompressionCallback(void *outRefCon, void *srcFrameRefCon,
     }
     if (au.length == 0) return;
     if (g_needConfig && haveParams) {
-        [au insertData:cfg atIndex:0];           /* 首帧把 SPS/PPS 拼进 AU，保证解码器能起步 */
+        [au replaceBytesInRange:NSMakeRange(0, 0) withBytes:cfg.bytes length:cfg.length];  /* 头部插入 */
         g_needConfig = NO;
     }
 
