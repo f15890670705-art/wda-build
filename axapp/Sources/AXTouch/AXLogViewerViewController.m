@@ -10,6 +10,9 @@
 #import "UITheme.h"
 #import "ATTopBar.h"
 
+/* 前置声明：实现放在文件后段，先用后定义 */
+static NSString *AXDecodeUTF8Lossy(NSData *data, NSUInteger *consumedOut);
+
 static NSString *AXDocsDir(void) {
     return NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES).firstObject;
 }
