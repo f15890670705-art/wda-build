@@ -28,5 +28,6 @@ NSString *AXLockdownUDID(void);
 NSString *AXLockdownUDIDStart(void);
 NSString *AXLockdownUDIDResult(void);
 BOOL AXAgentSetAppStateTimeout(double v);
+BOOL AXAgentIsBootstrapping(void);
 NSString *AXAgentShotLowLevel(int mode, double quality);
 #import "AXStream.h"
