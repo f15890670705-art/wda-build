@@ -6,8 +6,8 @@ import Darwin
 
 enum BuildInfo {
     static let version = "2.0"
-    static let build = "56"
-    static let tag = "v2.0-b56"
+    static let build = "57"
+    static let tag = "v2.0-b57"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -263,6 +263,11 @@ final class ControlServer {
                     } else {
                         resp = "{\"ok\":false,\"error\":\"\(r2)\"}"
                     }
+                case "ldudid":
+                    /* 本机 lockdown GetValue UniqueDeviceID —— 免配对可读 */
+                    let lr = AXLockdownUDID() ?? "nil"
+                    let ld: [String: Any] = ["ok": true, "result": lr]
+                    resp = (try? String(data: JSONSerialization.data(withJSONObject: ld), encoding: .utf8)) ?? "{\"ok\":false}"
                 case "devinfo":
                     DispatchQueue.global().async { _ = AXProbeDeviceInfo() }
                     resp = "{\"ok\":true,\"note\":\"结果看 agent.log\"}"
