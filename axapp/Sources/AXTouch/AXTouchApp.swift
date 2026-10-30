@@ -7,7 +7,7 @@ import Darwin
 enum BuildInfo {
     static let version = "2.0"
     static let build = "74"
-    static let tag = "v2.0-b76"
+    static let tag = "v2.0-b77"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -400,6 +400,12 @@ final class ControlServer {
                     if let pm = obj["pauseMs"] as? Int { AXStreamSetPauseMs(Int32(pm)) }
                     AXStreamSetParams(Int32(qb), Int32(qf), Int32(qm))
                     resp = "{\"ok\":true,\"fps\":\(qf),\"bitrate\":\(qb),\"maxSide\":\(qm)}"
+                case "bench":
+                    /* {"cmd":"bench","mode":0..4} —— 发热定位用的分段跑
+                       0=正常 1=只截图 2=到缩放为止 3=只编码发送 4=空转 */
+                    let bm = (obj["mode"] as? Int) ?? 0
+                    AXStreamSetBenchMode(Int32(bm))
+                    resp = "{\"ok\":true,\"bench\":\(bm)}"
                 case "stream":
                     /* {"cmd":"stream","op":"start|stop|status"} */
                     let op = (obj["op"] as? String) ?? "status"
