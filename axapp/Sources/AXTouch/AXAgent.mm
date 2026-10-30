@@ -476,6 +476,13 @@ extern "C" BOOL AXAgentBootstrapNow(void) {
     return AXAgentBootstrap();
 }
 
+/* 单调时钟毫秒（AXNowMs 定义在文件后段，前面几处要先用） */
+static long long AXSeqMs(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
 /* 核心实现（提交完立刻返回，不等待）。控制通道必须用这个 ——
    控制线程是串行的，这里一阻塞，后面的点击/滑动全在队列里排队，
    表现就是"点了半天才反应"。 */
@@ -804,13 +811,6 @@ extern "C" BOOL AXAgentPasteboardSet(NSString *text) {
               中间每段从上一位置 move 到新位置
    两次都从 (x1,y1) 拖到 (x2,y2)，steps 段，段间停顿 gapMs。
    返回一段摘要（每段耗时），同时打日志 —— 判断依据就看"手指有没有真的跟着走"。 */
-/* 本文件后面的 AXNowMs 定义在流那一段，这里先用一个本地计时器（单调时钟） */
-static long long AXSeqMs(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
-}
-
 /* 把一次拖动切成若干段分别 synthesizeEvent，用来验证 XCTest 是否支持
    「跨 record 保持手指按下」：
      mode 0 = 整段一条 record 一次提交（现在的正式做法，作为对照）
@@ -1852,7 +1852,9 @@ static volatile long long g_ptsMs = 0;         /* 真实墙钟毫秒，严格单
 static volatile BOOL    g_needConfig = YES;    /* 首帧 / 编码器重建后要发 SPS/PPS */
 static volatile double g_imgQuality = 0.70;   /* 截图压缩质量（0~1） */
 static volatile int    g_decodeThumb = 0;     /* 0=全解+CGContext(默认)  1=ImageIO thumbnail */
-static volatile int    g_inputKick   = 0;     /* 有触控输入 → 让编码循环立刻出一帧 */
+static volatile int    g_inputKick   = 0;
+static volatile long long g_capPauseUntil = 0;  /* 到此时刻前暂停抓图，先把 daemon 让给合成事件 */
+static volatile int    g_capPauseMs  = 200;     /* 停采时长（0=关闭该策略） */     /* 有触控输入 → 让编码循环立刻出一帧 */
 static volatile int    g_staticDrop  = 1;     /* 1=静止画面自动降帧（默认开）；测试时可关 */
 static char           g_imgUTI[64] = "public.jpeg";  /* 截图编码格式：public.jpeg / public.png */
 static volatile long long g_lastImgBytes = 0; /* 上帧 IPC 返回的图片字节数 */
@@ -2281,6 +2283,11 @@ static void *AXEncodeLoop(void *arg) {
             if (g_clientCount <= 0) {
                 /* 没人看就不抓，省电省 CPU */
                 usleep(50 * 1000);
+                continue;
+            }
+            /* 刚提交过手势 → 短暂停采，让 daemon 优先处理合成事件（否则点击要排队） */
+            if (g_capPauseMs > 0 && AXSeqMs() < g_capPauseUntil) {   /* 必须用同一个时钟（单调钟） */
+                usleep(15 * 1000);
                 continue;
             }
             if (g_clientCount > 0 && g_force_key == 0 && g_sentFrames == 0) {
@@ -3055,6 +3062,10 @@ static void AXTouchCommit(void) {
         ALog(@"❌ 双指事件异常: %@", e.reason);
     }
     AXTouchReset();
+    /* ★ daemon 是串行的：截图和 synthesizeEvent 走同一条队列。
+       我们每秒打 20 次截图（每次 25-60ms），合成事件排在后面 → 表现为"点了要等一会才生效"。
+       这里在提交完手势后短暂停采，把队列让给合成事件。 */
+    if (g_capPauseMs > 0) g_capPauseUntil = AXSeqMs() + g_capPauseMs;
 }
 
 static void AXTouchHandle(const uint8_t *b) {
@@ -3480,6 +3491,11 @@ static void AXLoadStoredUDIDIfNeeded(void) {
         g_udidUserSet = 1;
         ALogShim(@"📺 已载入上次保存的设备 UDID = %s", g_udid);
     }
+}
+
+void AXStreamSetPauseMs(int ms) {
+    g_capPauseMs = (ms < 0) ? 0 : (ms > 1000 ? 1000 : ms);
+    ALogShim(@"⏸ 手势后停采 = %dms", g_capPauseMs);
 }
 
 void AXStreamSetStaticDrop(int on) {
