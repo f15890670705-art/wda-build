@@ -43,6 +43,7 @@
 #import <unistd.h>
 #import <stdarg.h>
 #import <ctype.h>
+#import <Security/Security.h>
 #import "AXStream.h"
 #import <sys/time.h>
 #import <signal.h>
@@ -2025,8 +2026,11 @@ static void *AXAcceptLoop(void *arg) {
 
 /* ---------------- 对外接口 ---------------- */
 
+static void AXLoadStoredUDIDIfNeeded(void);
+
 BOOL AXStreamStart(uint16_t port) {
     if (g_running) return YES;
+    AXLoadStoredUDIDIfNeeded();   /* ★ 用上次保存的真 UDID，别再用假 ID */
 
     g_listenFd = socket(AF_INET, SOCK_STREAM, 0);
     if (g_listenFd < 0) {
@@ -2102,11 +2106,83 @@ BOOL AXStreamIsRunning(void) { return g_running; }
 /* ★ 设置真 UDID：普通 App 拿不到，由 PC 端经 10010 传进来。
    preamble 里必须发真 UDID，否则 PC 端把流当成一台独立的"新设备"，
    既关联不到 usbmux 里的真机，还会多出一台重复设备。 */
-void AXStreamSetUDID(NSString *udid) {
+/* ===== 设备 UDID 持久化（用户手填 / PC 下发都走这里）=====
+   为什么存 Keychain：普通 App 拿不到真 UDID（lockdown 在沙盒里 EPERM、MobileGestalt 全 NULL、
+   XCTest 的 uniqueIdentifier 是会话级的每次启动都变），所以只能由人来提供一次。
+   Keychain 在卸载重装后仍然存在，Sideloadly 7 天重签也不用重新输入。 */
+static NSString *const kAXUDIDKey = @"axtouch.device.udid";
+static volatile int g_udidUserSet = 0;   /* 置位后人手填的值优先，不再被 devinfo 覆盖 */
+
+static NSString *AXStoredUDID(void) {
+    NSString *v = nil;
+    NSDictionary *q = @{ (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
+                         (__bridge id)kSecAttrService: @"axtouch",
+                         (__bridge id)kSecAttrAccount: kAXUDIDKey,
+                         (__bridge id)kSecReturnData:  @YES,
+                         (__bridge id)kSecMatchLimit:  (__bridge id)kSecMatchLimitOne };
+    CFTypeRef out = NULL;
+    if (SecItemCopyMatching((__bridge CFDictionaryRef)q, &out) == errSecSuccess && out) {
+        NSData *d = (__bridge_transfer NSData *)out;
+        if (d.length) v = [[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding];
+    }
+    if (v.length == 0) v = [[NSUserDefaults standardUserDefaults] stringForKey:kAXUDIDKey];
+    return v.length ? v : nil;
+}
+
+static void AXStoreUDID(NSString *v) {
+    NSDictionary *base = @{ (__bridge id)kSecClass:       (__bridge id)kSecClassGenericPassword,
+                            (__bridge id)kSecAttrService: @"axtouch",
+                            (__bridge id)kSecAttrAccount: kAXUDIDKey };
+    SecItemDelete((__bridge CFDictionaryRef)base);
+    NSMutableDictionary *add = [base mutableCopy];
+    add[(__bridge id)kSecValueData]      = [v dataUsingEncoding:NSUTF8StringEncoding];
+    add[(__bridge id)kSecAttrAccessible] = (__bridge id)kSecAttrAccessibleAfterFirstUnlock;
+    OSStatus st = SecItemAdd((__bridge CFDictionaryRef)add, NULL);
+    [[NSUserDefaults standardUserDefaults] setObject:v forKey:kAXUDIDKey];
+    ALogShim(@"💾 UDID 已存储 (keychain=%d)", (int)st);
+}
+
+/* 内部：真正写进 g_udid */
+static void AXApplyUDID(NSString *udid) {
     if (udid.length == 0 || udid.length >= sizeof(g_udid)) return;
     memset(g_udid, 0, sizeof(g_udid));
     memcpy(g_udid, udid.UTF8String, udid.length);
-    ALogShim(@"📺 已设置设备 UDID = %s", g_udid);
+}
+
+/* 给 devinfo / 10010 用：人手填过就不覆盖（人手填的才是权威） */
+void AXStreamSetUDID(NSString *udid) {
+    if (g_udidUserSet) {
+        ALogShim(@"📺 UDID 已由用户指定，忽略自动探测值 %@", udid);
+        return;
+    }
+    AXApplyUDID(udid);
+    ALogShim(@"📺 已设置设备 UDID = %s（自动来源）", g_udid);
+}
+
+/* 用户手填 / PC 下发：写入并持久化，此后一律用它 */
+void AXStreamSetUDIDPersist(NSString *udid) {
+    NSString *t = [udid stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (t.length == 0) return;
+    AXApplyUDID(t);
+    AXStoreUDID(t);
+    g_udidUserSet = 1;
+    ALogShim(@"📺 已设置设备 UDID = %s（用户指定，已持久化）", g_udid);
+}
+
+/* 当前生效的 UDID（界面显示用）*/
+NSString *AXStreamCurrentUDID(void) {
+    return g_udid[0] ? @(g_udid) : @"";
+}
+
+/* 启动时载入上次存的（没有就用 identifierForVendor 兜底）*/
+static void AXLoadStoredUDIDIfNeeded(void) {
+    if (g_udid[0]) return;
+    NSString *v = AXStoredUDID();
+    if (v.length) {
+        AXApplyUDID(v);
+        g_udidUserSet = 1;
+        ALogShim(@"📺 已载入上次保存的设备 UDID = %s", g_udid);
+    }
 }
 
 void AXStreamSetParams(int bitrateBps, int fps, int maxSide) {
