@@ -24,6 +24,12 @@ BOOL AXStreamIsRunning(void);
 /// 设置真 UDID（PC 端经 10010 传入；preamble 用它关联真机）
 void AXStreamSetUDID(NSString *udid);
 
+/// 用户手填 / PC 下发：写入并持久化（Keychain），此后 preamble 一律用它
+void AXStreamSetUDIDPersist(NSString *udid);
+
+/// 当前生效的 UDID（空串＝还没有）
+NSString *AXStreamCurrentUDID(void);
+
 /// 统计：fps / 码率 / 客户端数 / 编码尺寸 / 最近错误
 NSDictionary *AXStreamStats(void);
 
