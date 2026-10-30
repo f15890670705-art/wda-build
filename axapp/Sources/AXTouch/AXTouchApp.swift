@@ -7,7 +7,7 @@ import Darwin
 enum BuildInfo {
     static let version = "2.0"
     static let build = "74"
-    static let tag = "v2.0-b75"
+    static let tag = "v2.0-b76"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -111,6 +111,27 @@ func AXListLogsJSON() -> String {
 }
 
 /// 读日志尾部 maxKB 千字节，JSON 返回（text 已转义，可安全塞进一行）
+/// 清空指定日志文件（截断成 0 字节）。用于 {"cmd":"logclear","file":"xxx"}
+func AXClearLogFileJSON(_ name: String) -> String {
+    let dir = AXDocumentsURL()
+    var fileName = name
+    if !fileName.lowercased().hasSuffix(".log") { fileName += ".log" }
+    let url = dir.appendingPathComponent(fileName)
+
+    var dict: [String: Any] = ["ok": false, "file": url.path]
+    let attr = try? FileManager.default.attributesOfItem(atPath: url.path)
+    let before = (attr?[.size] as? NSNumber)?.int64Value ?? 0
+    do {
+        try Data().write(to: url, options: .atomic)
+        dict["ok"] = true
+    } catch {
+        dict["error"] = error.localizedDescription
+    }
+    dict["freedKB"] = Int(before / 1024)
+    guard let out = try? JSONSerialization.data(withJSONObject: dict) else { return "{\"ok\":false}" }
+    return String(data: out, encoding: .utf8) ?? "{\"ok\":false}"
+}
+
 func AXReadLogJSON(_ name: String, _ maxKB: Int) -> String {
     let dir = AXDocumentsURL()
     /* 允许 "agent" / "axtouch" 简写，也允许直接给文件名 */
@@ -419,6 +440,17 @@ final class ControlServer {
                     let name = (obj["file"] as? String) ?? "agent"
                     let kb = (obj["kb"] as? Int) ?? 5120
                     resp = AXReadLogJSON(name, kb)
+                case "logclear", "logdel":
+                    /* {"cmd":"logclear"} —— 清空运行日志（文件截断成 0 字节）
+                       可选 {"file":"axtouch"} 清别的日志文件。 */
+                    let lcName = (obj["file"] as? String) ?? "agent"
+                    if lcName == "agent" {
+                        var freed: Int64 = 0
+                        let ok = AXAgentLogClear(&freed)
+                        resp = "{\"ok\":\(ok),\"freedKB\":\(freed / 1024)}"
+                    } else {
+                        resp = AXClearLogFileJSON(lcName)
+                    }
                 case "load": AXLoadXCTestThread(); resp = "{\"ok\":true}"
                 case "server": AXStartWDAServerThread(nil); resp = "{\"ok\":true}"
                 default: resp = "{\"ok\":false,\"error\":\"unknown\"}"
