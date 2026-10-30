@@ -21,6 +21,9 @@ void AXStreamStop(void);
 /// 是否在推流
 BOOL AXStreamIsRunning(void);
 
+/// 设置真 UDID（PC 端经 10010 传入；preamble 用它关联真机）
+void AXStreamSetUDID(NSString *udid);
+
 /// 统计：fps / 码率 / 客户端数 / 编码尺寸 / 最近错误
 NSDictionary *AXStreamStats(void);
 
