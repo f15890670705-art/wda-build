@@ -416,3 +416,127 @@ extern "C" NSString *AXBootstrapProbe(void) {
     [out appendString:@"mDNS 窗口结束\n"];
     return out;
 }
+
+#pragma mark - 本机 lockdown 取 UDID
+
+/* ★ AXStream 的 UDID 写入口（AXAgent.mm 里实现） */
+extern "C" void AXStreamSetUDID(NSString *udid);
+
+/// 连接 ::1:port 发一个 lockdown 请求并读完整响应（nil=失败）
+/// 请求/响应都是 [4B 大端长度][二进制 plist]
+static NSDictionary *AXLockdownRoundtrip(int port, NSDictionary *req) {
+    int fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) return nil;
+    struct sockaddr_in6 addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin6_family = AF_INET6;
+    addr.sin6_port = htons((uint16_t)port);
+    inet_pton(AF_INET6, "::1", &addr.sin6_addr);
+
+    int flags = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    int r = connect(fd, (struct sockaddr *)&addr, sizeof(addr));
+    if (r != 0 && errno == EINPROGRESS) {
+        fd_set wset; FD_ZERO(&wset); FD_SET(fd, &wset);
+        struct timeval tv = {2, 0};
+        if (select(fd + 1, NULL, &wset, NULL, &tv) <= 0) { close(fd); return nil; }
+        int err = 0; socklen_t elen = sizeof(err);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &elen);
+        if (err != 0) { close(fd); return nil; }
+    } else if (r != 0) {
+        close(fd); return nil;
+    }
+    fcntl(fd, F_SETFL, flags);
+
+    NSData *pl = [NSPropertyListSerialization dataWithPropertyList:req
+                                                            format:NSPropertyListBinaryFormat_v1_0
+                                                           options:0 error:nil];
+    if (!pl.length) { close(fd); return nil; }
+    uint32_t len = htonl((uint32_t)pl.length);
+    NSMutableData *msg = [NSMutableData dataWithBytes:&len length:4];
+    [msg appendData:pl];
+    if (write(fd, msg.bytes, msg.length) != (ssize_t)msg.length) { close(fd); return nil; }
+
+    uint8_t lh[4];
+    ssize_t got = 0;
+    while (got < 4) {
+        ssize_t n = read(fd, lh + got, 4 - got);
+        if (n <= 0) { close(fd); return nil; }
+        got += n;
+    }
+    uint32_t rlen;
+    memcpy(&rlen, lh, 4);
+    rlen = ntohl(rlen);
+    if (rlen == 0 || rlen > 4194304) { close(fd); return nil; }
+
+    NSMutableData *body = [NSMutableData dataWithCapacity:rlen];
+    uint8_t buf[16384];
+    while (body.length < rlen) {
+        ssize_t n = read(fd, buf, MIN((uint32_t)sizeof(buf), rlen - (uint32_t)body.length));
+        if (n <= 0) break;
+        [body appendBytes:buf length:n];
+    }
+    close(fd);
+    return [NSPropertyListSerialization propertyListWithData:body options:0 format:nil error:nil];
+}
+
+static BOOL AXIsLockdownResp(NSDictionary *r) {
+    return r && [r isKindOfClass:[NSDictionary class]]
+        && [r[@"Type"] isKindOfClass:[NSString class]];
+}
+
+/// 取真 UDID：先认出 lockdown 端口，再 GetValue UniqueDeviceID（免配对可读）。
+/// 成功 → 同步给推流 preamble 并返回 UDID 字符串；失败 → 返回诊断信息。
+extern "C" NSString *AXLockdownUDID(void) {
+    NSMutableString *out = [NSMutableString string];
+
+    /* 1) 认端口：62078 是 lockdown 标准端口；扫描兜底 */
+    int lport = 0;
+    for (int p : {62078, 49152}) {
+        NSDictionary *r = AXLockdownRoundtrip(p, @{@"Label": @"axtouch", @"Request": @"QueryType"});
+        if (AXIsLockdownResp(r)) {
+            [out appendFormat:@"✅ 端口 %d 是 lockdown (Type=%@)\n", p, r[@"Type"]];
+            lport = p;
+            break;
+        }
+    }
+    if (!lport) {
+        NSString *scan = AXScanLoopbackPorts() ?: @"";
+        for (NSString *it in [scan componentsSeparatedByString:@" "]) {
+            int p = [it intValue];
+            if (p <= 0) continue;
+            NSDictionary *r = AXLockdownRoundtrip(p, @{@"Label": @"axtouch", @"Request": @"QueryType"});
+            if (AXIsLockdownResp(r)) { lport = p; break; }
+        }
+    }
+    if (!lport) return @"no lockdown port (62078/scan 均未命中)";
+
+    /* 2) GetValue：单 key。UniqueDeviceID 不要求配对 */
+    NSDictionary *resp = AXLockdownRoundtrip(lport, @{
+        @"Label": @"axtouch",
+        @"Request": @"GetValue",
+        @"Key": @"UniqueDeviceID",
+    });
+    id val = resp[@"Value"];
+    if ([val isKindOfClass:[NSString class]] && [(NSString *)val length] > 10) {
+        AXStreamSetUDID(val);
+        return (NSString *)val;
+    }
+    [out appendFormat:@"单key响应: %@\n", resp ?: @"nil"];
+
+    /* 3) 兜底：全量 GetValue（本机连的 lockdown 视为本机信任，可能给得更多） */
+    resp = AXLockdownRoundtrip(lport, @{@"Label": @"axtouch", @"Request": @"GetValue"});
+    val = resp[@"Value"];
+    if ([val isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *vv = (NSDictionary *)val;
+        id u = vv[@"UniqueDeviceID"];
+        if ([u isKindOfClass:[NSString class]] && [(NSString *)u length] > 10) {
+            AXStreamSetUDID(u);
+            return (NSString *)u;
+        }
+        [out appendFormat:@"全量响应键: %@\n", [vv.allKeys componentsJoinedByString:@","]];
+    } else {
+        [out appendFormat:@"全量响应: %@\n", resp ?: @"nil"];
+    }
+    return out;
+}
