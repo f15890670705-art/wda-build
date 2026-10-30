@@ -274,6 +274,8 @@ final class ControlServer {
                 case "getudid":
                     let cur = AXStreamCurrentUDID() ?? ""
                     resp = "{\"ok\":true,\"udid\":\"\(cur)\"}"
+                case "home":
+                    resp = "{\"ok\":\(AXAgentPressHome())}"
                 case "devinfo":
                     DispatchQueue.global().async { _ = AXProbeDeviceInfo() }
                     resp = "{\"ok\":true,\"note\":\"结果看 agent.log\"}"
