@@ -1854,10 +1854,19 @@ static volatile double g_imgQuality = 0.70;   /* 截图压缩质量（0~1） */
 static volatile int    g_decodeThumb = 0;     /* 0=全解+CGContext(默认)  1=ImageIO thumbnail */
 static volatile int    g_inputKick   = 0;
 static volatile long long g_capPauseUntil = 0;  /* 到此时刻前暂停抓图，先把 daemon 让给合成事件 */
-static volatile int    g_capPauseMs  = 200;     /* 停采时长（0=关闭该策略） */     /* 有触控输入 → 让编码循环立刻出一帧 */
-static volatile int    g_staticDrop  = 1;     /* 1=静止画面自动降帧（默认开）；测试时可关 */
+static volatile int    g_capPauseMs  = 0;       /* 停采时长（0=关闭该策略）
+                                                   ★ 2026-10-31 默认改 0：实测手势合成只要 0~1ms
+                                                   （synthesizeEvent 是异步提交、不阻塞），daemon 根本
+                                                   不排队，停采毫无收益；反而在停采窗口内把 g_inputKick
+                                                   一起挡掉，用户点一下就少 200ms 画面反馈。 */
+static volatile int    g_staticDrop  = 0;     /* ★ 2026-10-31 用户决定：默认关闭。
+                                                 理由：静止降帧会让「静止画面上点一下」永远要等下一帧
+                                                 （下限 2fps 时就是最多 500ms 才看到反应），而投屏的
+                                                 核心诉求是响应快，不是省电。留开关仅为将来需要时用。 */
+static volatile int    g_staticFps   = 8;     /* 仅当 g_staticDrop=1 时生效的静止下限帧率 */
 static char           g_imgUTI[64] = "public.jpeg";  /* 截图编码格式：public.jpeg / public.png */
 static volatile long long g_lastImgBytes = 0; /* 上帧 IPC 返回的图片字节数 */
+static volatile long long g_lastGrabMs = 0;   /* ★ 上帧「截图」耗时（XPC 往返 + 图片回传） */
 static volatile long long g_lastDecMs = 0;    /* 上帧解码耗时（心跳里打出来） */
 static volatile long long g_lastDrawMs = 0;   /* 上帧转 CVPixelBuffer + 缩放耗时 */
 static volatile int     g_force_key = 0;       /* ★ 新连接 → 强制下一帧 IDR（照 mirror_stream v46：
@@ -2191,7 +2200,8 @@ static NSData *AXGrabEncodedData(CGSize *outSize) {
         if (qq <= 0) qq = 0.7;
         if (qq > 1.0) qq = 1.0;
         q = ((id (*)(id, SEL, id, double))objc_msgSend)([encCls alloc], encInit, uti, qq);
-        ALogShim(@"🖼 用 XCTImageEncoding：%@  q=%.2f", uti, qq);
+        /* ★ 不要在这里打日志：本函数每帧调用一次（20fps），一行 ALogShim 就是
+           每秒 20 次字符串格式化 + 文件写，白烧 CPU 还会造成调度抖动。 */
     }
     if (!q && qCls) {
         id qa = ((id (*)(id, SEL))objc_msgSend)(qCls, NSSelectorFromString(@"alloc"));
@@ -2285,10 +2295,17 @@ static void *AXEncodeLoop(void *arg) {
                 usleep(50 * 1000);
                 continue;
             }
-            /* 刚提交过手势 → 短暂停采，让 daemon 优先处理合成事件（否则点击要排队） */
+            /* 刚提交过手势 → 短暂停采，让 daemon 优先处理合成事件（否则点击要排队）
+               ★ 但这个窗口绝不能挡住输入唤醒：它是"让资源"，不是"让用户等"。
+               用户在这个窗口里又动了一下手指，说明他要的是立刻看到反应 → 立即结束停采。 */
             if (g_capPauseMs > 0 && AXSeqMs() < g_capPauseUntil) {   /* 必须用同一个时钟（单调钟） */
-                usleep(15 * 1000);
-                continue;
+                if (g_inputKick) {
+                    g_capPauseUntil = 0;      /* 新手势来了：立刻恢复采集 */
+                    g_inputKick = 0;
+                } else {
+                    usleep(15 * 1000);
+                    continue;
+                }
             }
             if (g_clientCount > 0 && g_force_key == 0 && g_sentFrames == 0) {
                 /* 首帧也强制 IDR */
@@ -2298,6 +2315,10 @@ static void *AXEncodeLoop(void *arg) {
             long long t0 = AXNowMs();
             CGSize px = CGSizeZero;
             NSData *enc = AXGrabEncodedData(&px);
+            /* ★ 截图耗时（XPC 往返 + 图片回传）此前从未统计，心跳里只看到"解"和"绘"，
+               很容易误判成采集很快。整屏截一张是 3.6MP、JPEG 约 200KB / TIFF 约 10MB，
+               这一段的耗时往往是整帧里最大的一块，必须打出来。 */
+            g_lastGrabMs = AXNowMs() - t0;
             if (enc) g_lastImgBytes = (long long)enc.length;
             if (!enc) {
                 /* 采集失败：把 AXSetErr 记的原因打出来（每 20 次打一条，别刷爆日志） */
@@ -2445,12 +2466,12 @@ static void *AXEncodeLoop(void *arg) {
             frameCount++;
             statFrames++;
             if ((AXNowMs() - statT0) >= 5000) {
-                ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d fps=%d 图%luKB 解%lldms 绘%lldms 静止%d vt=%p %dx%d",
+                ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d fps=%d 图%luKB 截%lldms 解%lldms 绘%lldms 静止%d vt=%p %dx%d",
                          (long)[UIApplication sharedApplication].applicationState,
                          g_clientCount, g_sentFrames,
                          (int)(statFrames * 1000 / MAX(1, (AXNowMs() - statT0))),
                          (unsigned long)(g_lastImgBytes / 1024),
-                         g_lastDecMs, g_lastDrawMs, staticStreak,
+                         g_lastGrabMs, g_lastDecMs, g_lastDrawMs, staticStreak,
                          (void *)g_vt, g_encW, g_encH);
                 statT0 = AXNowMs(); statFrames = 0;
             }
@@ -2470,8 +2491,8 @@ static void *AXEncodeLoop(void *arg) {
             int fpsNow = (g_fps > 0 ? g_fps : 20);
             if (fpsNow > 60) fpsNow = 60;
             if (fpsNow < 1)  fpsNow = 1;
-            /* 画面静止超过 4 帧 → 2fps（只发心跳帧维持会话）；有变化立刻回到目标帧率 */
-            if (g_staticDrop && staticStreak >= 4 && fpsNow > 2) fpsNow = 2;
+            /* 画面静止超过 4 帧 → 降到 g_staticFps（只发心跳帧维持会话）；有变化立刻回到目标帧率 */
+            if (g_staticDrop && staticStreak >= 4 && fpsNow > g_staticFps) fpsNow = g_staticFps;
             long long intervalMs = 1000 / fpsNow;
             nextTick += intervalMs;
             long long nowPace = AXNowMs();
@@ -3500,7 +3521,14 @@ void AXStreamSetPauseMs(int ms) {
 
 void AXStreamSetStaticDrop(int on) {
     g_staticDrop = (on == 1) ? 1 : 0;
-    ALogShim(@"❄️ 静止自动降帧 = %@", g_staticDrop ? @"开" : @"关");
+    ALogShim(@"❄️ 静止自动降帧 = %@（下限 %dfps）", g_staticDrop ? @"开" : @"关", g_staticFps);
+}
+
+void AXStreamSetStaticFps(int fps) {
+    if (fps < 1) fps = 1;
+    if (fps > 60) fps = 60;
+    g_staticFps = fps;
+    ALogShim(@"❄️ 静止下限帧率 = %dfps", g_staticFps);
 }
 
 void AXStreamSetDecodeMode(int thumb) {
