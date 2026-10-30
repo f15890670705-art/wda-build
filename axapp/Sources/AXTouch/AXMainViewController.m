@@ -44,6 +44,8 @@ static NSString *AXBuildTag(void) {
     return v;
 }
 
+static NSString *const kAXSchemeKey = @"axtouch.stream.scheme";   /* 0=XCUITest 1=ReplayKit */
+
 static NSString *AXLanIP(void) {
     struct ifaddrs *addrs = NULL;
     NSString *result = @"未知";
@@ -165,7 +167,6 @@ static NSString *AXLanIP(void) {
 @property (nonatomic, strong) AXInfoRow *devName;
 @property (nonatomic, strong) AXInfoRow *devOS;
 @property (nonatomic, strong) AXInfoRow *devScreen;
-@property (nonatomic, strong) AXInfoRow *devPort;
 @property (nonatomic, strong) AXInfoRow *devUDID;
 
 @property (nonatomic, strong) UIImageView *preview;
@@ -173,7 +174,7 @@ static NSString *AXLanIP(void) {
 @property (nonatomic, strong) UIButton    *shotBtn;
 @property (nonatomic, strong) UIButton    *burstBtn;
 
-@property (nonatomic, strong) UIButton *streamBtn;
+@property (nonatomic, strong) UISegmentedControl *schemeSeg;
 @property (nonatomic, strong) UIButton *rebuildBtn;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) BOOL burstRunning;
@@ -194,7 +195,8 @@ static NSString *AXLanIP(void) {
 - (void)didTapLogs;
 - (void)didTapTree;
 - (void)didTapServer;
-- (void)didTapStream;
+- (void)didChangeScheme;
+- (void)autoStartStreamIfNeeded;
 - (void)didTapEditUDID;
 - (void)didTapShot;
 - (void)didTapBurst;
@@ -410,7 +412,6 @@ static NSString *AXLanIP(void) {
     self.devName   = [[AXInfoRow alloc] initWithKey:@"设备名称"];
     self.devOS     = [[AXInfoRow alloc] initWithKey:@"系统版本"];
     self.devScreen = [[AXInfoRow alloc] initWithKey:@"屏幕像素"];
-    self.devPort   = [[AXInfoRow alloc] initWithKey:@"控制端口"];
     // ★ 设备 ID：普通 App 拿不到真 UDID，由人填一次（存 Keychain，重装仍在）。
     //   preamble 里带着它，PC 才能把 USB 与无线认成同一台。
     self.devUDID   = [[AXInfoRow alloc] initWithKey:@"设备 ID"];
@@ -420,7 +421,6 @@ static NSString *AXLanIP(void) {
     [self.cardDevice addSubview:self.devName];
     [self.cardDevice addSubview:self.devOS];
     [self.cardDevice addSubview:self.devScreen];
-    [self.cardDevice addSubview:self.devPort];
     [self.cardDevice addSubview:self.devUDID];
 
     [NSLayoutConstraint activateConstraints:@[
@@ -443,12 +443,7 @@ static NSString *AXLanIP(void) {
         [self.devScreen.trailingAnchor constraintEqualToAnchor:self.cardDevice.trailingAnchor constant:-16],
         [self.devScreen.heightAnchor  constraintEqualToConstant:24],
 
-        [self.devPort.topAnchor       constraintEqualToAnchor:self.devScreen.bottomAnchor constant:10],
-        [self.devPort.leadingAnchor   constraintEqualToAnchor:self.cardDevice.leadingAnchor constant:16],
-        [self.devPort.trailingAnchor  constraintEqualToAnchor:self.cardDevice.trailingAnchor constant:-16],
-        [self.devPort.heightAnchor    constraintEqualToConstant:24],
-
-        [self.devUDID.topAnchor       constraintEqualToAnchor:self.devPort.bottomAnchor constant:10],
+        [self.devUDID.topAnchor       constraintEqualToAnchor:self.devScreen.bottomAnchor constant:10],
         [self.devUDID.leadingAnchor   constraintEqualToAnchor:self.cardDevice.leadingAnchor constant:16],
         [self.devUDID.trailingAnchor  constraintEqualToAnchor:self.cardDevice.trailingAnchor constant:-16],
         [self.devUDID.heightAnchor    constraintEqualToConstant:24],
@@ -524,16 +519,24 @@ static NSString *AXLanIP(void) {
     UIButton *logs = [self buildBigButton:@"📄  运行日志" bg:ATGreen() fg:[UIColor whiteColor]];
     [logs addTarget:self action:@selector(didTapLogs) forControlEvents:UIControlEventTouchUpInside];
 
-    UIButton *rec = [self buildBigButton:@"读节点树" bg:ATBrownBg() fg:ATBrown()];
-    [rec addTarget:self action:@selector(didTapTree) forControlEvents:UIControlEventTouchUpInside];
-
-    self.streamBtn = [self buildBigButton:@"开始投屏" bg:ATBlue() fg:[UIColor whiteColor]];
-    [self.streamBtn addTarget:self action:@selector(didTapStream) forControlEvents:UIControlEventTouchUpInside];
-
     UIStackView *row1 = [self stackWith:@[self.rebuildBtn, logs]];
-    UIStackView *row2 = [self stackWith:@[rec, self.streamBtn]];
     [self.cardControl addSubview:row1];
-    [self.cardControl addSubview:row2];
+
+    /* 投屏方案：默认 XCUITest（当前方案），可切 ReplayKit。
+       选择存 NSUserDefaults，下次启动沿用；切换时立刻停掉旧方案再起新的。 */
+    UILabel *schemeLabel = [UILabel new];
+    schemeLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    schemeLabel.text = @"投屏方案";
+    schemeLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    schemeLabel.textColor = ATSubText();
+    [self.cardControl addSubview:schemeLabel];
+
+    self.schemeSeg = [[UISegmentedControl alloc] initWithItems:@[@"XCUITest", @"ReplayKit"]];
+    self.schemeSeg.translatesAutoresizingMaskIntoConstraints = NO;
+    NSInteger saved = [[NSUserDefaults standardUserDefaults] integerForKey:kAXSchemeKey];
+    self.schemeSeg.selectedSegmentIndex = (saved == 1) ? 1 : 0;
+    [self.schemeSeg addTarget:self action:@selector(didChangeScheme) forControlEvents:UIControlEventValueChanged];
+    [self.cardControl addSubview:self.schemeSeg];
 
     [NSLayoutConstraint activateConstraints:@[
         [badge.topAnchor     constraintEqualToAnchor:self.cardControl.topAnchor constant:16],
@@ -545,11 +548,16 @@ static NSString *AXLanIP(void) {
         [row1.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
         [row1.heightAnchor   constraintEqualToConstant:48],
 
-        [row2.topAnchor      constraintEqualToAnchor:row1.bottomAnchor constant:12],
-        [row2.leadingAnchor  constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
-        [row2.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
-        [row2.heightAnchor   constraintEqualToConstant:48],
-        [row2.bottomAnchor   constraintEqualToAnchor:self.cardControl.bottomAnchor constant:-16],
+        [schemeLabel.topAnchor      constraintEqualToAnchor:row1.bottomAnchor constant:14],
+        [schemeLabel.leadingAnchor  constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
+        [schemeLabel.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
+        [schemeLabel.heightAnchor   constraintEqualToConstant:18],
+
+        [self.schemeSeg.topAnchor      constraintEqualToAnchor:schemeLabel.bottomAnchor constant:6],
+        [self.schemeSeg.leadingAnchor  constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
+        [self.schemeSeg.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
+        [self.schemeSeg.heightAnchor   constraintEqualToConstant:34],
+        [self.schemeSeg.bottomAnchor   constraintEqualToAnchor:self.cardControl.bottomAnchor constant:-16],
     ]];
 }
 
@@ -673,7 +681,7 @@ static NSString *AXLanIP(void) {
 
     self.titleLabel.text = [NSString stringWithFormat:@"AXTouch  %@", AXBuildTag()];
     self.versionText.text = [NSString stringWithFormat:@"tag: %@", AXBuildTag()];
-    self.ipText.text = [NSString stringWithFormat:@"%@ :10010", AXLanIP()];
+    self.ipText.text = AXLanIP();   /* 只显示 IP，端口不用露出来 */
 
     self.devName.valueLabel.text   = [UIDevice currentDevice].name ?: @"-";
     self.devOS.valueLabel.text     = [NSString stringWithFormat:@"%@ %@",
@@ -688,7 +696,6 @@ static NSString *AXLanIP(void) {
         self.devUDID.valueLabel.text = u.length ? u : @"点此输入";
         self.devUDID.valueLabel.textColor = u.length ? ATText() : ATSubText();
     }
-    self.devPort.valueLabel.text   = @"10010 (TCP/JSON)";
 }
 
 /* 版本 tag：从 AXAgent.mm 里没法反向取，这里用编译期常量；改版本时同步 AXTouchApp.swift */
@@ -696,6 +703,14 @@ static NSString *AXLanIP(void) {
 #pragma mark - 按钮回调
 
 - (void)didTapRefresh { [self refreshAll]; }
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    static BOOL once = NO;
+    if (once) return;
+    once = YES;
+    [self autoStartStreamIfNeeded];   /* 不点按钮，进来就投 */
+}
 
 - (void)didTapRebuild {
     /* ★ 幂等：连点不再叠加常驻线程 / 覆盖会话 */
@@ -738,17 +753,33 @@ static NSString *AXLanIP(void) {
     });
 }
 
-- (void)didTapStream {
-    if (AXStreamIsRunning()) {
-        AXStreamStop();
-        [self.streamBtn setTitle:@"开始投屏" forState:UIControlStateNormal];
-        self.streamBtn.backgroundColor = ATBlue();
-        [self.streamBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    } else {
+/* 切换方案：存选择 → 停旧方案 → 起新方案 */
+- (void)didChangeScheme {
+    NSInteger i = self.schemeSeg.selectedSegmentIndex;
+    [[NSUserDefaults standardUserDefaults] setInteger:i forKey:kAXSchemeKey];
+    AXStreamStop();
+    if (i == 0) {
         BOOL ok = AXStreamStart(27184);
-        [self.streamBtn setTitle:(ok ? @"停止投屏" : @"启动失败") forState:UIControlStateNormal];
-        self.streamBtn.backgroundColor = ok ? ATRed() : ATBrownBg();
-        [self.streamBtn setTitleColor:(ok ? [UIColor whiteColor] : ATBrown()) forState:UIControlStateNormal];
+        self.statusText.text = ok ? @"AGENT READY（XCUITest）" : @"投屏启动失败";
+        NSLog(@"[scheme] XCUITest start=%d", ok);
+    } else {
+        self.statusText.text = @"ReplayKit 方案：采集待接入";
+        self.statusText.textColor = ATBrown();
+        NSLog(@"[scheme] ReplayKit 采集尚未接入，投屏已停止");
+    }
+    [self refreshAll];
+}
+
+/* 进界面即开投屏：默认方案 XCUITest → 直接起 27184 */
+- (void)autoStartStreamIfNeeded {
+    NSInteger i = [[NSUserDefaults standardUserDefaults] integerForKey:kAXSchemeKey];
+    if (i == 1) {
+        self.statusText.text = @"ReplayKit 方案：采集待接入";
+        return;
+    }
+    if (!AXStreamIsRunning()) {
+        BOOL ok = AXStreamStart(27184);
+        NSLog(@"[stream] 自动启动 XCUITest 投屏 = %d", ok);
     }
 }
 
