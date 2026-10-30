@@ -7,7 +7,7 @@ import Darwin
 enum BuildInfo {
     static let version = "2.0"
     static let build = "74"
-    static let tag = "v2.0-b74"
+    static let tag = "v2.0-b75"
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
@@ -375,6 +375,7 @@ final class ControlServer {
                     if let iu = obj["imguti"] as? String { AXStreamSetImgFormat(iu) }
                     if let dm = obj["dec"] as? String { AXStreamSetDecodeMode(dm == "thumb" ? 1 : 0) }
                     if let sd = obj["staticDrop"] as? Int { AXStreamSetStaticDrop(Int32(sd)) }
+                    if let sf = obj["staticFps"] as? Int { AXStreamSetStaticFps(Int32(sf)) }
                     if let pm = obj["pauseMs"] as? Int { AXStreamSetPauseMs(Int32(pm)) }
                     AXStreamSetParams(Int32(qb), Int32(qf), Int32(qm))
                     resp = "{\"ok\":true,\"fps\":\(qf),\"bitrate\":\(qb),\"maxSide\":\(qm)}"
