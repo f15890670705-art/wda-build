@@ -527,10 +527,55 @@ static BOOL AXIsLockdownResp(NSDictionary *r) {
         && [r[@"Type"] isKindOfClass:[NSString class]];
 }
 
+/// 纯 connect 测试（不发任何数据）：用来区分「沙盒禁回环」和「端口没监听」
+static BOOL AXCanConnect(const char *host, int port, int *errOut) {
+    BOOL v6 = strchr(host, ':') != NULL;
+    int fd = socket(v6 ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) { if (errOut) *errOut = errno; return NO; }
+    int fl = fcntl(fd, F_GETFL, 0);
+    fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+    int r;
+    if (v6) {
+        struct sockaddr_in6 a; memset(&a, 0, sizeof(a));
+        a.sin6_family = AF_INET6; a.sin6_port = htons((uint16_t)port);
+        inet_pton(AF_INET6, host, &a.sin6_addr);
+        r = connect(fd, (struct sockaddr *)&a, sizeof(a));
+    } else {
+        struct sockaddr_in a; memset(&a, 0, sizeof(a));
+        a.sin_family = AF_INET; a.sin_port = htons((uint16_t)port);
+        inet_pton(AF_INET, host, &a.sin_addr);
+        r = connect(fd, (struct sockaddr *)&a, sizeof(a));
+    }
+    if (r != 0 && errno == EINPROGRESS) {
+        fd_set w; FD_ZERO(&w); FD_SET(fd, &w);
+        struct timeval tv = {2, 0};
+        if (select(fd + 1, NULL, &w, NULL, &tv) <= 0) {
+            if (errOut) *errOut = ETIMEDOUT; close(fd); return NO;
+        }
+        int e = 0; socklen_t el = sizeof(e);
+        getsockopt(fd, SOL_SOCKET, SO_ERROR, &e, &el);
+        if (e != 0) { if (errOut) *errOut = e; close(fd); return NO; }
+    } else if (r != 0) {
+        if (errOut) *errOut = errno; close(fd); return NO;
+    }
+    fcntl(fd, F_SETFL, fl);
+    close(fd);
+    return YES;
+}
+
 /// 取真 UDID：先认出 lockdown 端口，再 GetValue UniqueDeviceID（免配对可读）。
 /// 成功 → 同步给推流 preamble 并返回 UDID 字符串；失败 → 返回诊断信息。
 extern "C" NSString *AXLockdownUDID(void) {
     NSMutableString *out = [NSMutableString string];
+
+    /* 0) 回环自检：连自己的 10010。通了说明 loopback 可用，失败(errno)说明沙盒禁回环 */
+    {
+        int e1 = 0, e2 = 0;
+        BOOL ok1 = AXCanConnect("127.0.0.1", 10010, &e1);
+        BOOL ok2 = AXCanConnect("::1", 10010, &e2);
+        [out appendFormat:@"自检 127.0.0.1:10010 → %@（errno=%d）   ::1:10010 → %@（errno=%d）\n",
+             ok1 ? @"通" : @"不通", e1, ok2 ? @"通" : @"不通", e2];
+    }
 
     /* 1) 认端口：62078 标准端口，地址试 ::1 / 127.0.0.1 / 本机 en0 IPv4
        （b58 只试了 ::1 全军覆没 —— lockdown 未必绑 IPv6 回环） */
@@ -566,7 +611,11 @@ extern "C" NSString *AXLockdownUDID(void) {
             if (AXIsLockdownResp(r)) { lport = p; break; }
         }
     }
-    if (!lport) return @"no lockdown port (62078/scan 均未命中)";
+    if (!lport) {
+        /* ★ 关键：把上面收集的诊断带回去（b59 这里返回了固定串，等于把 errno 全丢了） */
+        [out appendString:@"❌ 未找到 lockdown 端口"];
+        return out;
+    }
 
     /* 2) GetValue：单 key。UniqueDeviceID 不要求配对 */
     NSDictionary *resp = AXLockdownRoundtrip(lport, @{
