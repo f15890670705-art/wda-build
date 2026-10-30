@@ -45,10 +45,12 @@
 #import <ctype.h>
 #import <Security/Security.h>
 #import <ReplayKit/ReplayKit.h>
+#import <AVFoundation/AVFoundation.h>
 #import "AXStream.h"
 #import <sys/time.h>
 #import <signal.h>
 #import <string.h>
+#import <stdlib.h>
 #import <errno.h>
 #import <fcntl.h>
 #import <arpa/inet.h>
@@ -2084,6 +2086,83 @@ static void *AXAcceptLoop(void *arg) {
 
 static void AXLoadStoredUDIDIfNeeded(void);
 
+/* ---------------- 后台常驻 ----------------
+   现象：App 一退到后台，27184 的 H.264 流就断。
+   原因：iOS 把 App 挂起（suspend），socket/线程全部冻结，不是我们代码断了。
+   做法（行业通用）：声明 UIBackgroundModes=audio + 播一段静音循环，系统就认为
+   "还在播音频"而保持进程活着；另外再挂一个 beginBackgroundTask 兜底（给非音频阶段争取时间）。
+   代价：后台常驻会多耗一点电。 */
+static AVAudioPlayer *g_keepAlivePlayer = nil;
+static UIBackgroundTaskIdentifier g_bgTask = UIBackgroundTaskInvalid;
+static volatile int g_keepAliveOn = 0;
+
+/* 1 秒 44.1k/16bit/单声道静音 WAV */
+static NSData *AXSilentWav(void) {
+    const int rate = 44100, secs = 1, ch = 1, bits = 16;
+    const int dataLen = rate * secs * ch * bits / 8;
+    NSMutableData *d = [NSMutableData data];
+    uint8_t hdr[44];
+    memcpy(hdr, "RIFF", 4);
+    uint32_t v = 36 + dataLen; memcpy(hdr + 4, &v, 4);
+    memcpy(hdr + 8, "WAVEfmt ", 8);
+    v = 16; memcpy(hdr + 16, &v, 4);
+    uint16_t s16 = 1; memcpy(hdr + 20, &s16, 2);       /* PCM */
+    s16 = ch;         memcpy(hdr + 22, &s16, 2);
+    v = rate;         memcpy(hdr + 24, &v, 4);
+    v = rate * ch * bits / 8; memcpy(hdr + 28, &v, 4);
+    s16 = ch * bits / 8; memcpy(hdr + 32, &s16, 2);
+    s16 = bits;       memcpy(hdr + 34, &s16, 2);
+    memcpy(hdr + 36, "data", 4);
+    v = dataLen;      memcpy(hdr + 40, &v, 4);
+    [d appendBytes:hdr length:44];
+    [d appendBytes:calloc(1, dataLen) length:dataLen];
+    return d;
+}
+
+static void AXStartKeepAlive(void) {
+    if (g_keepAliveOn) return;
+    g_keepAliveOn = 1;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        /* 兜底：先要一个后台任务（音频起来前争取 ~30s） */
+        if (g_bgTask == UIBackgroundTaskInvalid) {
+            g_bgTask = [[UIApplication sharedApplication]
+                        beginBackgroundTaskWithName:@"AXStreamKeepAlive"
+                        expirationHandler:^{
+                ALogShim(@"⌛ 后台任务到期（音频没生效？）");
+            }];
+        }
+        NSError *e1 = nil, *e2 = nil;
+        AVAudioSession *s = [AVAudioSession sharedInstance];
+        [s setCategory:AVAudioSessionCategoryPlayback
+           withOptions:AVAudioSessionCategoryOptionMixWithOthers
+                 error:&e1];
+        [s setActive:YES error:&e2];
+        if (!g_keepAlivePlayer) {
+            NSError *e3 = nil;
+            g_keepAlivePlayer = [[AVAudioPlayer alloc] initWithData:AXSilentWav() error:&e3];
+            g_keepAlivePlayer.numberOfLoops = -1;
+            g_keepAlivePlayer.volume = 0.0;
+            if (e3) ALogShim(@"⚠️ 静音音频初始化失败: %@", e3.localizedDescription);
+        }
+        BOOL ok = [g_keepAlivePlayer play];
+        ALogShim(@"🔋 后台常驻已开启（音频 ok=%d cat/act err=%@/%@）", ok,
+                 e1.localizedDescription ?: @"ok", e2.localizedDescription ?: @"ok");
+    });
+}
+
+static void AXStopKeepAlive(void) {
+    if (!g_keepAliveOn) return;
+    g_keepAliveOn = 0;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        if (g_keepAlivePlayer) { [g_keepAlivePlayer stop]; }
+        if (g_bgTask != UIBackgroundTaskInvalid) {
+            [[UIApplication sharedApplication] endBackgroundTask:g_bgTask];
+            g_bgTask = UIBackgroundTaskInvalid;
+        }
+        ALogShim(@"🔋 后台常驻已关闭");
+    });
+}
+
 /* ---------------- 采集方案 B：ReplayKit ----------------
    RPScreenRecorder 直接给 CMSampleBuffer（像素已在内存里，不用解码），喂给 VT 即可，
    比 XCUITest 少一次"编码数据→解码→转 BGRA"。
@@ -2132,12 +2211,12 @@ static void AXReplayKitHandler(CMSampleBufferRef sbuf, RPSampleBufferType type, 
    覆盖：权限没给、isAvailable=NO、DRM 内容、系统限制等。 */
 static void *AXReplayKitWatchdog(void *arg) {
     (void)arg;
-    for (int i = 0; i < 30; i++) {
+    for (int i = 0; i < 50; i++) {          /* ★ 用户要求放宽到 5 秒 */
         usleep(100 * 1000);
         if (!g_running || g_scheme != 1) return NULL;
         if (g_rkFrames > 0) return NULL;
     }
-    ALogShim(@"⚠️ ReplayKit 3 秒内没有出帧 → 自动回退 XCUITest 截图方案");
+    ALogShim(@"⚠️ ReplayKit 5 秒内没有出帧 → 自动回退 XCUITest 截图方案");
     AXReplayKitStopInternal();
     g_scheme = 0;
     g_rkFallback = 1;
@@ -2214,6 +2293,7 @@ BOOL AXStreamStart(uint16_t port) {
     g_sentFrames = 0;
     g_encW = g_encH = 0;
 
+    AXStartKeepAlive();   /* ★ 先让 App 能在后台活下去，否则后台一挂流就断 */
     pthread_create(&g_acceptTid, NULL, AXAcceptLoop, NULL);
     if (g_scheme == 1) {
         ALogShim(@"🎥 采集方案：ReplayKit");
@@ -2230,6 +2310,7 @@ void AXStreamStop(void) {
     if (!g_running) return;
     g_running = NO;
     AXReplayKitStopInternal();   /* 采集中就停掉，避免红条常驻 */
+    AXStopKeepAlive();
 
     if (g_listenFd >= 0) { close(g_listenFd); g_listenFd = -1; }
 
