@@ -58,6 +58,9 @@ void AXStreamSetStaticDrop(int on);
 /// 静止时的下限帧率（默认 8）。越小越省电、但静止画面下点一下要等更久才看到反应
 void AXStreamSetStaticFps(int fps);
 
+/// 发热定位：分段跑。0=正常 1=只截图 2=到缩放为止 3=只编码发送 4=空转
+void AXStreamSetBenchMode(int m);
+
 /// 提交手势后暂停抓图的时长（毫秒，默认 0=关闭）
 void AXStreamSetPauseMs(int ms);
 
