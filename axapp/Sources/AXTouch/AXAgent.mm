@@ -2366,13 +2366,20 @@ static void *AXEncodeLoop(void *arg) {
                 usleep(100 * 1000);
                 continue;
             }
-            if (g_clientCount <= 0) {
-                /* 没人看就不抓，省电省 CPU */
+            if (g_clientCount <= 0 && g_benchMode == 0) {
+                /* 没人看就不抓，省电省 CPU。
+                   ★ bench 测试档例外：那几个档本来就故意不发帧（PC 端会判死重连），
+                   要是也卡在"没客户端就不跑"，测试就永远跑不起来、心跳也不打。 */
                 usleep(50 * 1000);
                 continue;
             }
             /* ★ 发热定位：空转档 —— 什么都不做，只留心跳（这是温度/CPU 的底线基准） */
             if (g_benchMode == 4) {
+                if ((AXNowMs() - statT0) >= 5000) {
+                    ALogShim(@"❤️[bench4 空转] 热=%s cpu=%.0f%%（这是底线基准）",
+                             AXThermalStateStr(), AXSelfCPUPercent());
+                    statT0 = AXNowMs(); statFrames = 0;
+                }
                 usleep(30 * 1000);
                 continue;
             }
