@@ -175,6 +175,9 @@ static NSString *AXLanIP(void) {
 @property (nonatomic, strong) UIButton    *burstBtn;
 
 @property (nonatomic, strong) UIButton *schemeBtn;
+/* ★ 2026-11-01 发烫定位：分段跑下拉框（0 正常 / 1 只截图 / 2 截图+缩放 / 3 只编码 / 4 空转） */
+@property (nonatomic, strong) UIButton *benchBtn;
+@property (nonatomic, assign) NSInteger benchSel;
 @property (nonatomic, strong) UIButton *rebuildBtn;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) BOOL burstRunning;
@@ -198,6 +201,8 @@ static NSString *AXLanIP(void) {
 - (void)didTapServer;
 - (void)refreshSchemeButton;
 - (void)selectScheme:(NSInteger)i;
+- (void)refreshBenchButton;
+- (void)selectBench:(NSInteger)m;
 - (void)autoStartStreamIfNeeded;
 - (void)didTapEditUDID;
 - (void)didTapShot;
@@ -551,6 +556,30 @@ static NSString *AXLanIP(void) {
     [self.cardControl addSubview:self.schemeBtn];
     [self refreshSchemeButton];
 
+    /* ★ 2026-11-01 发烫定位：分段跑下拉框。
+       四个测试档 + 正常，用户自己切着跑，每档跑够时间再对比日志里的 热=/cpu=，
+       定位热源在截图 / 像素处理 / 编码发送 哪一步。 */
+    UILabel *benchLabel = [UILabel new];
+    benchLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    benchLabel.text = @"发烫定位（分段跑）";
+    benchLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    benchLabel.textColor = ATSubText();
+    [self.cardControl addSubview:benchLabel];
+
+    self.benchBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.benchBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    self.benchBtn.backgroundColor = ATCard();
+    self.benchBtn.layer.cornerRadius = 10;
+    self.benchBtn.layer.borderWidth = 0.5;
+    self.benchBtn.layer.borderColor = ATDivider().CGColor;
+    self.benchBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    self.benchBtn.contentEdgeInsets = UIEdgeInsetsMake(0, 12, 0, 12);
+    self.benchBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    [self.benchBtn setTitleColor:ATText() forState:UIControlStateNormal];
+    self.benchBtn.showsMenuAsPrimaryAction = YES;
+    [self.cardControl addSubview:self.benchBtn];
+    [self refreshBenchButton];
+
     [NSLayoutConstraint activateConstraints:@[
         [badge.topAnchor     constraintEqualToAnchor:self.cardControl.topAnchor constant:16],
         [badge.leadingAnchor constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
@@ -570,7 +599,17 @@ static NSString *AXLanIP(void) {
         [self.schemeBtn.leadingAnchor  constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
         [self.schemeBtn.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
         [self.schemeBtn.heightAnchor   constraintEqualToConstant:36],
-        [self.schemeBtn.bottomAnchor   constraintEqualToAnchor:self.cardControl.bottomAnchor constant:-16],
+
+        [benchLabel.topAnchor      constraintEqualToAnchor:self.schemeBtn.bottomAnchor constant:14],
+        [benchLabel.leadingAnchor  constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
+        [benchLabel.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
+        [benchLabel.heightAnchor   constraintEqualToConstant:18],
+
+        [self.benchBtn.topAnchor      constraintEqualToAnchor:benchLabel.bottomAnchor constant:6],
+        [self.benchBtn.leadingAnchor  constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
+        [self.benchBtn.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
+        [self.benchBtn.heightAnchor   constraintEqualToConstant:36],
+        [self.benchBtn.bottomAnchor   constraintEqualToAnchor:self.cardControl.bottomAnchor constant:-16],
     ]];
 }
 
@@ -851,6 +890,54 @@ static NSString *AXLanIP(void) {
     }
     NSLog(@"[scheme] 档位 %ld = %@  needRestart=%d  %s", (long)i, nm, needRestart,
           AXStreamProfileDesc((int)i));
+}
+
+#pragma mark - 发烫定位（分段跑）下拉框
+
+/* 四个测试档 + 正常。语义对应 AXAgent.mm 的 g_benchMode：
+   1 只截图（不解码/不缩放/不编码/不发送）    2 截图+解码+缩放（不编码不发送）
+   3 只编码发送（完全不截图）                  4 空转（只心跳，温度/CPU 底线基准） */
+- (void)refreshBenchButton {
+    NSString *names[] = { @"正常全链路", @"1 只截图（不处理）", @"2 截图+缩放",
+                          @"3 只编码发送", @"4 空转（基线）" };
+    NSInteger m = self.benchSel;
+    if (m < 0 || m > 4) m = 0;
+    [self.benchBtn setTitle:[NSString stringWithFormat:@"%@    ▾", names[m]]
+                   forState:UIControlStateNormal];
+
+    __weak typeof(self) ws = self;
+    NSMutableArray *items = [NSMutableArray array];
+    for (NSInteger i = 0; i <= 4; i++) {
+        NSInteger mm = i;
+        UIAction *a = [UIAction actionWithTitle:names[i]
+                                        image:nil
+                                   identifier:nil
+                                    handler:^(UIAction *act) {
+            __strong typeof(ws) ss = ws;
+            if (ss) [ss selectBench:mm];
+        }];
+        a.state = (i == m) ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [items addObject:a];
+    }
+    self.benchBtn.menu = [UIMenu menuWithTitle:@"发烫定位（分段跑）" children:items];
+}
+
+- (void)selectBench:(NSInteger)m {
+    NSString *names[] = { @"正常全链路", @"1 只截图（不处理）", @"2 截图+缩放",
+                          @"3 只编码发送", @"4 空转（基线）" };
+    if (m < 0 || m > 4) m = 0;
+    self.benchSel = m;
+    AXStreamSetBenchMode((int)m);   /* 立刻生效，不用重启服务 */
+    [self refreshBenchButton];
+
+    if (m == 0) {
+        self.statusText.text = @"已恢复正常全链路";
+    } else {
+        self.statusText.text = [NSString stringWithFormat:
+            @"已切到「%@」，跑够时间后看运行日志的 热=/cpu=", names[m]];
+    }
+    self.statusText.textColor = ATSubText();
+    NSLog(@"[bench] 模式 %ld = %@", (long)m, names[m]);
 }
 
 /* 进界面即开投屏：按保存的方案启动 */
