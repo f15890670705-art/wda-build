@@ -394,7 +394,13 @@ final class ControlServer {
                     let qm = (obj["maxSide"] as? Int) ?? 0
                     if let iq = obj["imgq"] as? Double { AXStreamSetImgQuality(iq) }
                     if let iu = obj["imguti"] as? String { AXStreamSetImgFormat(iu) }
-                    if let dm = obj["dec"] as? String { AXStreamSetDecodeMode(dm == "thumb" ? 1 : 0) }
+                    /* dec：0=全解CPU / 1=thumbnail / 2=GPU（也可用 "full"/"thumb"/"gpu"） */
+                    if let dm = obj["dec"] as? String {
+                        let v: Int32 = (dm == "gpu") ? 2 : (dm == "thumb") ? 1 : (dm == "full" ? 0 : 2)
+                        AXStreamSetDecodeMode(v)
+                    } else if let di = obj["dec"] as? Int {
+                        AXStreamSetDecodeMode(Int32(di))
+                    }
                     if let sd = obj["staticDrop"] as? Int { AXStreamSetStaticDrop(Int32(sd)) }
                     if let sf = obj["staticFps"] as? Int { AXStreamSetStaticFps(Int32(sf)) }
                     if let pm = obj["pauseMs"] as? Int { AXStreamSetPauseMs(Int32(pm)) }
