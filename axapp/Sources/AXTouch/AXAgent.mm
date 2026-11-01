@@ -505,6 +505,11 @@ static long long AXSeqMs(void) {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* ★ 1 = daemon 里正压着一张截图（AXGrabEncodedData 置位、收到回包清零）。
+   合成手势前要等它回来，否则事件排在截图后面，连点时第二下会被挤掉。
+   定义必须放在 AXTapCore 之前（它要用）。 */
+static volatile int g_grabBusy = 0;
+
 /* 核心实现（提交完立刻返回，不等待）。控制通道必须用这个 ——
    控制线程是串行的，这里一阻塞，后面的点击/滑动全在队列里排队，
    表现就是"点了半天才反应"。 */
@@ -1936,7 +1941,6 @@ static volatile int    g_capPauseMs  = 60;      /* 停采时长（0=关闭该策
                                                    不是 daemon **真正执行**事件的耗时。daemon 是串行的：
                                                    20fps 截图每张 20~50ms，队列基本占满，合成事件只能排队。
                                                    提交完让 60ms 出来给它执行，连点才不会被吃掉。 */
-static volatile int    g_grabBusy    = 0;       /* 1 = 有一张截图正压在 daemon 里，还没回来 */
 static volatile int    g_staticDrop  = 0;     /* ★ 2026-10-31 用户决定：默认关闭。
                                                  理由：静止降帧会让「静止画面上点一下」永远要等下一帧
                                                  （下限 2fps 时就是最多 500ms 才看到反应），而投屏的
