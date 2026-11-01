@@ -40,6 +40,7 @@
 #import <objc/message.h>
 #import <objc/runtime.h>
 #import <dispatch/dispatch.h>   /* QOS_CLASS_UTILITY（SpringBoard 预热用） */
+#include <mach/mach_time.h>     /* mach_absolute_time（HID 事件时间戳） */
 #import <dlfcn.h>
 #import <unistd.h>
 #import <stdarg.h>
@@ -657,6 +658,15 @@ static long long AXSeqMs(void) {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* ★ HID 触摸通道开关（b91）与入口前置声明：
+   AXAgentTap 在文件前段，触摸实现放在 HOME 附近（要用 AXSeqMs/日志），故先声明。 */
+/* ★ b91 默认**开**：XCTest 那条确认已经确认是残废的（每笔都超时失败），
+   不默认开就等于继续让用户等 4 秒。HID 不可用时 AXAgentHIDTap 返回 NO，自动落回 XCTest。
+   要退回旧路径发一条 {"cmd":"hidtap","on":0} 即可。 */
+static volatile int g_hidTapOn = 1;
+extern "C" BOOL AXAgentHIDTap(double x, double y);
+extern "C" BOOL AXAgentHIDTouch(double xPt, double yPt, int down);
+
 /* ★ 1 = daemon 里正压着一张截图（AXGrabEncodedData 置位、收到回包清零）。
    合成手势前要等它回来，否则事件排在截图后面，连点时第二下会被挤掉。
    定义必须放在 AXTapCore 之前（它要用）。 */
@@ -832,7 +842,10 @@ static BOOL AXTapCore(double x, double y) {
 }
 
 /* 对外的 tap：给 10010 用，提交后等 0.1 秒让手势走完再回包 */
-extern "C" BOOL AXAgentTap(double x, double y) {    BOOL ok = AXTapCore(x, y);
+extern "C" BOOL AXAgentTap(double x, double y) {
+    /* b91：HID 通道开着就直接走 HID —— 0ms 入队、无确认、无目标切换 */
+    if (g_hidTapOn != 0 && AXAgentHIDTap(x, y)) return YES;
+    BOOL ok = AXTapCore(x, y);
     if (ok) [NSThread sleepForTimeInterval:0.1];
     return ok;
 }
@@ -918,6 +931,114 @@ extern "C" BOOL AXAgentHomeHID(long usage) {
     ALog(@"🏠 home = 纯 HID 直发 page=0x0C usage=0x%lx（%lldms，不等确认）", usage, AXSeqMs() - t0);
     return YES;
 }
+
+/* ★★★ 2026-11-02 b91：**HID 直发触摸**（绕开 XCTest 合成链）。
+   为什么必须换：b89/b90 日志实证 —— `synthesizeEvent:completion:` 每笔的确认**全部失败**
+   （err 一直涨），耗时 0.5~4 秒随机，那就是 daemon 等一个永远不会来的确认。
+   确认间隔设 0.05 也没用（回读确实是 0.05，控制线程上也是 0.05，证明不是设置问题）。
+   根因是 XCTest 的事件通道要"目标 App 在场确认"，而我们的会话目标固定是 hbVideo 自己。
+   HID 这条不走测试框架：IOHIDEventCreateDigitizerFingerEvent → hand 容器 →
+   IOHIDEventSystemClientDispatchEvent，事件直接进系统触摸流，没有确认、没有目标、0 等待。
+   ★ 坐标：XCPointerEventPath 用 point，HID digitizer 用**屏幕像素** ⇒ × nativeScale。 */
+typedef void *(*AXHIDDigitizerFn)(CFAllocatorRef, uint64_t, int, uint32_t, uint32_t,
+                                  uint32_t, uint32_t, double, double, double, double,
+                                  double, int, int, uint32_t, int);
+typedef void *(*AXHIDFingerFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t,
+                               double, double, double, double, double, int, int, int);
+typedef void  (*AXHIDAppendFn)(void *, void *);
+typedef void  (*AXHIDDispatchFn)(void *, void *);
+typedef void *(*AXHIDClientFn)(CFAllocatorRef);
+
+static void *g_tchClient   = NULL;
+static AXHIDFingerFn    fFingerEvt  = NULL;
+static AXHIDDigitizerFn fHandEvt    = NULL;
+static AXHIDAppendFn    fEvtAppend  = NULL;
+static AXHIDDispatchFn  fEvtDispatch = NULL;
+static int  g_hidTouchInit = 0;      /* 0=未试 1=可用 -1=不可用 */
+/* g_hidTapOn 定义在文件前段（AXAgentTap 要用） */
+
+static int AXHIDTouchInit(void) {
+    if (g_hidTouchInit != 0) return g_hidTouchInit;
+    g_hidTouchInit = -1;
+    void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY | RTLD_GLOBAL);
+    void *scope = h ? h : RTLD_DEFAULT;
+    AXHIDClientFn fCli = (AXHIDClientFn)dlsym(scope, "IOHIDEventSystemClientCreate");
+    fFingerEvt   = (AXHIDFingerFn)dlsym(scope, "IOHIDEventCreateDigitizerFingerEvent");
+    fHandEvt     = (AXHIDDigitizerFn)dlsym(scope, "IOHIDEventCreateDigitizerEvent");
+    fEvtAppend   = (AXHIDAppendFn)dlsym(scope, "IOHIDEventAppendEvent");
+    fEvtDispatch = (AXHIDDispatchFn)dlsym(scope, "IOHIDEventSystemClientDispatchEvent");
+    if (fCli) g_tchClient = fCli(kCFAllocatorDefault);
+    if (fFingerEvt && fEvtDispatch && g_tchClient) {
+        g_hidTouchInit = 1;
+    }
+    ALog(@"🔧 HID 触摸初始化：client=%p finger=%p hand=%p append=%p dispatch=%p → %s",
+         g_tchClient, (void *)fFingerEvt, (void *)fHandEvt, (void *)fEvtAppend,
+         (void *)fEvtDispatch, g_hidTouchInit == 1 ? "可用" : "不可用");
+    return g_hidTouchInit;
+}
+
+/* down=1 按下 / down=0 抬起。只发 finger，不占控制线程。 */
+extern "C" BOOL AXAgentHIDTouch(double xPt, double yPt, int down) {
+    if (AXHIDTouchInit() != 1) return NO;
+    @try {
+        UIScreen *sc = [UIScreen mainScreen];
+        double scale = sc ? (double)sc.nativeScale : 1.0;
+        double px = xPt * scale, py = yPt * scale;
+        uint64_t ts = mach_absolute_time();
+        uint32_t mask = down ? 0x03u : 0x03u;   /* Range|Touch 一直带上，靠 range/touch 位表示状态 */
+        void *finger = fFingerEvt(kCFAllocatorDefault, ts, 1, 2, mask,
+                                 px, py, 0.0,
+                                 down ? 1.0 : 0.0, 0.0,
+                                 down ? 1 : 0, down ? 1 : 0, 0);
+        if (!finger) { ALog(@"❌ HID 触摸：finger 事件构造失败"); return NO; }
+        if (fHandEvt && fEvtAppend) {
+            /* type=3 是 Hand，作为容器把手指事件装进去（系统触摸流认这个结构） */
+            void *hand = fHandEvt(kCFAllocatorDefault, ts, 3, 0, 0, mask, 0,
+                                  0, 0, 0, 0, 0, 1, 1, 0, 1);
+            if (hand) {
+                fEvtAppend(hand, finger);
+                fEvtDispatch(g_tchClient, hand);
+                return YES;
+            }
+        }
+        fEvtDispatch(g_tchClient, finger);
+        return YES;
+    } @catch (NSException *e) {
+        ALog(@"⚠️ HID 触摸异常：%@", e.reason);
+        return NO;
+    }
+}
+
+/* 一次点击：down → 60ms → up。放进**串行后台队列**，控制线程 0ms 返回
+   （以前 AXTapCore 之后还要 sleep 0.1 秒，那 100ms 也是白等的延迟）。 */
+extern "C" BOOL AXAgentHIDTap(double x, double y) {
+    if (AXHIDTouchInit() != 1) return NO;
+    static dispatch_queue_t q;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        q = dispatch_queue_create("ax.hid.touch", DISPATCH_QUEUE_SERIAL);
+    });
+    long long t0 = AXSeqMs();
+    dispatch_async(q, ^{
+        AXAgentHIDTouch(x, y, 1);
+        usleep(60 * 1000);
+        AXAgentHIDTouch(x, y, 0);
+        /* ★ 看门狗：300ms 后再补一次「抬起」。重复抬起无副作用，
+           但能兜住第一次 up 构造失败导致屏幕"手指一直按着"的最坏情况。 */
+        usleep(300 * 1000);
+        AXAgentHIDTouch(x, y, 0);
+    });
+    ALog(@"👆 hidtap(%.1f, %.1f) 已入队（%lldms）", x, y, AXSeqMs() - t0);
+    return YES;
+}
+
+extern "C" void AXAgentSetHIDTap(int on) {
+    g_hidTapOn = on ? 1 : 0;
+    if (g_hidTapOn) AXHIDTouchInit();
+    ALog(@"👆 HID 触摸通道 = %s", g_hidTapOn ? "开（不用 XCTest）" : "关（回 XCTest 合成）");
+}
+
+extern "C" int AXAgentGetHIDTap(void) { return g_hidTapOn; }
 
 /* ★★ 2026-11-02 HOME 四条通路的实测探针（只探测，不改主路径）。
    背景：`pressButton:` 每次 5.5 秒（XPC 到 daemon + 空闲等待）。从框架符号表挖到两条**硬件级**通路，
