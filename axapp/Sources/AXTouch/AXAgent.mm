@@ -47,6 +47,7 @@
 #import <CommonCrypto/CommonCryptor.h>
 #import <ReplayKit/ReplayKit.h>
 #import <AVFoundation/AVFoundation.h>
+#import <CoreImage/CoreImage.h>
 #import <CoreBluetooth/CoreBluetooth.h>
 #import <CoreLocation/CoreLocation.h>
 #import "AXStream.h"
@@ -1893,7 +1894,12 @@ static volatile BOOL    g_needConfig = YES;    /* 首帧 / 编码器重建后要
 static volatile double g_imgQuality = 0.10;   /* 截图压缩质量（0~1）。用户指定 0.1：
                                                  全屏 JPEG 从 139KB 级降到几十 KB，
                                                  daemon 编码和 XPC 回传都更快（这是每帧最大的一块）。 */
-static volatile int    g_decodeThumb = 0;     /* 0=全解+CGContext(默认)  1=ImageIO thumbnail */
+static volatile int    g_decodeThumb = 2;     /* 「第二步」解码+缩放走哪条路：
+                                                 0 = 全解 + CGBitmapContext 重采样（最贵，留作对比）
+                                                 1 = ImageIO thumbnail（CPU 解码 + DCT 缩放）
+                                                 2 = GPU（CoreImage/Metal 直接 render 进 CVPixelBuffer，默认）
+                                                 2026-11-01：实测档1（只截图）不烫、档2（+解码+缩放）烫，
+                                                 热点就在这一步，默认改成 GPU 让 Metal 扛缩放和色彩转换。 */
 static volatile int    g_inputKick   = 0;
 static volatile long long g_capPauseUntil = 0;  /* 到此时刻前暂停抓图，先把 daemon 让给合成事件 */
 static volatile int    g_capPauseMs  = 0;       /* 停采时长（0=关闭该策略）
@@ -2349,6 +2355,45 @@ static NSData *AXGrabEncodedData(CGSize *outSize) {
 
 /* ---------------- 编码循环 ---------------- */
 
+/* ================= 「第二步」的 GPU 落图 =================
+   第二步 = 截图 JPEG → 目标尺寸的 CVPixelBuffer。以前整段全在 CPU：
+       ImageIO 满幅解码 3.6MP  →  CGBitmapContext + CGContextDrawImage 重采样  →  IOSurface
+   现在（dec=2 / GPU）改成：
+       CIImage(数据直入)  →  按 tw×th 缩放（Lanczos，跑了在 GPU）  →  CIContext 直接 render 进像素缓冲
+   缩放、色彩转换、写 IOSurface 全部在 Metal 上，CPU 只剩「把 JPEG 熵解成图」这一小段
+   （iOS 没有公开的 GPU JPEG 解码接口，这一小段谁也搬不走；但它不再叠加一次满幅重采样）。
+
+   ★ 万一画面上下颠倒（不同 iOS 版本 CI 对 pixel buffer 的 y 轴处理不一致），
+     把下面 dst 改成 CGRectMake(0, -th, tw, th) 或给 out 加一个 scale(1,-1) 即可 —— 只影响这一处。 */
+static CIContext *g_ciCtx = nil;
+
+static BOOL AXGpuBlit(NSData *enc, CVPixelBufferRef pb, int tw, int th) {
+    if (!enc || !pb || tw <= 0 || th <= 0) return NO;
+    @autoreleasepool {
+        if (!g_ciCtx) {
+            /* options 里显式关掉软件渲染，逼它走 Metal；万一设备不支持 GPU 上下文会返回 nil，调用方退回 CPU 路径。 */
+            g_ciCtx = [CIContext contextWithOptions:@{ kCIContextUseSoftwareRenderer: @NO }];
+            if (!g_ciCtx) return NO;
+        }
+        CIImage *src = [CIImage imageWithData:enc];
+        if (!src) return NO;
+        CGRect ext = src.extent;
+        if (ext.size.width < 1 || ext.size.height < 1) return NO;
+
+        CGRect dst = CGRectMake(0, 0, (CGFloat)tw, (CGFloat)th);
+        CIImage *out = src;
+        if (fabs(ext.size.width - (CGFloat)tw) > 0.5 || fabs(ext.size.height - (CGFloat)th) > 0.5) {
+            CGAffineTransform t = CGAffineTransformMakeScale((CGFloat)tw / ext.size.width,
+                                                            (CGFloat)th / ext.size.height);
+            out = [src imageByApplyingTransform:t];
+            out = [out imageByCroppingToRect:dst];   /* 消掉浮点取整多出来的那半像素 */
+        }
+        if (!g_rgbCS) g_rgbCS = CGColorSpaceCreateDeviceRGB();
+        [g_ciCtx render:out toCVPixelBuffer:pb bounds:dst colorSpace:g_rgbCS];
+        return YES;
+    }
+}
+
 static void *AXEncodeLoop(void *arg) {
     (void)arg;
     ALogShim(@"🎬 编码循环启动");
@@ -2506,41 +2551,19 @@ static void *AXEncodeLoop(void *arg) {
                 lastEnc = enc;
             }
 
-            /* 解码（2026-10-31 改）：以前是「按原尺寸解满 3.6MP → 再重采样到 720×1560」，
-               多解了 3 倍像素，而且全部是 CPU 在跑（发热主因之一）。
-               现在用 CGImageSourceCreateThumbnailAtIndex 让 ImageIO 在解码阶段就按目标
-               长边缩放（JPEG 走 DCT scaling，1/2、1/4 直接出），解码和缩放合并成一步。
-               失败（格式不支持缩略图路径）再退回原来的全解 + 重采样。 */
-            long long tDec0 = AXNowMs();
-            CGImageRef img = NULL;
-            if (enc) {
-                CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)enc, NULL);
-                if (src) {
-                    if (g_decodeThumb) {
-                        NSDictionary *thumbOpts = @{
-                            (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
-                            (id)kCGImageSourceCreateThumbnailWithTransform:   @NO,
-                            (id)kCGImageSourceThumbnailMaxPixelSize:          @(MAX(tw, th)),
-                        };
-                        img = CGImageSourceCreateThumbnailAtIndex(src, 0,
-                                                                  (__bridge CFDictionaryRef)thumbOpts);
-                    }
-                    if (!img) img = CGImageSourceCreateImageAtIndex(src, 0, NULL);
-                    CFRelease(src);
-                }
-            }
-            if (!img && g_benchMode != 3) { usleep(20 * 1000); continue; }
-            long long tDec1 = AXNowMs();
-
-            /* ★★ 2026-10-31 降耗：像素缓冲改为 pool 复用。
-               以前每帧 CVPixelBufferCreate 一个新 IOSurface（460x1000x4 = 1.84MB），
-               编码完再 Release —— 20fps 就是每秒 20 次「内核态分配 1.84MB + 释放」，
-               这部分开销全算在「绘」里，而且会带来内存压力和调度抖动。
+            /* 「第二步」= 解码 + 缩放 + 转成 CVPixelBuffer。2026-11-01 定案：
+               实测 档1（只截图）不烫、档2（截图 + 这一步）烫 ⇒ 热点就在这一段。
+               默认走 GPU（dec=2）：CoreImage 直接把图像渲染进像素缓冲，缩放与色彩转换由 Metal 做，
+               CPU 只剩 ImageIO 的 JPEG 熵解码（iOS 没公开的 GPU JPEG 解码接口，这段搬不走）。
+               dec=0/1 是 CPU 对照路径（全解 / thumbnail），App「解码路径」可随时切。 */
+            /* ★★ 像素缓冲：先取（只看 tw/th，跟解码无关），这样 GPU 路径可以直接往里渲染。
+               pool 复用（2026-10-31 降耗）：以前每帧 CVPixelBufferCreate 一个新 IOSurface
+               （460x1000x4 = 1.84MB），编码完再 Release —— 20fps 就是每秒 20 次
+               「内核态分配 1.84MB + 释放」，开销全算在「绘」里，还带来内存压力和调度抖动。
                pool 用尽（VT 还没吃完）时退回直接创建，绝不因为池空而卡帧。 */
             CVPixelBufferRef pb = NULL;
             BOOL poolReady = (g_pbPool != NULL && g_pbPoolW == tw && g_pbPoolH == th);
             if (poolReady) {
-                /* 池里有空闲 buffer 就直接取；取不到（VT 还没吃完）留到下面兜底，不重建池 */
                 CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, g_pbPool, &pb);
             }
             if (!pb && !poolReady) {
@@ -2573,34 +2596,78 @@ static void *AXEncodeLoop(void *arg) {
                                     (__bridge CFDictionaryRef)pbAttrs, &pb);
             }
             if (!pb) {
-                if (img) CGImageRelease(img);
                 AXSetErr(-1, @"拿不到 CVPixelBuffer");
                 usleep(50 * 1000);
                 continue;
             }
-            CVPixelBufferLockBaseAddress(pb, 0);
-            void *base = CVPixelBufferGetBaseAddress(pb);
-            size_t bpr = CVPixelBufferGetBytesPerRow(pb);
-            if (!g_rgbCS) g_rgbCS = CGColorSpaceCreateDeviceRGB();
-            CGContextRef ctx = CGBitmapContextCreate(base, tw, th, 8, bpr, g_rgbCS,
-                kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
-            if (ctx) {
-                if (img) {
-                    /* ★ 缩小时用低质量插值：默认是高质量重采样（kCGInterpolationDefault），
-                       把 3.6MP 缩到 46 万像素时开销很大；投屏画面本身还要过 H.264，
-                       低插值带来的那点差别在上屏后基本不可见。 */
-                    CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
-                    CGContextDrawImage(ctx, CGRectMake(0, 0, tw, th), img);
-                } else {
-                    /* bench=3（只测编码发送）：没有截图，无脑填黑，码率稳定、和真实静止画面接近 */
-                    memset(base, 0, bpr * (size_t)th);
-                }
-                CGContextRelease(ctx);
+
+            long long tDec0 = AXNowMs();
+            CGImageRef img = NULL;
+            BOOL gpuFilled = NO;
+            /* ★ GPU 路径（dec=2）：不走 ImageIO 的 CGImage 中转，CoreImage 直接渲染进 pb，
+               缩放和色彩转换都在 Metal 上做。 */
+            if (enc && g_decodeThumb == 2) {
+                gpuFilled = AXGpuBlit(enc, pb, tw, th);
             }
-            CVPixelBufferUnlockBaseAddress(pb, 0);
+            if (enc && !gpuFilled) {
+                CGImageSourceRef src = CGImageSourceCreateWithData((__bridge CFDataRef)enc, NULL);
+                if (src) {
+                    if (g_decodeThumb == 1) {
+                        NSDictionary *thumbOpts = @{
+                            (id)kCGImageSourceCreateThumbnailFromImageAlways: @YES,
+                            (id)kCGImageSourceCreateThumbnailWithTransform:   @NO,
+                            (id)kCGImageSourceThumbnailMaxPixelSize:          @(MAX(tw, th)),
+                            /* ★ 立刻解码：不写这个键，ImageIO 只返回懒 CGImage，
+                               真正的解码发生在后面 CGContextDrawImage 里 —— 心跳里的
+                               「解」永远显示 0ms、「绘」把解码成本也吞进去，没法定位。 */
+                            (id)kCGImageSourceShouldCacheImmediately:         @YES,
+                        };
+                        img = CGImageSourceCreateThumbnailAtIndex(src, 0,
+                                                                  (__bridge CFDictionaryRef)thumbOpts);
+                    }
+                    if (!img) {
+                        NSDictionary *fullOpts = @{
+                            (id)kCGImageSourceShouldCacheImmediately: @YES,
+                        };
+                        img = CGImageSourceCreateImageAtIndex(src, 0,
+                                                              (__bridge CFDictionaryRef)fullOpts);
+                    }
+                    CFRelease(src);
+                }
+            }
+            if (!gpuFilled && !img && g_benchMode != 3) {
+                CVPixelBufferRelease(pb);
+                usleep(20 * 1000);
+                continue;
+            }
+            long long tDec1 = AXNowMs();
+
+            if (!gpuFilled) {
+                CVPixelBufferLockBaseAddress(pb, 0);
+                void *base = CVPixelBufferGetBaseAddress(pb);
+                size_t bpr = CVPixelBufferGetBytesPerRow(pb);
+                if (!g_rgbCS) g_rgbCS = CGColorSpaceCreateDeviceRGB();
+                CGContextRef ctx = CGBitmapContextCreate(base, tw, th, 8, bpr, g_rgbCS,
+                    kCGBitmapByteOrder32Little | kCGImageAlphaNoneSkipFirst);
+                if (ctx) {
+                    if (img) {
+                        /* ★ 缩小时用低质量插值：默认是高质量重采样（kCGInterpolationDefault），
+                           把 3.6MP 缩到 46 万像素时开销很大；投屏画面本身还要过 H.264，
+                           低插值带来的那点差别在上屏后基本不可见。 */
+                        CGContextSetInterpolationQuality(ctx, kCGInterpolationLow);
+                        CGContextDrawImage(ctx, CGRectMake(0, 0, tw, th), img);
+                    } else {
+                        /* bench=3（只测编码发送）：没有截图，无脑填黑，码率稳定、和真实静止画面接近 */
+                        memset(base, 0, bpr * (size_t)th);
+                    }
+                    CGContextRelease(ctx);
+                }
+                CVPixelBufferUnlockBaseAddress(pb, 0);
+            }
             if (img) CGImageRelease(img);
-            g_lastDecMs  = tDec1 - tDec0;      /* 解码（含 DCT 缩放） */
-            g_lastDrawMs = AXNowMs() - tDec1;  /* 转 CVPixelBuffer + 重采样 */
+            /* GPU 路径下解码+缩放+落图是同一段渲染，全记在「解」里；「绘」≈0 就是它生效的标志。 */
+            g_lastDecMs  = tDec1 - tDec0;
+            g_lastDrawMs = AXNowMs() - tDec1;
 
             /* ★ 发热定位：截图+解码+缩放都做完了，但不编码不发送 ——
                用来把「App 端像素处理」的成本从「编码发送」里分出来。 */
@@ -2608,10 +2675,11 @@ static void *AXEncodeLoop(void *arg) {
                 CVPixelBufferRelease(pb);
                 statFrames++;
                 if ((AXNowMs() - statT0) >= 5000) {
-                    ALogShim(@"❤️[bench2 到缩放为止] fps=%d 图%luKB 截%lldms 绘%lldms 热=%s cpu=%.0f%%",
+                    ALogShim(@"❤️[bench2 到缩放为止] fps=%d 图%luKB 截%lldms 解%lldms 绘%lldms 热=%s cpu=%.0f%% dec=%d",
                              (int)(statFrames * 1000 / MAX(1, (AXNowMs() - statT0))),
-                             (unsigned long)(g_lastImgBytes / 1024), g_lastGrabMs, g_lastDrawMs,
-                             AXThermalStateStr(), AXSelfCPUPercent());
+                             (unsigned long)(g_lastImgBytes / 1024), g_lastGrabMs,
+                             g_lastDecMs, g_lastDrawMs,
+                             AXThermalStateStr(), AXSelfCPUPercent(), g_decodeThumb);
                     statT0 = AXNowMs(); statFrames = 0;
                 }
                 long long iv2 = 1000 / MAX(1, g_fps);
@@ -2651,13 +2719,13 @@ static void *AXEncodeLoop(void *arg) {
             frameCount++;
             statFrames++;
             if ((AXNowMs() - statT0) >= 5000) {
-                ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d fps=%d 图%luKB 截%lldms 解%lldms 绘%lldms 静止%d 热=%s cpu=%.0f%% bench=%d vt=%p %dx%d",
+                ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d fps=%d 图%luKB 截%lldms 解%lldms 绘%lldms 静止%d 热=%s cpu=%.0f%% bench=%d dec=%d vt=%p %dx%d",
                          (long)[UIApplication sharedApplication].applicationState,
                          g_clientCount, g_sentFrames,
                          (int)(statFrames * 1000 / MAX(1, (AXNowMs() - statT0))),
                          (unsigned long)(g_lastImgBytes / 1024),
                          g_lastGrabMs, g_lastDecMs, g_lastDrawMs, staticStreak,
-                         AXThermalStateStr(), AXSelfCPUPercent(), g_benchMode,
+                         AXThermalStateStr(), AXSelfCPUPercent(), g_benchMode, g_decodeThumb,
                          (void *)g_vt, g_encW, g_encH);
                 statT0 = AXNowMs(); statFrames = 0;
             }
@@ -3755,8 +3823,13 @@ void AXStreamSetBenchMode(int m) {
 }
 
 void AXStreamSetDecodeMode(int thumb) {
-    g_decodeThumb = (thumb == 1) ? 1 : 0;
-    ALogShim(@"🧩 解码路径 = %@", g_decodeThumb ? @"ImageIO thumbnail" : @"全解+CGContext");
+    if (thumb < 0) thumb = 0;
+    if (thumb > 2) thumb = 2;
+    g_decodeThumb = thumb;
+    const char *nm = "全解+CGContext";
+    if (thumb == 1) nm = "ImageIO thumbnail";
+    else if (thumb == 2) nm = "GPU(CoreImage)";
+    ALogShim(@"🧩 解码路径 = %s", nm);
 }
 
 void AXStreamSetImgFormat(NSString *uti) {
