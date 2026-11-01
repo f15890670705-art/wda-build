@@ -70,6 +70,10 @@ NSDictionary *AXStreamStats(void);
 /// 设置编码参数（码率 bps、目标帧率、最长边像素）
 void AXStreamSetParams(int bitrateBps, int fps, int maxSide);
 
+/// 调 XCTest 的「事件确认间隔」（秒）。默认 5.0；设 0 会闪退（b78 实测），只能用正值。
+/// 用途：确认间隔太大时，连点会被逐笔排队 —— 用它调小来验证/缓解。
+void AXSetEventConfirmInterval(double sec);
+
 #ifdef __cplusplus
 }
 #endif
