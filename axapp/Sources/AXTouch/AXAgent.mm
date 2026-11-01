@@ -39,6 +39,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
+#import <dispatch/dispatch.h>   /* QOS_CLASS_UTILITY（SpringBoard 预热用） */
 #import <dlfcn.h>
 #import <unistd.h>
 #import <stdarg.h>
@@ -154,25 +155,44 @@ extern "C" void ALogShim(NSString *fmt, ...) {
       -[XCUIApplicationProcess shouldSkipPreEventQuiescence] / ShouldSkipPost...     → 返回 YES
    这些方法名是从包内 XCUIAutomation 的符号表里捞出来的，找不到就跳过并打日志。 */
 static BOOL AXQuiYes2(id self, SEL _cmd, BOOL a, BOOL b) { return YES; }
+static BOOL AXQuiYes3(id self, SEL _cmd, BOOL a, id b, BOOL c) { return YES; }
 static BOOL AXQuiYes1(id self, SEL _cmd, BOOL a) { return YES; }
 static BOOL AXQuiYes0(id self, SEL _cmd) { return YES; }
+static void AXQuiVoid1(id self, SEL _cmd, BOOL a) { /* 什么都不做 = 立即返回 */ }
+static void AXQuiVoid0(id self, SEL _cmd) { }
 
+/* ★★ 2026-11-02 全量版：把 XCTest 所有「等 App 空闲（quiescence）」的入口都关掉。
+   为什么需要全量：SpringBoard（桌面）一直在动（小组件/动画），永远不"闲"，
+   XCTest 每笔事件都要等它闲下来，等不到就卡满默认 5 秒 —— 用户实测「就在桌面上点图标也要等几秒」。
+   其他 App 页面通常静止，所以那边看着很快，把问题掩盖了。
+   ★ 方法名全部来自包内 XCUIAutomation 的符号表；每个都独立 try，缺哪个就只跳过哪个并打日志。 */
 static void AXInstallQuiescenceKiller(void) {
-    Class cls = NSClassFromString(@"XCUIApplicationProcess");
-    if (!cls) { ALog(@"  ⚠️ 无 XCUIApplicationProcess，跳过 idle 补丁"); return; }
-    struct { const char *name; IMP imp; } tbl[] = {
-        {"waitForQuiescenceIncludingAnimationsIdle:isPreEvent:", (IMP)AXQuiYes2},
-        {"waitForQuiescenceIncludingAnimationsIdle:",           (IMP)AXQuiYes1},
-        {"shouldSkipPreEventQuiescence",                        (IMP)AXQuiYes0},
-        {"shouldSkipPostEventQuiescence",                       (IMP)AXQuiYes0},
+    struct { const char *clsName; const char *selName; IMP imp; } tbl[] = {
+        /* 进程级：真正的等待入口（新版把 isPreEvent 挪到了别的变体上） */
+        {"XCUIApplicationProcess", "waitForQuiescenceIncludingAnimationsIdle:isPreEvent:",                 (IMP)AXQuiYes2},
+        {"XCUIApplicationProcess", "waitForQuiescenceIncludingAnimationsIdle:usingActivity:isPreEvent:",   (IMP)AXQuiYes3},
+        {"XCUIApplicationProcess", "waitForQuiescenceIncludingAnimationsIdle:",                           (IMP)AXQuiYes1},
+        {"XCUIApplicationProcess", "shouldSkipPreEventQuiescence",                                        (IMP)AXQuiYes0},
+        {"XCUIApplicationProcess", "shouldSkipPostEventQuiescence",                                       (IMP)AXQuiYes0},
+        {"XCUIApplicationProcess", "_initiateQuiescenceChecksIncludingAnimationsIdle:",                    (IMP)AXQuiVoid1},
+        /* 应用级 */
+        {"XCUIApplication", "_waitForQuiescence",                                                          (IMP)AXQuiVoid0},
+        {"XCUIApplication", "_waitForQuiescenceAsPreEvent:",                                               (IMP)AXQuiVoid1},
+        /* AX 客户端级（所有前台 App 的整批等待） */
+        {"XCAXClient_iOS",  "waitForQuiescenceOnAllForegroundApplicationsAsPreEvent:",                    (IMP)AXQuiVoid1},
     };
+    int hit = 0, miss = 0;
     for (int i = 0; i < (int)(sizeof(tbl) / sizeof(tbl[0])); i++) {
-        SEL s = NSSelectorFromString([NSString stringWithUTF8String:tbl[i].name]);
+        Class cls = NSClassFromString([NSString stringWithUTF8String:tbl[i].clsName]);
+        if (!cls) { ALog(@"  ⚠️ 无类 %s", tbl[i].clsName); miss++; continue; }
+        SEL s = NSSelectorFromString([NSString stringWithUTF8String:tbl[i].selName]);
         Method m = class_getInstanceMethod(cls, s);
-        if (!m) { ALog(@"  ⚠️ 无 -%s（跳过）", tbl[i].name); continue; }
+        if (!m) { ALog(@"  ⚠️ 无 -[%s %s]", tbl[i].clsName, tbl[i].selName); miss++; continue; }
         method_setImplementation(m, tbl[i].imp);
-        ALog(@"  ✅ 关闭 -%s", tbl[i].name);
+        ALog(@"  ✅ 关闭 -[%s %s]", tbl[i].clsName, tbl[i].selName);
+        hit++;
     }
+    ALog(@"  🧯 quiescence 补丁：命中 %d 个、缺失 %d 个", hit, miss);
 }
 
 /* 定义在文件后部（录屏探针那节），这里先声明 */
@@ -488,18 +508,21 @@ static BOOL AXAgentBootstrap(void) {
                 }
             }
 
-            // 9c) 兜底：把**全局**确认间隔设成 0.3 秒（实测 5.0→9.5s 等待、0.3→约 0.3s；设 0 会闪退）。
-            //     逐次重载（AXTapCore 里）优先；这里保证即使那条例外也还有 0.3 秒可用。
+            // 9c) 把**全局确认间隔**压到 0.05 秒。实测（10010 同步返回的「上次确认」字段）：
+            //       5.0 → 9473ms ｜ 1.0 → 1973ms ｜ 0.3 → 809ms ｜ 0.1 → 385ms ｜ **0.05 → 128ms**
+            //     确认从来不会成功（err 一直涨），所以这就是"干等超时"的时长 —— 越小越跟手。
+            //     ★ 设 0 会让进程闪退（b78 实测），代码里口径最小 0.05，永远不给 0。
+            //     运行时可用 {"cmd":"cfmto","v":秒} 改，不用重新出包。
             {
                 SEL s3 = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:");
                 @try {
-                    ((void (*)(id, SEL, double))objc_msgSend)(session, s3, 0.3);
+                    ((void (*)(id, SEL, double))objc_msgSend)(session, s3, 0.05);
                     double now = -1;
                     SEL rd = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
                     if ([session respondsToSelector:rd]) {
                         now = ((double (*)(id, SEL))objc_msgSend)(session, rd);
                     }
-                    ALog(@"⚙️ 全局确认间隔 → 0.3，回读 = %.3f", now);
+                    ALog(@"⚙️ 全局确认间隔 → 0.05，回读 = %.3f", now);
                 } @catch (NSException *e) {
                     ALog(@"⚠️ 全局确认间隔设置失败：%@", e.reason);
                 }
@@ -885,30 +908,79 @@ extern "C" long long AXAgentHomeTest(int mode) {
     return AXSeqMs() - t0;
 }
 
+/* ★ 2026-11-02：HOME 之后把会话目标切到 SpringBoard（桌面）。
+   现象：按 HOME 后立刻点一个坐标，**手机屏幕本身**要等几秒才有反应。
+   原因：我们的自动化会话是 requestAutomationSessionForTestTargetWithPID:(getpid()) 起的，
+   目标一直挂在 hbVideo 上；回到桌面后前台变成 com.apple.springboard，
+   第一笔事件要等 XCTest 重新认目标（默认约 5 秒）。
+   WDA 的 fb_goToHomescreenWithError: 之后会 fb_waitUntilRunning 一下 SpringBoard，
+   我们照做：异步 activate 一次，慢也慢在后台线程，不挡用户操作。 */
+static void AXWarmSpringboard(void) {
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        @try {
+            Class appCls = NSClassFromString(@"XCUIApplication");
+            if (!appCls) return;
+            SEL ini = NSSelectorFromString(@"initWithBundleIdentifier:");
+            if (![appCls instancesRespondToSelector:ini]) return;
+            id app = ((id (*)(id, SEL, id))objc_msgSend)([appCls alloc], ini, @"com.apple.springboard");
+            if (!app) return;
+            long long t0 = AXSeqMs();
+            SEL act = NSSelectorFromString(@"activate");
+            if ([app respondsToSelector:act]) {
+                ((void (*)(id, SEL))objc_msgSend)(app, act);
+            }
+            ALog(@"🏠 已把会话目标切到 SpringBoard（预热 %lldms）", AXSeqMs() - t0);
+        } @catch (NSException *e) {
+            ALog(@"⚠️ SpringBoard 预热失败：%@", e.reason);
+        }
+    });
+}
+
 extern "C" BOOL AXAgentPressHome(void) {
     if (!gReady) { ALog(@"❌ pressHome: 会话未就绪"); return NO; }
 
     /* ★★★ 2026-11-02 定案：HOME 走**硬件设备事件**，实测提交 0~1ms、用户已确认能回桌面。
        为什么不用 pressButton:：那条走 XPC + 空闲等待，实测每次 5.3~5.5 秒
        （pressButton / _silentPressButton / XCUIButtonConsole 三条都一样慢，b84 探针实测数据）。
-       设备事件这条路是直接用 HID 用法码构造「硬件按键」发给 daemon：
-         +[XCDeviceEvent deviceEventWithPage:usage:duration:]
-         -[XCTRunnerDaemonSession performDeviceEvent:completion:]
-       page = 12 (kHIDPage_Consumer)，usage = 0x40 (Menu) ⇐ b84 实测这个组合有效（0x223 AC Home 无效）。
-       ★ 它的 completion 回调不会回来（实测 err/cfm 都是 -1），所以**只发不等**，别在这里阻塞。 */
+       设备事件这条路是直接用 HID 用法码构造「硬件按键」：
+         +[XCDeviceEvent deviceEventWithPage:usage:duration:]  (page=12 Consumer, usage=0x40 Menu)
+         → 首选 -[XCUIDevice performDeviceEvent:error:]      （WDA 用的就是这条，同步返回）
+         → 退 -[XCTRunnerDaemonSession performDeviceEvent:completion:]（completion 永不回，会占住 daemon）
+       用法码来自 b84 实测：0x40(Menu) 有效、0x223(AC Home) 无效。 */
     {
         Class deCls = NSClassFromString(@"XCDeviceEvent");
         SEL mk = NSSelectorFromString(@"deviceEventWithPage:usage:duration:");
-        SEL pd = NSSelectorFromString(@"performDeviceEvent:completion:");
-        if (deCls && [deCls respondsToSelector:mk] && [gSession respondsToSelector:pd]) {
+        if (deCls && [deCls respondsToSelector:mk]) {
             @try {
                 long long t0 = AXSeqMs();
                 id ev = ((id (*)(id, SEL, long, long, double))objc_msgSend)(deCls, mk, 12, 0x40, 0.05);
                 if (ev) {
-                    void (^done)(id) = ^(id err) { /* 不捕获任何对象 */ };
-                    ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, pd, ev, done);
-                    ALog(@"🏠 home = 设备事件 page12/usage0x40（%lldms）", AXSeqMs() - t0);
-                    return YES;
+                    /* ★ 优先 WDA 的写法：-[XCUIDevice performDeviceEvent:error:]（同步、带 error）
+                       我们之前用的是 -[XCTRunnerDaemonSession performDeviceEvent:completion:]，
+                       它的 completion **永远不回来**，等于事件一直挂在 daemon 里 ——
+                       实测表现就是「按完 HOME，紧接着点一下要等几秒」，因为下一笔排在它后面。
+                       AScript 内置的 WebDriverAgentLib 里就是 _FBCreateXCDeviceEvent +
+                       performDeviceEvent:error:，照它改。 */
+                    Class scrCls = NSClassFromString(@"XCUIScreen");
+                    id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+                    id dev = screen ? ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device")) : nil;
+                    SEL pde = NSSelectorFromString(@"performDeviceEvent:error:");
+                    if (dev && [dev respondsToSelector:pde]) {
+                        NSError *err = nil;
+                        ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(dev, pde, ev, &err);
+                        ALog(@"🏠 home = XCUIDevice performDeviceEvent（%lldms）err=%@",
+                             AXSeqMs() - t0, err ? err.localizedDescription : @"无");
+                        return YES;
+                    }
+                    /* 退一步：会话版（不回包，但至少能回桌面） */
+                    SEL pd = NSSelectorFromString(@"performDeviceEvent:completion:");
+                    if ([gSession respondsToSelector:pd]) {
+                        void (^done)(id) = ^(id e) { /* 不捕获对象 */ };
+                        ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, pd, ev, done);
+                        ALog(@"🏠 home = 会话 performDeviceEvent（%lldms，无回调）", AXSeqMs() - t0);
+                        AXWarmSpringboard();
+                        return YES;
+                    }
                 }
                 ALog(@"⚠️ pressHome: deviceEvent 构造失败，回退按键");
             } @catch (NSException *e) {
@@ -936,10 +1008,12 @@ extern "C" BOOL AXAgentPressHome(void) {
         ((void (*)(id, SEL, long))objc_msgSend)(dev, spb, 1);   /* XCUIDeviceButtonHome = 1 */
         if (!s_silentLogged) { s_silentLogged = YES; ALog(@"🏠 走 _silentPressButton:（不等空闲）"); }
         ALog(@"🏠 pressHome 已发送（静默版，耗时 %lldms）", AXSeqMs() - phT0);
+        AXWarmSpringboard();
         return YES;
     }
     ((void (*)(id, SEL, long))objc_msgSend)(dev, pb, 1);   /* XCUIDeviceButtonHome = 1 */
     ALog(@"🏠 pressHome 已发送（普通版，调用耗时 %lldms）", AXSeqMs() - phT0);
+    AXWarmSpringboard();
     return YES;
 }
 
