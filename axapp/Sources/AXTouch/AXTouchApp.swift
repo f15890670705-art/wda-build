@@ -415,6 +415,12 @@ final class ControlServer {
                     let bm = (obj["mode"] as? Int) ?? 0
                     AXStreamSetBenchMode(Int32(bm))
                     resp = "{\"ok\":true,\"bench\":\(bm)}"
+                case "cfmto":
+                    /* {"cmd":"cfmto","v":1.0} —— 调 XCTest 的事件确认间隔（秒）。
+                       默认 5.0，太大会让连点被逐笔排队；0 会闪退，最小 0.05。 */
+                    let v = (obj["v"] as? Double) ?? 1.0
+                    AXSetEventConfirmInterval(v)
+                    resp = "{\"ok\":true,\"cfmto\":\(v)}"
                 case "stream":
                     /* {"cmd":"stream","op":"start|stop|status"} */
                     let op = (obj["op"] as? String) ?? "status"
