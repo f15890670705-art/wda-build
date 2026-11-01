@@ -787,8 +787,7 @@ static BOOL AXTapCore(double x, double y) {
 }
 
 /* 对外的 tap：给 10010 用，提交后等 0.1 秒让手势走完再回包 */
-extern "C" BOOL AXAgentTap(double x, double y) {
-    BOOL ok = AXTapCore(x, y);
+extern "C" BOOL AXAgentTap(double x, double y) {    BOOL ok = AXTapCore(x, y);
     if (ok) [NSThread sleepForTimeInterval:0.1];
     return ok;
 }
@@ -823,6 +822,69 @@ extern "C" void AXAgentStartSticky(void) {
 
 /// xy: [x0,y0, x1,y1, ...]  t: 每个点的时间偏移(秒)，最后一个点是 liftUp
 /* 按 Home 键（用自动化会话里的 XCUIDevice.pressButton:），用于自己复现"退到后台" */
+/* ★★ 2026-11-02 HOME 四条通路的实测探针（只探测，不改主路径）。
+   背景：`pressButton:` 每次 5.5 秒（XPC 到 daemon + 空闲等待）。从框架符号表挖到两条**硬件级**通路，
+   都不经过 UI 元素操作：
+     A. XCUIButtonConsole: -[XCUIButtonConsole initWithScreen:] + _silentlyPressButton:forDuration:
+     B. XCDeviceEvent:     +[XCDeviceEvent deviceEventWithPage:usage:duration:] +
+                           -[XCTRunnerDaemonSession performDeviceEvent:completion:]
+   B 里的 page/usage 是 HID 用法码：page 0x0C(Consumer) + usage 0x223(AC Home) 或 0x40(Menu)。
+   用 {"cmd":"hometest","mode":0..4} 逐条试，日志里带耗时，看哪条能秒回。 */
+static volatile long long g_evtCfmMs  = -1;
+static volatile int       g_evtCfmErr = -1;
+
+extern "C" long long AXAgentHomeTest(int mode) {
+    if (!gReady) { ALog(@"❌ hometest: 会话未就绪"); return -1; }
+    long long t0 = AXSeqMs();
+    @try {
+        if (mode == 0) {                                  /* 对照：现在的 pressButton */
+            Class scrCls = NSClassFromString(@"XCUIScreen");
+            id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+            id dev = ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device"));
+            ((void (*)(id, SEL, long))objc_msgSend)(dev, NSSelectorFromString(@"pressButton:"), 1);
+            ALog(@"🧪 hometest[0 pressButton] %lldms", AXSeqMs() - t0);
+        } else if (mode == 1) {                            /* 对照：_silentPressButton */
+            Class scrCls = NSClassFromString(@"XCUIScreen");
+            id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+            id dev = ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device"));
+            ((void (*)(id, SEL, long))objc_msgSend)(dev, NSSelectorFromString(@"_silentPressButton:"), 1);
+            ALog(@"🧪 hometest[1 _silentPressButton] %lldms", AXSeqMs() - t0);
+        } else if (mode == 2) {                            /* A. XCUIButtonConsole 静默按键 */
+            Class ccCls = NSClassFromString(@"XCUIButtonConsole");
+            Class scrCls = NSClassFromString(@"XCUIScreen");
+            id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
+            SEL ini = NSSelectorFromString(@"initWithScreen:");
+            id console = ((id (*)(id, SEL, id))objc_msgSend)([ccCls alloc], ini, screen);
+            SEL sp = NSSelectorFromString(@"_silentlyPressButton:forDuration:");
+            if (![console respondsToSelector:sp]) { ALog(@"🧪 hometest[2] 无 _silentlyPressButton:forDuration:"); return -1; }
+            ((void (*)(id, SEL, long, double))objc_msgSend)(console, sp, 1, 0.05);
+            ALog(@"🧪 hometest[2 XCUIButtonConsole 静默] %lldms", AXSeqMs() - t0);
+        } else {                                           /* B. 硬件设备事件 */
+            long page = 12;                                 /* kHIDPage_Consumer */
+            long usage = (mode == 3) ? 0x223 : 0x40;        /* AC Home / Menu */
+            Class deCls = NSClassFromString(@"XCDeviceEvent");
+            SEL mk = NSSelectorFromString(@"deviceEventWithPage:usage:duration:");
+            if (![deCls respondsToSelector:mk]) { ALog(@"🧪 hometest[%d] 无 deviceEventWithPage:usage:duration:", mode); return -1; }
+            id ev = ((id (*)(id, SEL, long, long, double))objc_msgSend)(deCls, mk, page, usage, 0.05);
+            SEL pd = NSSelectorFromString(@"performDeviceEvent:completion:");
+            if (![gSession respondsToSelector:pd]) { ALog(@"🧪 hometest[%d] 会话无 performDeviceEvent:completion:", mode); return -1; }
+            g_evtCfmMs = -1; g_evtCfmErr = -1;
+            long long sub = AXSeqMs();
+            ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, pd, ev, ^(id err) {
+                g_evtCfmMs = AXSeqMs() - sub;
+                g_evtCfmErr = err ? 1 : 0;
+            });
+            ALog(@"🧪 hometest[%d deviceEvent page=%ld usage=0x%lx] 提交 %lldms", mode, page, usage, AXSeqMs() - t0);
+            usleep(200 * 1000);   /* 等 200ms 看回包，探针专用 */
+            ALog(@"🧪 hometest[%d] 回调 %lldms err=%d", mode, g_evtCfmMs, g_evtCfmErr);
+        }
+    } @catch (NSException *e) {
+        ALog(@"🧪 hometest[%d] 异常：%@", mode, e.reason);
+        return -1;
+    }
+    return AXSeqMs() - t0;
+}
+
 extern "C" BOOL AXAgentPressHome(void) {
     if (!gReady) { ALog(@"❌ pressHome: 会话未就绪"); return NO; }
     Class scrCls = NSClassFromString(@"XCUIScreen");
