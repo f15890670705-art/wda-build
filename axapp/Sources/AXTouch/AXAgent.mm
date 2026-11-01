@@ -525,6 +525,21 @@ static BOOL AXTapCore(double x, double y) {
         id path = fp1([pathCls alloc], initPath, CGPointMake(x, y), 0.0);
         if (!path) { ALog(@"❌ tap：path 构造失败"); return NO; }
 
+        /* ★★ 必须显式抬手（2026-11-01 用户反馈「点击之间必须隔一下才能点第二下」）。
+           以前这里只建了「按下」就提交，record 里这根手指**永远没有 lift**：
+           daemon 只能自己猜什么时候松手 —— 第二下点提交上去时上一次还没收尾，
+           就表现成「第二下点不上、要等一会儿」。文件里其它路径（手势/双指/touchSeq）
+           都调了 liftUpAtOffset:，唯独 tap 这条漏了。
+           ★ 抬手时刻取 50~80ms 随机（用户指定）：真人点按时长天然有抖动，
+             固定值会让连点/长按判定过于机械、也更容易两下之间撞在同一时刻。 */
+        SEL upSel = NSSelectorFromString(@"liftUpAtOffset:");
+        if ([path respondsToSelector:upSel]) {
+            int holdMs = 50 + (int)arc4random_uniform(31);   /* 31 → 0..30 ⇒ 50~80ms */
+            ((void (*)(id, SEL, double))objc_msgSend)(path, upSel, (double)holdMs / 1000.0);
+        } else {
+            ALog(@"⚠️ tap：XCPointerEventPath 无 liftUpAtOffset:，本次只有按下没有抬起");
+        }
+
         long orient = AXInterfaceOrientation();
         SEL initRec = NSSelectorFromString(@"initWithName:interfaceOrientation:");
         id (*fp2)(id, SEL, id, long) = (id (*)(id, SEL, id, long))objc_msgSend;
