@@ -400,6 +400,31 @@ static BOOL AXAgentBootstrap(void) {
                 } @catch (NSException *e) { ALog(@"  ❌ implicitInterval: %@", e.reason); }
             }
 
+            // 9b) 探针（2026-11-02）：把「能改事件确认超时」的入口全试一遍，只打印存在与否，
+            //     **不改任何值**（b78 把全局设成 0 → 一点击就闪退，教训在此）。
+            {
+                const char *syms[] = {
+                    "_XCTSetEventConfirmationTimeout",
+                    "_XCTSetImplicitEventConfirmationInterval",
+                    "_XCTEventConfirmationTimeout",
+                    NULL
+                };
+                for (int i = 0; syms[i]; i++) {
+                    void *p = dlsym(RTLD_DEFAULT, syms[i]);
+                    ALog(@"  🔎 dlsym %s -> %s", syms[i], p ? "有" : "无");
+                }
+                const char *sels[] = {
+                    "_XCT_synthesizeEvent:implicitConfirmationInterval:completion:",
+                    "XCT_synthesizeEvent:implicitConfirmationInterval:completion:",
+                    "setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:",
+                    NULL
+                };
+                for (int i = 0; sels[i]; i++) {
+                    SEL s2 = NSSelectorFromString([NSString stringWithUTF8String:sels[i]]);
+                    ALog(@"  🔎 sel %s -> %s", sels[i], [session respondsToSelector:s2] ? "有" : "无");
+                }
+            }
+
             gReady = YES;
             gLastError = nil;
             ALog(@"✅ 会话就绪（gReady=YES）");
@@ -508,6 +533,22 @@ static long long AXSeqMs(void) {
    定义必须放在 AXTapCore 之前（它要用）。 */
 static volatile int g_grabBusy = 0;
 
+/* ★★ 点击确认探针（2026-11-02，**只读，不改任何行为**）。
+   目的：确认「点一下就等 5 秒」到底卡在哪一段。XCTest 合成一笔事件后要等 daemon
+   回报确认（草稿默认 5 秒，日志里 implicitEventConfirmationInterval = 5.000）。
+   这里记录三件事：
+     g_tapSynAt  提交 synthesizeEvent 的时刻
+     g_tapCfmAt  completion 回调回来的时刻
+     g_tapCfmMs  两者之差 = daemon 真正处理完这笔点击花了多久
+   ★ 回调块里只写 C 静态变量，绝不捕获任何 ObjC 对象（b35/b36 的 SIGSEGV 教训）。 */
+static volatile long long g_tapSynAt  = 0;
+static volatile long long g_tapCfmAt  = 0;
+static volatile long long g_tapCfmMs  = -1;   /* 提交→确认 耗时 */
+static volatile long long g_tapGapMs  = -1;   /* 相邻两次点击提交的间隔 */
+static volatile int       g_tapSynN   = 0;    /* 提交次数 */
+static volatile int       g_tapCfmN   = 0;    /* 确认回调次数 */
+static volatile int       g_tapCfmErr = 0;    /* 确认带错（daemon 拒绝）的次数 */
+
 /* 核心实现（提交完立刻返回，不等待）。控制通道必须用这个 ——
    控制线程是串行的，这里一阻塞，后面的点击/滑动全在队列里排队，
    表现就是"点了半天才反应"。 */
@@ -556,7 +597,14 @@ static BOOL AXTapCore(double x, double y) {
         // completion 块绝不能捕获任何 ObjC 对象（__block 变量在函数返回后会失效，
         // XPC 回调再来时 objc_retain 野指针直接 SIGSEGV —— b35/b36 就是这个崩的）
         // ★ b77 曾在这里加过 if (err) ALogShim(...)，b79 撤回：保持空块最安全。
-        void (^completion)(id) = ^(id err) { /* 空，只为满足 ABI */ };
+        void (^completion)(id) = ^(id err) {
+            /* ★ 探针：只写 C 静态变量，不捕获/不 retain/不调任何 ObjC 方法 */
+            long long t = AXSeqMs();
+            g_tapCfmAt = t;
+            g_tapCfmMs = (g_tapSynAt > 0) ? (t - g_tapSynAt) : -1;
+            if (err) g_tapCfmErr++;
+            g_tapCfmN++;
+        };
         SEL syn = NSSelectorFromString(@"synthesizeEvent:completion:");
         if (![gSession respondsToSelector:syn]) {
             ALog(@"❌ tap：daemonSession 无 synthesizeEvent:completion:");
@@ -590,6 +638,10 @@ static BOOL AXTapCore(double x, double y) {
         }
         void (*fp4)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
         void (*fp5)(id, SEL, id, double, id) = (void (*)(id, SEL, id, double, id))objc_msgSend;
+        /* ★ 探针：记下提交时刻 + 与上一笔点击的间隔（确认耗时在 completion 里回填） */
+        g_tapGapMs = (g_tapSynAt > 0) ? (AXSeqMs() - g_tapSynAt) : -1;
+        g_tapSynAt = AXSeqMs();
+        g_tapSynN++;
         long long synT0 = AXSeqMs();
         if (s_synMode == 1) {
             @try {
@@ -606,7 +658,8 @@ static BOOL AXTapCore(double x, double y) {
         long long synMs = AXSeqMs() - synT0;
         /* 合成调用本身若很慢（>100ms），说明卡在 daemon 或 CPU 被采集循环占满 */
         if (synMs > 100) ALog(@"⏱ tap 合成耗时 %lldms（CPU 忙/daemon 慢）", synMs);
-        else             ALog(@"  ✅ tap(%.1f, %.1f) 已提交（%lldms）", x, y, synMs);
+        else ALog(@"  ✅ tap(%.1f, %.1f) 已提交（%lldms） 间隔=%lldms 上次确认=%lldms 确认数=%d/%d 错误=%d",
+                  x, y, synMs, g_tapGapMs, g_tapCfmMs, g_tapCfmN, g_tapSynN, g_tapCfmErr);
         return YES;
     } @catch (NSException *e) {
         ALog(@"❌ tap 异常: %@ / %@", e.name, e.reason);
@@ -2780,14 +2833,15 @@ static void *AXEncodeLoop(void *arg) {
             frameCount++;
             statFrames++;
             if ((AXNowMs() - statT0) >= 5000) {
-                ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d fps=%d 图%luKB 截%lldms 解%lldms 绘%lldms 静止%d 热=%s cpu=%.0f%% bench=%d dec=%d vt=%p %dx%d",
+                ALogShim(@"❤️ 心跳 state=%ld clients=%d sent=%d fps=%d 图%luKB 截%lldms 解%lldms 绘%lldms 静止%d 热=%s cpu=%.0f%% bench=%d dec=%d vt=%p %dx%d tap[间隔=%lldms 确认=%lldms %d/%d err=%d]",
                          (long)[UIApplication sharedApplication].applicationState,
                          g_clientCount, g_sentFrames,
                          (int)(statFrames * 1000 / MAX(1, (AXNowMs() - statT0))),
                          (unsigned long)(g_lastImgBytes / 1024),
                          g_lastGrabMs, g_lastDecMs, g_lastDrawMs, staticStreak,
                          AXThermalStateStr(), AXSelfCPUPercent(), g_benchMode, g_decodeThumb,
-                         (void *)g_vt, g_encW, g_encH);
+                         (void *)g_vt, g_encW, g_encH,
+                         g_tapGapMs, g_tapCfmMs, g_tapCfmN, g_tapSynN, g_tapCfmErr);
                 statT0 = AXNowMs(); statFrames = 0;
             }
 
@@ -3891,6 +3945,34 @@ void AXStreamSetDecodeMode(int thumb) {
     if (thumb == 1) nm = "ImageIO thumbnail";
     else if (thumb == 2) nm = "GPU(CoreImage)";
     ALogShim(@"🧩 解码路径 = %s", nm);
+}
+
+/* ★ 运行时调「事件确认间隔」（2026-11-02）。默认 5.0 秒：
+   daemon 合成一笔事件后要等确认，等不到就按这个上限超时（日志里
+   "No confirmation received for event, treating as non-fatal and continuing"）。
+   间隔太大 ⇒ 连续点击被逐笔排队 ⇒ 表现为「点一下要等、连点第二下没反应」。
+   ★ 设 0 会闪退（b78 实测，一点击就整个进程没了），所以只接受正值，最小 0.05。
+   给 10010 的 {"cmd":"cfmto","v":秒} 用，方便不重新出包就能试不同值。 */
+void AXSetEventConfirmInterval(double sec) {
+    if (!gSession) { ALog(@"❌ cfmto：会话未就绪"); return; }
+    if (sec < 0.05) sec = 0.05;      /* 0 = 闪退，永远不给 */
+    if (sec > 10.0) sec = 10.0;
+    SEL s = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:");
+    if (![gSession respondsToSelector:s]) {
+        ALog(@"❌ cfmto：当前会话没有 WithoutSideEffects 版 setter");
+        return;
+    }
+    @try {
+        ((void (*)(id, SEL, double))objc_msgSend)(gSession, s, sec);
+        double now = -1;
+        SEL rd = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
+        if ([gSession respondsToSelector:rd]) {
+            now = ((double (*)(id, SEL))objc_msgSend)(gSession, rd);
+        }
+        ALog(@"⚙️ cfmto 设为 %.3f，回读 = %.3f", sec, now);
+    } @catch (NSException *e) {
+        ALog(@"❌ cfmto 异常：%@", e.reason);
+    }
 }
 
 void AXStreamSetImgFormat(NSString *uti) {
