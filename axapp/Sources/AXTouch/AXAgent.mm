@@ -425,6 +425,35 @@ static BOOL AXAgentBootstrap(void) {
                 }
             }
 
+            // 9c) 兜底：把**全局**确认间隔设成 0.3 秒（实测 5.0→9.5s 等待、0.3→约 0.3s；设 0 会闪退）。
+            //     逐次重载（AXTapCore 里）优先；这里保证即使那条例外也还有 0.3 秒可用。
+            {
+                SEL s3 = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:");
+                @try {
+                    ((void (*)(id, SEL, double))objc_msgSend)(session, s3, 0.3);
+                    double now = -1;
+                    SEL rd = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
+                    if ([session respondsToSelector:rd]) {
+                        now = ((double (*)(id, SEL))objc_msgSend)(session, rd);
+                    }
+                    ALog(@"⚙️ 全局确认间隔 → 0.3，回读 = %.3f", now);
+                } @catch (NSException *e) {
+                    ALog(@"⚠️ 全局确认间隔设置失败：%@", e.reason);
+                }
+            }
+
+            // 9d) AScript 里也用了 setWaitForIdleTimeout:（静默等待应用 idle 的超时）。
+            //     设 0 = 不等 idle，避免每次点击前先等 App「闲下来」。
+            {
+                SEL wi = NSSelectorFromString(@"setWaitForIdleTimeout:");
+                @try {
+                    ((void (*)(id, SEL, double))objc_msgSend)(session, wi, 0.0);
+                    ALog(@"  ✅ setWaitForIdleTimeout(0) 已设");
+                } @catch (NSException *e) {
+                    ALog(@"  ⚠️ setWaitForIdleTimeout 不可用：%@", e.reason);
+                }
+            }
+
             gReady = YES;
             gLastError = nil;
             ALog(@"✅ 会话就绪（gReady=YES）");
@@ -614,28 +643,19 @@ static BOOL AXTapCore(double x, double y) {
            而是 implicitEventConfirmationInterval=5s 没设成 0（见 bootstrap 第 12 步）。
            那 80ms 等待反而给每一下点击加了延迟，已撤掉。 */
 
-        /* ★★ 2026-11-02「连点要等」的正解：**逐次**传隐式确认间隔，不动全局。
-           背景：daemon 合成一笔事件后要等它被确认才算完，默认 **5 秒**（日志里
-           `implicitEventConfirmationInterval = 5.000`）。这期间提交的新点击只能排队，
-           表现就是「两次点击之间必须有间隔」。
-           走不通的两条路（都已验证）：
-             · 全局 setImplicitEventConfirmationIntervalForCurrentContext:（无 case 上下文 → 抛异常，从没成功过）
-             · 全局 ...WithoutSideEffects: 设 0（b78，回读确实 0.000，但**一点击就闪退**）
-           现在用的是 XCTest 内部那个**带 per-call 参数**的重载：
-             _XCT_synthesizeEvent:implicitConfirmationInterval:completion:
-           它每次调用单独指定等待上限，不改全局状态，也不会塞 0 进去。
-           确认没按时回来时框架自己会 "treating as non-fatal and continuing"，不会卡死。
-           逐次间隔取 0.15s：足够让系统回报一次确认，又远小于 5s，连点不再互相排队。 */
-        static int s_synMode = -1;   /* -1=未探测  0=普通入口  1=带间隔重载 */
-        SEL syn2 = NSSelectorFromString(@"_XCT_synthesizeEvent:implicitConfirmationInterval:completion:");
-        if (s_synMode < 0) {
-            s_synMode = ([gSession respondsToSelector:syn2] ? 1 : 0);
-            if (s_synMode == 1) {
-                ALog(@"🧷 合成事件走「逐次确认间隔」重载（interval=0.150s）");
-            } else {
-                ALog(@"🧷 合成事件无逐次间隔重载，退回普通入口（确认间隔=全局 5s）");
-            }
-        }
+        /* ★★★ 2026-11-02 照 AScript 的做法改（从其 IPA 主程序字符串提取）：
+          它用的是同两个私有重载 —— `_XCT_synthesizeEvent:completion:` /
+          `_XCT_synthesizeEvent:implicitConfirmationInterval:completion:`，
+          会话同样是 `[XCTRunnerDaemonSession sharedSession]`（我们一样）。
+          唯一差别：**它不管 respondsToSelector，直接发消息**。
+          我们之前用 respondsToSelector 探测得到 NO 就放弃了 —— 但 XCTest 这套是消息转发实现的，
+          探测返回 NO 并不代表不能发。这里改成"直接发 + @try 兜底"：
+          抛异常就永久降级到下一个入口，绝不会拿你的点击反复试崩。 */
+        static int s_synMode = -1;   /* -1=未定  2=_XCT_带间隔  1=_XCT_  0=普通 */
+        static BOOL s_synLogged = NO;
+        SEL synX2 = NSSelectorFromString(@"_XCT_synthesizeEvent:implicitConfirmationInterval:completion:");
+        SEL synX1 = NSSelectorFromString(@"_XCT_synthesizeEvent:completion:");
+        if (s_synMode < 0) s_synMode = 2;
         void (*fp4)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
         void (*fp5)(id, SEL, id, double, id) = (void (*)(id, SEL, id, double, id))objc_msgSend;
         /* ★ 探针：记下提交时刻 + 与上一笔点击的间隔（确认耗时在 completion 里回填） */
@@ -643,17 +663,39 @@ static BOOL AXTapCore(double x, double y) {
         g_tapSynAt = AXSeqMs();
         g_tapSynN++;
         long long synT0 = AXSeqMs();
-        if (s_synMode == 1) {
+        BOOL sent = NO;
+        if (s_synMode == 2) {
             @try {
-                fp5(gSession, syn2, rec, 0.15, completion);
+                fp5(gSession, synX2, rec, 0.02, completion);
+                sent = YES;
+                if (!s_synLogged) {
+                    s_synLogged = YES;
+                    ALog(@"🧷 合成事件走 _XCT_synthesizeEvent:implicitConfirmationInterval:completion:（0.02s）");
+                }
             } @catch (NSException *e) {
-                /* 有了就崩/抛异常 → 永久退回普通入口，别再拿点击去试 */
-                s_synMode = 0;
-                ALog(@"❌ 逐次间隔重载异常（%@），退回普通入口", e.reason);
-                fp4(gSession, syn, rec, completion);
+                s_synMode = 1;
+                ALog(@"⚠️ _XCT_ 带间隔重载不可用（%@）→ 退 _XCT_synthesizeEvent:completion:", e.reason);
             }
-        } else {
+        }
+        if (!sent && s_synMode == 1) {
+            @try {
+                fp4(gSession, synX1, rec, completion);
+                sent = YES;
+                if (!s_synLogged) {
+                    s_synLogged = YES;
+                    ALog(@"🧷 合成事件走 _XCT_synthesizeEvent:completion:（无独立间隔）");
+                }
+            } @catch (NSException *e) {
+                s_synMode = 0;
+                ALog(@"⚠️ _XCT_synthesizeEvent:completion: 也不可用（%@）→ 退普通入口", e.reason);
+            }
+        }
+        if (!sent) {
             fp4(gSession, syn, rec, completion);
+            if (!s_synLogged) {
+                s_synLogged = YES;
+                ALog(@"🧷 合成事件退回普通入口 synthesizeEvent:completion:（确认间隔=全局）");
+            }
         }
         long long synMs = AXSeqMs() - synT0;
         /* 合成调用本身若很慢（>100ms），说明卡在 daemon 或 CPU 被采集循环占满 */
