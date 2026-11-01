@@ -31,6 +31,7 @@ NSString *AXLockdownUDIDResult(void);
 BOOL AXAgentSetAppStateTimeout(double v);
 BOOL AXAgentIsBootstrapping(void);
 BOOL AXAgentPressHome(void);
+long long AXAgentHomeTest(int mode);   /* 0=pressButton 1=_silent 2=XCUIButtonConsole 3/4=XCDeviceEvent */
 BOOL AXAgentPinch(double cx, double cy, double startGap, double endGap, double dur);
 BOOL AXAgentTypeText(NSString *text);
 BOOL AXAgentKey(NSString *key, unsigned long mods);
