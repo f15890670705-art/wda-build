@@ -21,10 +21,19 @@ jobs:
         working-directory: axapp
         run: |
           set -o pipefail
+          # ★ 2026-11-02：原来直接 tail -200，编译错误（往往在更前面）会被整段吞掉，
+          #   只能看到 "BUILD FAILED" 干着急。现在落盘后单独把 error 行捞出来。
           xcodebuild -project AXTouch.xcodeproj -scheme AXTouch \
             -sdk iphoneos -configuration Release -derivedDataPath dd \
             CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY= \
-            ARCHS=arm64 build 2>&1 | tail -200
+            ARCHS=arm64 build > /tmp/xb.log 2>&1 || {
+              echo "===== 编译错误 =====";
+              grep -nE "error:|\.mm:[0-9]+:[0-9]+: error|\.m:[0-9]+:[0-9]+: error" /tmp/xb.log | head -30;
+              echo "===== 末 60 行 =====";
+              tail -60 /tmp/xb.log;
+              exit 1;
+            }
+          tail -20 /tmp/xb.log
           test -f dd/Build/Products/Release-iphoneos/AXTouch.app/AXTouch
           mkdir -p Payload
           cp -R dd/Build/Products/Release-iphoneos/AXTouch.app Payload/
