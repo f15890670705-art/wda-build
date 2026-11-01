@@ -552,11 +552,23 @@ static BOOL AXTapCore(double x, double y) {
 
         // completion 块绝不能捕获任何 ObjC 对象（__block 变量在函数返回后会失效，
         // XPC 回调再来时 objc_retain 野指针直接 SIGSEGV —— b35/b36 就是这个崩的）
-        void (^completion)(id) = ^(id err) { /* 空，只为满足 ABI */ };
+        // ★ 但 err 是入参，用它打印是安全的 —— daemon 拒绝执行事件时会从这里回来，
+        //   这正是「点了没反应」最直接的证据（以前这个块是空的，什么都看不到）。
+        void (^completion)(id) = ^(id err) {
+            if (err) ALogShim(@"❌ tap 合成被 daemon 拒绝: %@", err);
+        };
         SEL syn = NSSelectorFromString(@"synthesizeEvent:completion:");
         if (![gSession respondsToSelector:syn]) {
             ALog(@"❌ tap：daemonSession 无 synthesizeEvent:completion:");
             return NO;
+        }
+        /* ★★ 等 daemon 手上那张截图回来（最多 80ms）再提交手势。
+           daemon 是串行的：20fps 截图每张 20~50ms，合成事件排在后面就要等一整张图；
+           连点时第二下常常就"迟到"或被丢。用户 2026-11-02 反馈的「两次点击之间必须有间隔」
+           根因就在这里。 */
+        {
+            long long wt0 = AXSeqMs();
+            while (g_grabBusy && (AXSeqMs() - wt0) < 80) usleep(2 * 1000);
         }
         void (*fp4)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
         long long synT0 = AXSeqMs();
@@ -1917,11 +1929,14 @@ static volatile int    g_decodeThumb = 2;     /* 「第二步」解码+缩放走
                                                  热点就在这一步，默认改成 GPU 让 Metal 扛缩放和色彩转换。 */
 static volatile int    g_inputKick   = 0;
 static volatile long long g_capPauseUntil = 0;  /* 到此时刻前暂停抓图，先把 daemon 让给合成事件 */
-static volatile int    g_capPauseMs  = 0;       /* 停采时长（0=关闭该策略）
-                                                   ★ 2026-10-31 默认改 0：实测手势合成只要 0~1ms
-                                                   （synthesizeEvent 是异步提交、不阻塞），daemon 根本
-                                                   不排队，停采毫无收益；反而在停采窗口内把 g_inputKick
-                                                   一起挡掉，用户点一下就少 200ms 画面反馈。 */
+static volatile int    g_capPauseMs  = 60;      /* 停采时长（0=关闭该策略）
+                                                   ★ 2026-11-02 改回 60（用户反馈「连点第二下没反应」）。
+                                                   2026-10-31 关掉它的理由是"手势合成只要 0~1ms" —— 但那个
+                                                   数字量的是 synthesizeEvent 这个 XPC 调用的**返回耗时**，
+                                                   不是 daemon **真正执行**事件的耗时。daemon 是串行的：
+                                                   20fps 截图每张 20~50ms，队列基本占满，合成事件只能排队。
+                                                   提交完让 60ms 出来给它执行，连点才不会被吃掉。 */
+static volatile int    g_grabBusy    = 0;       /* 1 = 有一张截图正压在 daemon 里，还没回来 */
 static volatile int    g_staticDrop  = 0;     /* ★ 2026-10-31 用户决定：默认关闭。
                                                  理由：静止降帧会让「静止画面上点一下」永远要等下一帧
                                                  （下限 2fps 时就是最多 500ms 才看到反应），而投屏的
@@ -2324,14 +2339,19 @@ static NSData *AXGrabEncodedData(CGSize *outSize) {
     __block NSData *result = nil;
     dispatch_semaphore_t sem = dispatch_semaphore_create(0);
     void (^reply)(id, id) = ^(id v, id e) {
+        g_grabBusy = 0;                     /* ★ 截图回来了，daemon 不再被这张图占着 */
         if (v && [v respondsToSelector:NSSelectorFromString(@"data")]) {
             id d = ((id (*)(id, SEL))objc_msgSend)(v, NSSelectorFromString(@"data"));
             if ([d isKindOfClass:[NSData class]]) result = (NSData *)d;
         }
         dispatch_semaphore_signal(sem);
     };
+    /* ★ 标记「daemon 里正压着一张截图」：合成手势前要等它回来，否则事件排在这张图后面，
+       连点时第二下就会明显延迟甚至被丢。 */
+    g_grabBusy = 1;
     ((void (*)(id, SEL, id, id))objc_msgSend)(ipc, callSel, req, reply);
     if (dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3.0 * NSEC_PER_SEC))) != 0) {
+        g_grabBusy = 0;
         AXSetErr(-9, @"截图超时");
         return nil;
     }
@@ -3333,6 +3353,10 @@ static void AXTouchCommit(void) {
             AXGestureCore(xy, tt, k);
         }
         AXTouchReset();
+        /* ★ 单指这条以前直接 return，把下面那句「提交后停采」跳过了 ——
+           等于 g_capPauseMs 对点击从来就没生效过（只有双指才设）。这里补上：
+           提交完让 daemon 有 60ms 把事件执行完，连点第二下才不会被截图挤掉。 */
+        if (g_capPauseMs > 0) g_capPauseUntil = AXSeqMs() + g_capPauseMs;
         return;
     }
 
