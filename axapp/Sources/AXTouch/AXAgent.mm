@@ -845,6 +845,58 @@ extern "C" void AXAgentStartSticky(void) {
 
 /// xy: [x0,y0, x1,y1, ...]  t: 每个点的时间偏移(秒)，最后一个点是 liftUp
 /* 按 Home 键（用自动化会话里的 XCUIDevice.pressButton:），用于自己复现"退到后台" */
+/* ★★★ 2026-11-02 b89：**纯 HID 直发 HOME**（真正绕开 XCTest 全部通道）。
+   为什么还要再来一条：XCDeviceEvent + 会话 performDeviceEvent 在 hometest 探针里
+   "看起来有效"（提交 0~1ms），但真机按 HOME 仍不回桌面 —— 因为事件只是交给了
+   XCTest 的 daemon，还要过它的确认与目标切换（目标一直挂在 hbVideo 上）。
+   hometest mode 4 之所以"有效"，靠的正是探针里那 200ms 的等待 + 之后人眼看桌面。
+   这里直接把「硬件按键」塞进系统 HID 流，不经过任何测试框架：
+     IOHIDEventCreateKeyboardEvent(0, kHIDPage_Consumer=0x0C, usage=0x40(Menu), down/up)
+     IOHIDEventSystemClientDispatchEvent(client, event)
+   代价：需要 com.apple.private.hid.client.event-dispatch（TrollStore 签名是否给未知），
+   失败时 dispatch 无返回值（静默），所以下面保留探测 + 逐级降级。 */
+typedef void *(*AXHIDKbFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, unsigned char);
+
+extern "C" BOOL AXAgentHomeHID(long usage) {
+    static AXHIDKbFn fCreate = NULL;
+    static void *(*fClientCreate)(CFAllocatorRef) = NULL;
+    static void (*fDispatch)(void *, void *) = NULL;
+    static void *s_client = NULL;
+    static BOOL s_inited = NO;
+    static BOOL s_ok = NO;
+    if (!s_inited) {
+        s_inited = YES;
+        void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY | RTLD_GLOBAL);
+        void *scope = h ? h : RTLD_DEFAULT;
+        fCreate       = (AXHIDKbFn)dlsym(scope, "IOHIDEventCreateKeyboardEvent");
+        fClientCreate = (void *(*)(CFAllocatorRef))dlsym(scope, "IOHIDEventSystemClientCreate");
+        fDispatch     = (void (*)(void *, void *))dlsym(scope, "IOHIDEventSystemClientDispatchEvent");
+        if (!fClientCreate) {
+            /* iOS 13+ 只有带 type 的版本：IOHIDEventSystemClientCreateWithType(alloc, type, props)
+               type=1 是 Monitor 客户端（能收发事件）。★ 必须按 3 参数调用，少一个参数会崩。 */
+            void *(*f2)(CFAllocatorRef, int, CFDictionaryRef) =
+                (void *(*)(CFAllocatorRef, int, CFDictionaryRef))dlsym(scope, "IOHIDEventSystemClientCreateWithType");
+            if (f2) s_client = f2(kCFAllocatorDefault, 1, NULL);
+        } else {
+            s_client = fClientCreate(kCFAllocatorDefault);
+        }
+        s_ok = (fCreate && fDispatch && s_client);
+        ALog(@"🔧 HID 直发初始化：IOKit=%p create=%p client=%p(%p) dispatch=%p → %s",
+             h, (void *)fCreate, (void *)fClientCreate, s_client, (void *)fDispatch,
+             s_ok ? "可用" : "不可用");
+    }
+    if (!s_ok) return NO;
+    long long t0 = AXSeqMs();
+    void *down = fCreate(kCFAllocatorDefault, 0, 0x0C, (uint32_t)usage, 1);
+    void *up   = fCreate(kCFAllocatorDefault, 0, 0x0C, (uint32_t)usage, 0);
+    if (!down || !up) { ALog(@"❌ HID 事件构造失败 down=%p up=%p", down, up); return NO; }
+    fDispatch(s_client, down);
+    usleep(30 * 1000);
+    fDispatch(s_client, up);
+    ALog(@"🏠 home = 纯 HID 直发 page=0x0C usage=0x%lx（%lldms，不等确认）", usage, AXSeqMs() - t0);
+    return YES;
+}
+
 /* ★★ 2026-11-02 HOME 四条通路的实测探针（只探测，不改主路径）。
    背景：`pressButton:` 每次 5.5 秒（XPC 到 daemon + 空闲等待）。从框架符号表挖到两条**硬件级**通路，
    都不经过 UI 元素操作：
@@ -882,6 +934,11 @@ extern "C" long long AXAgentHomeTest(int mode) {
             if (![console respondsToSelector:sp]) { ALog(@"🧪 hometest[2] 无 _silentlyPressButton:forDuration:"); return -1; }
             ((void (*)(id, SEL, long, double))objc_msgSend)(console, sp, 1, 0.05);
             ALog(@"🧪 hometest[2 XCUIButtonConsole 静默] %lldms", AXSeqMs() - t0);
+        } else if (mode >= 5) {                            /* C. 纯 HID 直发（b89） */
+            long usage = (mode == 6) ? 0x223 : 0x40;        /* Menu / AC Home */
+            BOOL ok = AXAgentHomeHID(usage);
+            ALog(@"🧪 hometest[%d HID直发 usage=0x%lx] %s 总耗时 %lldms",
+                 mode, usage, ok ? "已发" : "不可用", AXSeqMs() - t0);
         } else {                                           /* B. 硬件设备事件 */
             long page = 12;                                 /* kHIDPage_Consumer */
             long usage = (mode == 3) ? 0x223 : 0x40;        /* AC Home / Menu */
@@ -939,6 +996,13 @@ static void AXWarmSpringboard(void) {
 extern "C" BOOL AXAgentPressHome(void) {
     if (!gReady) { ALog(@"❌ pressHome: 会话未就绪"); return NO; }
 
+    /* ★★★ 2026-11-02 b89：第一优先 = 纯 HID 直发（page 0x0C / usage 0x40 Menu）。
+       这条不经过 XCTest，没有确认、没有目标切换、没有 quiescence，发完即回桌面。
+       ★ 但 dispatch 失败是**静默**的（无返回值），没法从代码判断成不成，
+       所以这里**不独占**：HID 发完继续把会话版也发一次，用它兜住"HID 没权限"的情况。
+       两次 HOME 连发没有副作用（已经在桌面时再按一次还是桌面）。 */
+    BOOL hidSent = AXAgentHomeHID(0x40);
+
     /* ★★★ 2026-11-02 定案：HOME 走**硬件设备事件**，实测提交 0~1ms、用户已确认能回桌面。
        为什么不用 pressButton:：那条走 XPC + 空闲等待，实测每次 5.3~5.5 秒
        （pressButton / _silentPressButton / XCUIButtonConsole 三条都一样慢，b84 探针实测数据）。
@@ -965,7 +1029,7 @@ extern "C" BOOL AXAgentPressHome(void) {
                     if ([gSession respondsToSelector:pd]) {
                         void (^done)(id) = ^(id e) { /* 不捕获对象 */ };
                         ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, pd, ev, done);
-                        ALog(@"🏠 home = 会话 performDeviceEvent（%lldms，发送即返回）", AXSeqMs() - t0);
+                        ALog(@"🏠 home = 会话 performDeviceEvent（%lldms，发送即返回）hid=%d", AXSeqMs() - t0, (int)hidSent);
                         return YES;
                     }
                     /* 退路：同步版（会阻塞 5.5 秒，但不阻塞也比回不了桌面强） */
@@ -987,6 +1051,11 @@ extern "C" BOOL AXAgentPressHome(void) {
             }
         }
     }
+
+    /* ★ b89：HID 已经发出去了，就**不要**再走按键通道 —— 那条每次 5.5 秒，
+       只会白堵控制线程（用户最恨的"按完 HOME 点一下要等几秒"）。
+       只有 HID 连符号都拿不到（hidSent=NO）才用按键兜底。 */
+    if (hidSent) { ALog(@"🏠 home 已由 HID 直发（跳过按键盘通道）"); return YES; }
 
     Class scrCls = NSClassFromString(@"XCUIScreen");
     if (!scrCls) return NO;
