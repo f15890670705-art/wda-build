@@ -944,8 +944,8 @@ extern "C" BOOL AXAgentPressHome(void) {
        （pressButton / _silentPressButton / XCUIButtonConsole 三条都一样慢，b84 探针实测数据）。
        设备事件这条路是直接用 HID 用法码构造「硬件按键」：
          +[XCDeviceEvent deviceEventWithPage:usage:duration:]  (page=12 Consumer, usage=0x40 Menu)
-         → 首选 -[XCUIDevice performDeviceEvent:error:]      （WDA 用的就是这条，同步返回）
-         → 退 -[XCTRunnerDaemonSession performDeviceEvent:completion:]（completion 永不回，会占住 daemon）
+         → 首选 -[XCTRunnerDaemonSession performDeviceEvent:completion:]（发送即返回，不堵控制线程）
+         → 退 -[XCUIDevice performDeviceEvent:error:]（WDA 的写法，但**同步阻塞 5.5 秒**，实测堵死控制线程）
        用法码来自 b84 实测：0x40(Menu) 有效、0x223(AC Home) 无效。 */
     {
         Class deCls = NSClassFromString(@"XCDeviceEvent");
@@ -955,12 +955,20 @@ extern "C" BOOL AXAgentPressHome(void) {
                 long long t0 = AXSeqMs();
                 id ev = ((id (*)(id, SEL, long, long, double))objc_msgSend)(deCls, mk, 12, 0x40, 0.05);
                 if (ev) {
-                    /* ★ 优先 WDA 的写法：-[XCUIDevice performDeviceEvent:error:]（同步、带 error）
-                       我们之前用的是 -[XCTRunnerDaemonSession performDeviceEvent:completion:]，
-                       它的 completion **永远不回来**，等于事件一直挂在 daemon 里 ——
-                       实测表现就是「按完 HOME，紧接着点一下要等几秒」，因为下一笔排在它后面。
-                       AScript 内置的 WebDriverAgentLib 里就是 _FBCreateXCDeviceEvent +
-                       performDeviceEvent:error:，照它改。 */
+                    /* ★☆ 先走**发送即返回**的会话版，再退同步版。
+                       实测（b87 日志）：`-[XCUIDevice performDeviceEvent:error:]` 是**同步阻塞**的，
+                       每次 5.5 秒 —— 它把我们的控制线程堵死，这 5.5 秒里 socket 都读不了，
+                       用户按完 HOME 紧接着的那一下点击只能躺在 TCP 缓冲里等着 ⇒ 就是「点一下等几秒」。
+                       会话版 completion 永不回调，但**立刻返回**，控制线程不阻塞，下一笔点击马上能处理。
+                       （代价：daemon 那边这笔事件可能要挂一会儿，但实测接着点的那笔确认只要 1ms，不影响。） */
+                    SEL pd = NSSelectorFromString(@"performDeviceEvent:completion:");
+                    if ([gSession respondsToSelector:pd]) {
+                        void (^done)(id) = ^(id e) { /* 不捕获对象 */ };
+                        ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, pd, ev, done);
+                        ALog(@"🏠 home = 会话 performDeviceEvent（%lldms，发送即返回）", AXSeqMs() - t0);
+                        return YES;
+                    }
+                    /* 退路：同步版（会阻塞 5.5 秒，但不阻塞也比回不了桌面强） */
                     Class scrCls = NSClassFromString(@"XCUIScreen");
                     id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
                     id dev = screen ? ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device")) : nil;
@@ -970,15 +978,6 @@ extern "C" BOOL AXAgentPressHome(void) {
                         ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(dev, pde, ev, &err);
                         ALog(@"🏠 home = XCUIDevice performDeviceEvent（%lldms）err=%@",
                              AXSeqMs() - t0, err ? err.localizedDescription : @"无");
-                        return YES;
-                    }
-                    /* 退一步：会话版（不回包，但至少能回桌面） */
-                    SEL pd = NSSelectorFromString(@"performDeviceEvent:completion:");
-                    if ([gSession respondsToSelector:pd]) {
-                        void (^done)(id) = ^(id e) { /* 不捕获对象 */ };
-                        ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, pd, ev, done);
-                        ALog(@"🏠 home = 会话 performDeviceEvent（%lldms，无回调）", AXSeqMs() - t0);
-                        AXWarmSpringboard();
                         return YES;
                     }
                 }
