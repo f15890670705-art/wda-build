@@ -887,6 +887,36 @@ extern "C" long long AXAgentHomeTest(int mode) {
 
 extern "C" BOOL AXAgentPressHome(void) {
     if (!gReady) { ALog(@"❌ pressHome: 会话未就绪"); return NO; }
+
+    /* ★★★ 2026-11-02 定案：HOME 走**硬件设备事件**，实测提交 0~1ms、用户已确认能回桌面。
+       为什么不用 pressButton:：那条走 XPC + 空闲等待，实测每次 5.3~5.5 秒
+       （pressButton / _silentPressButton / XCUIButtonConsole 三条都一样慢，b84 探针实测数据）。
+       设备事件这条路是直接用 HID 用法码构造「硬件按键」发给 daemon：
+         +[XCDeviceEvent deviceEventWithPage:usage:duration:]
+         -[XCTRunnerDaemonSession performDeviceEvent:completion:]
+       page = 12 (kHIDPage_Consumer)，usage = 0x40 (Menu) ⇐ b84 实测这个组合有效（0x223 AC Home 无效）。
+       ★ 它的 completion 回调不会回来（实测 err/cfm 都是 -1），所以**只发不等**，别在这里阻塞。 */
+    {
+        Class deCls = NSClassFromString(@"XCDeviceEvent");
+        SEL mk = NSSelectorFromString(@"deviceEventWithPage:usage:duration:");
+        SEL pd = NSSelectorFromString(@"performDeviceEvent:completion:");
+        if (deCls && [deCls respondsToSelector:mk] && [gSession respondsToSelector:pd]) {
+            @try {
+                long long t0 = AXSeqMs();
+                id ev = ((id (*)(id, SEL, long, long, double))objc_msgSend)(deCls, mk, 12, 0x40, 0.05);
+                if (ev) {
+                    void (^done)(id) = ^(id err) { /* 不捕获任何对象 */ };
+                    ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, pd, ev, done);
+                    ALog(@"🏠 home = 设备事件 page12/usage0x40（%lldms）", AXSeqMs() - t0);
+                    return YES;
+                }
+                ALog(@"⚠️ pressHome: deviceEvent 构造失败，回退按键");
+            } @catch (NSException *e) {
+                ALog(@"⚠️ pressHome: deviceEvent 异常 %@，回退按键", e.reason);
+            }
+        }
+    }
+
     Class scrCls = NSClassFromString(@"XCUIScreen");
     if (!scrCls) return NO;
     id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
