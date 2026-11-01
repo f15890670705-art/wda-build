@@ -687,6 +687,28 @@ static BOOL AXTapCore(double x, double y) {
         return NO;
     }
     @try {
+        /* ★★★ 2026-11-02 b90：`...ForCurrentContext` 这一族是**线程局部**的！
+           bootstrap 在启动线程设 0.05（日志回读确实 0.050），但点击跑在控制线程，
+           那一侧的 context 还是默认 **5.000** ⇒ 每笔点击仍然干等 4.5 秒
+           （b89 日志实证：`确认=4477ms err=1`，用户感受就是"按完 HOME 点一下要等 5 秒"）。
+           所以必须在**真正合成事件的那条线程**上再设一次。只设一次，之后跟着线程走。 */
+        static BOOL s_cfmInit = NO;
+        if (!s_cfmInit) {
+            s_cfmInit = YES;
+            SEL s3 = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:");
+            SEL rd = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
+            @try {
+                double before = [gSession respondsToSelector:rd]
+                    ? ((double (*)(id, SEL))objc_msgSend)(gSession, rd) : -1;
+                ((void (*)(id, SEL, double))objc_msgSend)(gSession, s3, 0.05);
+                double after = [gSession respondsToSelector:rd]
+                    ? ((double (*)(id, SEL))objc_msgSend)(gSession, rd) : -1;
+                ALog(@"⚙️ tap 线程确认间隔 %.3f → %.3f（线程局部，bootstrap 那次不算）", before, after);
+            } @catch (NSException *e) {
+                ALog(@"⚠️ tap 线程确认间隔设置失败：%@", e.reason);
+            }
+        }
+
         Class pathCls = NSClassFromString(@"XCPointerEventPath");
         Class recCls = NSClassFromString(@"XCSynthesizedEventRecord");
         if (!pathCls || !recCls) {
@@ -1055,7 +1077,9 @@ extern "C" BOOL AXAgentPressHome(void) {
     /* ★ b89：HID 已经发出去了，就**不要**再走按键通道 —— 那条每次 5.5 秒，
        只会白堵控制线程（用户最恨的"按完 HOME 点一下要等几秒"）。
        只有 HID 连符号都拿不到（hidSent=NO）才用按键兜底。 */
-    if (hidSent) { ALog(@"🏠 home 已由 HID 直发（跳过按键盘通道）"); return YES; }
+    /* ★ b90：HID 直发成功后也要把会话目标切到 SpringBoard —— b89 在这里直接 return，
+       漏掉了预热，回到桌面后第一笔点击要重新认目标（日志 4477ms 就是这么来的）。 */
+    if (hidSent) { ALog(@"🏠 home 已由 HID 直发（跳过按键盘通道，预热 SpringBoard）"); AXWarmSpringboard(); return YES; }
 
     Class scrCls = NSClassFromString(@"XCUIScreen");
     if (!scrCls) return NO;
