@@ -5,9 +5,12 @@ import Network
 import Darwin
 
 enum BuildInfo {
-    static let version = "2.0"
-    static let build = "74"
-    static let tag = "v2.0-b77"
+    /* ★ 2026-11-02：以前 version/build/tag 全是写死的（"2.0"/"74"/"v2.0-b77"），
+       构建号一直涨、ping 回来的 tag 却永远停在 b77，排查时分不清你装的是哪一版。
+       改成运行时读 Info.plist（由 project.yml 注入），以后 ping 就是真实版本。 */
+    static let version = Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "?"
+    static let build   = Bundle.main.infoDictionary?["CFBundleVersion"] as? String ?? "?"
+    static var tag: String { "v\(version)-b\(build)" }
 }
 
 /// 文件日志：所有输出同步写入 Documents/axtouch.log（PC 端通过 house_arrest/AFC 随时拉取）
