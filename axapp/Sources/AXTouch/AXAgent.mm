@@ -3932,7 +3932,14 @@ static void AXTouchCommit(void) {
         int k = g_tpn[s];
         if (k <= 0) { AXTouchReset(); return; }
         if (k <= 2) {
-            AXTapCore(g_tpts[s][0].x, g_tpts[s][0].y);
+            /* ★★★ b92：**投屏的点击是从这里进的**（PC 发 DOWN/MOVE/UP 分片 → AXTouchCommit），
+               不经过 AXAgentTap —— b91 把 HID 开关接在了 AXAgentTap 上，所以一直没生效。
+               单点判定（k<=2）就按一下，直接走 HID，0ms 且不受 XCTest 确认拖累。 */
+            if (g_hidTapOn != 0 && AXAgentHIDTap(g_tpts[s][0].x, g_tpts[s][0].y)) {
+                /* 日志由 AXAgentHIDTap 打，这里不重复 */
+            } else {
+                AXTapCore(g_tpts[s][0].x, g_tpts[s][0].y);
+            }
         } else {
             double xy[AX_TP_MAX * 2];
             double tt[AX_TP_MAX];
