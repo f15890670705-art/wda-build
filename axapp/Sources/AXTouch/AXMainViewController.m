@@ -178,6 +178,9 @@ static NSString *AXLanIP(void) {
 /* ★ 2026-11-01 发烫定位：分段跑下拉框（0 正常 / 1 只截图 / 2 截图+缩放 / 3 只编码 / 4 空转） */
 @property (nonatomic, strong) UIButton *benchBtn;
 @property (nonatomic, assign) NSInteger benchSel;
+/* ★ 解码路径：0 = 全解+CGContext（默认） 1 = ImageIO thumbnail（解码阶段直接缩，省 CPU） */
+@property (nonatomic, strong) UIButton *decodeBtn;
+@property (nonatomic, assign) NSInteger decodeSel;
 @property (nonatomic, strong) UIButton *rebuildBtn;
 @property (nonatomic, strong) NSTimer *timer;
 @property (nonatomic, assign) BOOL burstRunning;
@@ -203,6 +206,8 @@ static NSString *AXLanIP(void) {
 - (void)selectScheme:(NSInteger)i;
 - (void)refreshBenchButton;
 - (void)selectBench:(NSInteger)m;
+- (void)refreshDecodeButton;
+- (void)selectDecode:(NSInteger)m;
 - (void)autoStartStreamIfNeeded;
 - (void)didTapEditUDID;
 - (void)didTapShot;
@@ -580,6 +585,32 @@ static NSString *AXLanIP(void) {
     [self.cardControl addSubview:self.benchBtn];
     [self refreshBenchButton];
 
+    /* ★ 2026-11-01 解码路径：档1（只截图）不烫、档2（到缩放）烫 ⇒ 热源在「全解 3.6MP + 重采样」。
+       thumbnail 让 ImageIO 在解码阶段就按目标长边出图（JPEG 走 DCT scaling），
+       省掉整幅全解 + CGContextDrawImage 重采样这一大坨 CPU。可切回对比。 */
+    UILabel *decodeLabel = [UILabel new];
+    decodeLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    decodeLabel.text = @"解码路径（省CPU对比）";
+    decodeLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    decodeLabel.textColor = ATSubText();
+    [self.cardControl addSubview:decodeLabel];
+
+    self.decodeBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    self.decodeBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    self.decodeBtn.backgroundColor = ATCard();
+    self.decodeBtn.layer.cornerRadius = 10;
+    self.decodeBtn.layer.borderWidth = 0.5;
+    self.decodeBtn.layer.borderColor = ATDivider().CGColor;
+    self.decodeBtn.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    self.decodeBtn.contentEdgeInsets = UIEdgeInsetsMake(0, 12, 0, 12);
+    self.decodeBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    [self.decodeBtn setTitleColor:ATText() forState:UIControlStateNormal];
+    self.decodeBtn.showsMenuAsPrimaryAction = YES;
+    [self.cardControl addSubview:self.decodeBtn];
+    /* 引擎默认走 GPU（2026-11-01），这里跟着显示 */
+    self.decodeSel = 2;
+    [self refreshDecodeButton];
+
     [NSLayoutConstraint activateConstraints:@[
         [badge.topAnchor     constraintEqualToAnchor:self.cardControl.topAnchor constant:16],
         [badge.leadingAnchor constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
@@ -609,7 +640,17 @@ static NSString *AXLanIP(void) {
         [self.benchBtn.leadingAnchor  constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
         [self.benchBtn.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
         [self.benchBtn.heightAnchor   constraintEqualToConstant:36],
-        [self.benchBtn.bottomAnchor   constraintEqualToAnchor:self.cardControl.bottomAnchor constant:-16],
+
+        [decodeLabel.topAnchor      constraintEqualToAnchor:self.benchBtn.bottomAnchor constant:14],
+        [decodeLabel.leadingAnchor  constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
+        [decodeLabel.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
+        [decodeLabel.heightAnchor   constraintEqualToConstant:18],
+
+        [self.decodeBtn.topAnchor      constraintEqualToAnchor:decodeLabel.bottomAnchor constant:6],
+        [self.decodeBtn.leadingAnchor  constraintEqualToAnchor:self.cardControl.leadingAnchor constant:16],
+        [self.decodeBtn.trailingAnchor constraintEqualToAnchor:self.cardControl.trailingAnchor constant:-16],
+        [self.decodeBtn.heightAnchor   constraintEqualToConstant:36],
+        [self.decodeBtn.bottomAnchor   constraintEqualToAnchor:self.cardControl.bottomAnchor constant:-16],
     ]];
 }
 
@@ -938,6 +979,52 @@ static NSString *AXLanIP(void) {
     }
     self.statusText.textColor = ATSubText();
     NSLog(@"[bench] 模式 %ld = %@", (long)m, names[m]);
+}
+
+- (void)refreshDecodeButton {
+    NSString *names[] = { @"全解 + CGContext（CPU·最贵）",
+                          @"ImageIO thumbnail（CPU + DCT）",
+                          @"GPU CoreImage（默认·推荐）" };
+    NSInteger m = self.decodeSel;
+    if (m < 0 || m > 2) m = 2;
+    [self.decodeBtn setTitle:[NSString stringWithFormat:@"%@    ▾", names[m]]
+                    forState:UIControlStateNormal];
+
+    __weak typeof(self) ws = self;
+    NSMutableArray *items = [NSMutableArray array];
+    for (NSInteger i = 0; i <= 2; i++) {
+        NSInteger mm = i;
+        UIAction *a = [UIAction actionWithTitle:names[i]
+                                        image:nil
+                                   identifier:nil
+                                    handler:^(UIAction *act) {
+            __strong typeof(ws) ss = ws;
+            if (ss) [ss selectDecode:mm];
+        }];
+        a.state = (i == m) ? UIMenuElementStateOn : UIMenuElementStateOff;
+        [items addObject:a];
+    }
+    self.decodeBtn.menu = [UIMenu menuWithTitle:@"解码路径" children:items];
+}
+
+- (void)selectDecode:(NSInteger)m {
+    NSString *names[] = { @"全解 + CGContext（CPU·最贵）",
+                          @"ImageIO thumbnail（CPU + DCT）",
+                          @"GPU CoreImage（默认·推荐）" };
+    if (m < 0 || m > 2) m = 2;
+    self.decodeSel = m;
+    AXStreamSetDecodeMode((int)m);   /* 立刻生效，下一帧就走新路径 */
+    [self refreshDecodeButton];
+
+    if (m == 2) {
+        self.statusText.text = @"解码已切 GPU（CoreImage）：缩放/色彩转换走 Metal，CPU 只解 JPEG";
+    } else if (m == 1) {
+        self.statusText.text = @"解码已切 thumbnail：解码阶段直接缩，缩放仍在 CPU";
+    } else {
+        self.statusText.text = @"解码已切回全解 + CGContext（最贵，用来对比）";
+    }
+    self.statusText.textColor = ATSubText();
+    NSLog(@"[decode] 路径 %ld = %@", (long)m, names[m]);
 }
 
 /* 进界面即开投屏：按保存的方案启动 */
