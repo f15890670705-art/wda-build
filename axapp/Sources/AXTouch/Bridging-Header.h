@@ -31,6 +31,11 @@ NSString *AXLockdownUDIDResult(void);
 BOOL AXAgentSetAppStateTimeout(double v);
 BOOL AXAgentIsBootstrapping(void);
 BOOL AXAgentPressHome(void);
+BOOL AXAgentHomeHID(long usage);       /* 纯 HID 直发 HOME（0x0C/0x40） */
+BOOL AXAgentHIDTap(double x, double y);        /* HID 直发触摸（point 坐标 → 像素） */
+BOOL AXAgentHIDTouch(double x, double y, int down);
+void AXAgentSetHIDTap(int on);
+int  AXAgentGetHIDTap(void);
 long long AXAgentHomeTest(int mode);   /* 0=pressButton 1=_silent 2=XCUIButtonConsole 3/4=XCDeviceEvent */
 BOOL AXAgentPinch(double cx, double cy, double startGap, double endGap, double dur);
 BOOL AXAgentTypeText(NSString *text);
