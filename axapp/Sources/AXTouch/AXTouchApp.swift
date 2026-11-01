@@ -421,6 +421,13 @@ final class ControlServer {
                     let v = (obj["v"] as? Double) ?? 1.0
                     AXSetEventConfirmInterval(v)
                     resp = "{\"ok\":true,\"cfmto\":\(v)}"
+                case "hometest":
+                    /* {"cmd":"hometest","mode":0..4} —— HOME 四条通路的耗时探针
+                       0=pressButton(对照) 1=_silentPressButton(对照)
+                       2=XCUIButtonConsole 静默按键 3=XCDeviceEvent page12/ACHome 4=XCDeviceEvent page12/Menu */
+                    let hm = (obj["mode"] as? Int) ?? 0
+                    let ms = AXAgentHomeTest(Int32(hm))
+                    resp = "{\"ok\":true,\"mode\":\(hm),\"ms\":\(ms)}"
                 case "stream":
                     /* {"cmd":"stream","op":"start|stop|status"} */
                     let op = (obj["op"] as? String) ?? "status"
