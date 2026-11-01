@@ -438,39 +438,13 @@ static BOOL AXAgentBootstrap(void) {
                 }
             }
 
-            // 12) 把「隐式事件确认间隔」压到 0 —— ★★ 这是「点一下要等、连点第二下没反应」的真凶
-            //     daemon 每合成一笔事件后要等它被确认才算完，默认 **5 秒**；这期间再提交的点击
-            //     只能排队/被丢。日志里 `implicitEventConfirmationInterval = 5.000` 就是它。
-            //   ★ 2026-11-02：原来只调 ...ForCurrentContext:，但我们在 App 里没有 XCTest 的
-            //     case 上下文，`XCTContext.currentContext` 恒为 nil → 抛 "Current context must
-            //     not be nil"（日志里那条 ❌ 就是它）⇒ **这个设置从来没成功过**，一直跑默认 5s。
-            //     框架里还有个 ...WithoutSideEffects: 版本不需要上下文，用它；设完再读回来确认。
-            {
-                SEL si2 = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:");
-                if ([session respondsToSelector:si2]) {
-                    @try {
-                        void (*fp)(id, SEL, double) = (void (*)(id, SEL, double))objc_msgSend;
-                        fp(session, si2, 0.0);
-                        double now = -1;
-                        SEL rd = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
-                        if ([session respondsToSelector:rd]) {
-                            double (*rf)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
-                            now = rf(session, rd);
-                        }
-                        ALog(@"  ✅ 隐式事件确认间隔 := 0（WithoutSideEffects），回读 = %.3f", now);
-                    } @catch (NSException *e) { ALog(@"  ❌ setImplicit(WithoutSideEffects): %@", e.reason); }
-                } else {
-                    ALog(@"  ⚠️ 没有 WithoutSideEffects 版本，退回带上下文那个");
-                    SEL si = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContext:");
-                    if ([session respondsToSelector:si]) {
-                        @try {
-                            void (*fp)(id, SEL, double) = (void (*)(id, SEL, double))objc_msgSend;
-                            fp(session, si, 0.0);
-                            ALog(@"  ✅ implicitEventConfirmationInterval := 0");
-                        } @catch (NSException *e) { ALog(@"  ❌ setImplicit: %@", e.reason); }
-                    }
-                }
-            }
+            // 12) 隐式事件确认间隔：**不再尝试修改**（原来那句必然抛 "Current context must not be nil"）
+            //   ★★ 2026-11-02 血泪：用 setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:
+            //     把它设成 0 **确实生效**（日志回读 = 0.000），但生效之后**每次点击都让进程直接闪退**
+            //     （01:41:06 提交 tap → 进程没了，没有任何异常日志）。XCTest 在这个值为 0 时会同步去
+            //     确认事件，内部状态没准备好就同归于尽。
+            //   ⇒ 保持默认 5s 不动。上面第 9 步已经把当前值打进日志，真要治「点一下要等」，
+            //     只能从减少 daemon 竞争 / 换采集通路入手，不要再碰这个开关。
 
             // 13) FBConfiguration setWaitForIdleTimeout:0
             Class fbCls = NSClassFromString(@"FBConfiguration");
@@ -581,11 +555,8 @@ static BOOL AXTapCore(double x, double y) {
 
         // completion 块绝不能捕获任何 ObjC 对象（__block 变量在函数返回后会失效，
         // XPC 回调再来时 objc_retain 野指针直接 SIGSEGV —— b35/b36 就是这个崩的）
-        // ★ 但 err 是入参，用它打印是安全的 —— daemon 拒绝执行事件时会从这里回来，
-        //   这正是「点了没反应」最直接的证据（以前这个块是空的，什么都看不到）。
-        void (^completion)(id) = ^(id err) {
-            if (err) ALogShim(@"❌ tap 合成被 daemon 拒绝: %@", err);
-        };
+        // ★ b77 曾在这里加过 if (err) ALogShim(...)，b79 撤回：保持空块最安全。
+        void (^completion)(id) = ^(id err) { /* 空，只为满足 ABI */ };
         SEL syn = NSSelectorFromString(@"synthesizeEvent:completion:");
         if (![gSession respondsToSelector:syn]) {
             ALog(@"❌ tap：daemonSession 无 synthesizeEvent:completion:");
