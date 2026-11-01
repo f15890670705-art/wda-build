@@ -565,9 +565,44 @@ static BOOL AXTapCore(double x, double y) {
         /* b77 曾在这里等 daemon 手上那张截图回来（≤80ms），后来证明真因不是 daemon 忙，
            而是 implicitEventConfirmationInterval=5s 没设成 0（见 bootstrap 第 12 步）。
            那 80ms 等待反而给每一下点击加了延迟，已撤掉。 */
+
+        /* ★★ 2026-11-02「连点要等」的正解：**逐次**传隐式确认间隔，不动全局。
+           背景：daemon 合成一笔事件后要等它被确认才算完，默认 **5 秒**（日志里
+           `implicitEventConfirmationInterval = 5.000`）。这期间提交的新点击只能排队，
+           表现就是「两次点击之间必须有间隔」。
+           走不通的两条路（都已验证）：
+             · 全局 setImplicitEventConfirmationIntervalForCurrentContext:（无 case 上下文 → 抛异常，从没成功过）
+             · 全局 ...WithoutSideEffects: 设 0（b78，回读确实 0.000，但**一点击就闪退**）
+           现在用的是 XCTest 内部那个**带 per-call 参数**的重载：
+             _XCT_synthesizeEvent:implicitConfirmationInterval:completion:
+           它每次调用单独指定等待上限，不改全局状态，也不会塞 0 进去。
+           确认没按时回来时框架自己会 "treating as non-fatal and continuing"，不会卡死。
+           逐次间隔取 0.15s：足够让系统回报一次确认，又远小于 5s，连点不再互相排队。 */
+        static int s_synMode = -1;   /* -1=未探测  0=普通入口  1=带间隔重载 */
+        SEL syn2 = NSSelectorFromString(@"_XCT_synthesizeEvent:implicitConfirmationInterval:completion:");
+        if (s_synMode < 0) {
+            s_synMode = ([gSession respondsToSelector:syn2] ? 1 : 0);
+            if (s_synMode == 1) {
+                ALog(@"🧷 合成事件走「逐次确认间隔」重载（interval=0.150s）");
+            } else {
+                ALog(@"🧷 合成事件无逐次间隔重载，退回普通入口（确认间隔=全局 5s）");
+            }
+        }
         void (*fp4)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
+        void (*fp5)(id, SEL, id, double, id) = (void (*)(id, SEL, id, double, id))objc_msgSend;
         long long synT0 = AXSeqMs();
-        fp4(gSession, syn, rec, completion);
+        if (s_synMode == 1) {
+            @try {
+                fp5(gSession, syn2, rec, 0.15, completion);
+            } @catch (NSException *e) {
+                /* 有了就崩/抛异常 → 永久退回普通入口，别再拿点击去试 */
+                s_synMode = 0;
+                ALog(@"❌ 逐次间隔重载异常（%@），退回普通入口", e.reason);
+                fp4(gSession, syn, rec, completion);
+            }
+        } else {
+            fp4(gSession, syn, rec, completion);
+        }
         long long synMs = AXSeqMs() - synT0;
         /* 合成调用本身若很慢（>100ms），说明卡在 daemon 或 CPU 被采集循环占满 */
         if (synMs > 100) ALog(@"⏱ tap 合成耗时 %lldms（CPU 忙/daemon 慢）", synMs);
