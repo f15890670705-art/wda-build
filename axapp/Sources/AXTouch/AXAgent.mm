@@ -143,8 +143,71 @@ extern "C" void ALogShim(NSString *fmt, ...) {
 
 #pragma mark - 动态调用小工具
 
+/* ★★ 关掉 XCTest 的「等 App 空闲（quiescence）」—— 2026-11-02
+   现象：点击修好后，HOME（XCUIDevice.pressButton:）每次还要 **5.5 秒**，滑动也卡。
+      日志证据：`🏠 pressHome 已发送` 相邻间隔 02:43:48.993 → 54.534 → 00.070 → 05.599，
+      正好每次 5.5s —— 这是 XCTest 的 quiescence 超时（默认 5s）在等「App 闲下来」。
+      目标 App 只要一直在动（视频/动画/游戏），就永远等满 5 秒。
+   做法：把 XCUIAutomation 里这几个判定「跳过/立即空闲」的方法直接换实现：
+      -[XCUIApplicationProcess waitForQuiescenceIncludingAnimationsIdle:isPreEvent:]  → 立即返回 YES
+      -[XCUIApplicationProcess waitForQuiescenceIncludingAnimationsIdle:]            → 立即返回 YES
+      -[XCUIApplicationProcess shouldSkipPreEventQuiescence] / ShouldSkipPost...     → 返回 YES
+   这些方法名是从包内 XCUIAutomation 的符号表里捞出来的，找不到就跳过并打日志。 */
+static BOOL AXQuiYes2(id self, SEL _cmd, BOOL a, BOOL b) { return YES; }
+static BOOL AXQuiYes1(id self, SEL _cmd, BOOL a) { return YES; }
+static BOOL AXQuiYes0(id self, SEL _cmd) { return YES; }
+
+static void AXInstallQuiescenceKiller(void) {
+    Class cls = NSClassFromString(@"XCUIApplicationProcess");
+    if (!cls) { ALog(@"  ⚠️ 无 XCUIApplicationProcess，跳过 idle 补丁"); return; }
+    struct { const char *name; IMP imp; } tbl[] = {
+        {"waitForQuiescenceIncludingAnimationsIdle:isPreEvent:", (IMP)AXQuiYes2},
+        {"waitForQuiescenceIncludingAnimationsIdle:",           (IMP)AXQuiYes1},
+        {"shouldSkipPreEventQuiescence",                        (IMP)AXQuiYes0},
+        {"shouldSkipPostEventQuiescence",                       (IMP)AXQuiYes0},
+    };
+    for (int i = 0; i < (int)(sizeof(tbl) / sizeof(tbl[0])); i++) {
+        SEL s = NSSelectorFromString([NSString stringWithUTF8String:tbl[i].name]);
+        Method m = class_getInstanceMethod(cls, s);
+        if (!m) { ALog(@"  ⚠️ 无 -%s（跳过）", tbl[i].name); continue; }
+        method_setImplementation(m, tbl[i].imp);
+        ALog(@"  ✅ 关闭 -%s", tbl[i].name);
+    }
+}
+
 /* 定义在文件后部（录屏探针那节），这里先声明 */
 static void AXDumpClass(NSString *name);
+
+/* ★ 2026-11-02：查一个 selector **到底在哪个类上**。
+   起因：AScript 里出现了 `_XCT_synthesizeEvent:implicitConfirmationInterval:completion:`，
+   而我们打在 `[XCTRunnerDaemonSession sharedSession]` 上直接 unrecognized selector。
+   说明这个方法不在那个类 —— 遍历所有已加载的类，把实现它的类名打出来，
+   下一版就能打到正确的对象上。 */
+static void AXFindSelectorOwners(const char *selName) {
+    SEL s = NSSelectorFromString([NSString stringWithUTF8String:selName]);
+    if (!s) { ALog(@"  🔍 %s: selector 无效", selName); return; }
+    int cnt = objc_getClassList(NULL, 0);
+    if (cnt <= 0) { ALog(@"  🔍 %s: 拿不到类列表", selName); return; }
+    Class *buf = (Class *)malloc(sizeof(Class) * (size_t)cnt);
+    if (!buf) return;
+    cnt = objc_getClassList(buf, cnt);
+    int found = 0;
+    for (int i = 0; i < cnt; i++) {
+        Class c = buf[i];
+        if (!c) continue;
+        if (class_getInstanceMethod(c, s)) {
+            ALog(@"  🔍 %s → 实例方法 @ %s", selName, class_getName(c));
+            found++;
+        }
+        if (class_getClassMethod(c, s)) {
+            ALog(@"  🔍 %s → 类方法 @ %s", selName, class_getName(c));
+            found++;
+        }
+        if (found >= 8) break;
+    }
+    if (!found) ALog(@"  🔍 %s → 没有任何类实现", selName);
+    free(buf);
+}
 
 static void AXCallVoid(id obj, NSString *selName) {
     SEL sel = NSSelectorFromString(selName);
@@ -454,6 +517,20 @@ static BOOL AXAgentBootstrap(void) {
                 }
             }
 
+            // 9e) 关掉「等 App 空闲」—— HOME / 滑动的 5 秒就耗在这上面（详见 AXInstallQuiescenceKiller 注释）
+            AXInstallQuiescenceKiller();
+
+            // 9f) 这几个私有入口到底挂在哪个类上（我们打在 daemonSession 上是 unrecognized selector，
+            //     说明类打错了；AScript 能用，它必然是打在对的对象上）
+            AXFindSelectorOwners("_XCT_synthesizeEvent:implicitConfirmationInterval:completion:");
+            AXFindSelectorOwners("_XCT_synthesizeEvent:completion:");
+            AXFindSelectorOwners("_silentPressButton:");
+            /* 也有可能它根本不是 ObjC 方法，而是一个 C 函数（XCTestCore 里带这串名字） */
+            {
+                void *fpC = dlsym(RTLD_DEFAULT, "_XCT_synthesizeEvent");
+                ALog(@"  🔍 dlsym _XCT_synthesizeEvent -> %p", fpC);
+            }
+
             gReady = YES;
             gLastError = nil;
             ALog(@"✅ 会话就绪（gReady=YES）");
@@ -756,8 +833,21 @@ extern "C" BOOL AXAgentPressHome(void) {
     if (!dev) { ALog(@"❌ pressHome: 无 device"); return NO; }
     SEL pb = NSSelectorFromString(@"pressButton:");
     if (![dev respondsToSelector:pb]) { ALog(@"❌ pressHome: 无 pressButton:"); return NO; }
+    long long phT0 = AXSeqMs();
+    /* ★★ 2026-11-02 照 AScript 的做法：优先用**静默版** `_silentPressButton:`。
+       普通 pressButton: 会等 App 空闲（quiescence，默认 5 秒），目标 App 一直在动就每次等满，
+       实测日志里相邻两次 pressHome 正好 5.5 秒。静默版不走那套等待。
+       框架符号表里确实有 -[XCUIDevice _silentPressButton:] 与 -[XCUIButtonConsole _silentlyPressButton:forDuration:]。 */
+    SEL spb = NSSelectorFromString(@"_silentPressButton:");
+    static BOOL s_silentLogged = NO;
+    if ([dev respondsToSelector:spb]) {
+        ((void (*)(id, SEL, long))objc_msgSend)(dev, spb, 1);   /* XCUIDeviceButtonHome = 1 */
+        if (!s_silentLogged) { s_silentLogged = YES; ALog(@"🏠 走 _silentPressButton:（不等空闲）"); }
+        ALog(@"🏠 pressHome 已发送（静默版，耗时 %lldms）", AXSeqMs() - phT0);
+        return YES;
+    }
     ((void (*)(id, SEL, long))objc_msgSend)(dev, pb, 1);   /* XCUIDeviceButtonHome = 1 */
-    ALog(@"🏠 pressHome 已发送");
+    ALog(@"🏠 pressHome 已发送（普通版，调用耗时 %lldms）", AXSeqMs() - phT0);
     return YES;
 }
 
