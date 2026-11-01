@@ -341,6 +341,18 @@ final class ControlServer {
                     resp = "{\"ok\":true,\"udid\":\"\(cur)\"}"
                 case "home":
                     resp = "{\"ok\":\(AXAgentPressHome())}"
+                case "hidtap":
+                    /* {"cmd":"hidtap","on":1}  开 HID 触摸（0ms，不走 XCTest）
+                       {"cmd":"hidtap"}         查当前状态
+                       {"cmd":"hidtap","on":1,"x":120,"y":300}  顺便点一下（point 坐标） */
+                    if let onv = obj["on"] as? Int {
+                        AXAgentSetHIDTap(Int32(onv))
+                    }
+                    var okFlag = true
+                    if let tx = obj["x"] as? Double, let ty = obj["y"] as? Double {
+                        okFlag = AXAgentHIDTap(tx, ty)
+                    }
+                    resp = "{\"ok\":\(okFlag),\"hidtap\":\(AXAgentGetHIDTap())}"
                 case "devinfo":
                     DispatchQueue.global().async { _ = AXProbeDeviceInfo() }
                     resp = "{\"ok\":true,\"note\":\"结果看 agent.log\"}"
