@@ -22,6 +22,8 @@ targets:
       - sdk: CoreMedia.framework
       - sdk: CoreVideo.framework
       - sdk: ImageIO.framework
+      - sdk: CoreImage.framework
+      - sdk: Metal.framework
       - sdk: Security.framework
       - sdk: ReplayKit.framework
       - sdk: AVFoundation.framework
@@ -32,7 +34,7 @@ targets:
       properties:
         CFBundleDisplayName: hbVideo
         CFBundleShortVersionString: "2.0"
-        CFBundleVersion: "74"
+        CFBundleVersion: "75"
         UIBackgroundModes:
           - audio
           - location
