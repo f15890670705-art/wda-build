@@ -438,14 +438,38 @@ static BOOL AXAgentBootstrap(void) {
                 }
             }
 
-            // 12) setImplicitEventConfirmationIntervalForCurrentContext:0
-            SEL si = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContext:");
-            if ([session respondsToSelector:si]) {
-                @try {
-                    void (*fp)(id, SEL, double) = (void (*)(id, SEL, double))objc_msgSend;
-                    fp(session, si, 0.0);
-                    ALog(@"  ✅ implicitEventConfirmationInterval := 0");
-                } @catch (NSException *e) { ALog(@"  ❌ setImplicit: %@", e.reason); }
+            // 12) 把「隐式事件确认间隔」压到 0 —— ★★ 这是「点一下要等、连点第二下没反应」的真凶
+            //     daemon 每合成一笔事件后要等它被确认才算完，默认 **5 秒**；这期间再提交的点击
+            //     只能排队/被丢。日志里 `implicitEventConfirmationInterval = 5.000` 就是它。
+            //   ★ 2026-11-02：原来只调 ...ForCurrentContext:，但我们在 App 里没有 XCTest 的
+            //     case 上下文，`XCTContext.currentContext` 恒为 nil → 抛 "Current context must
+            //     not be nil"（日志里那条 ❌ 就是它）⇒ **这个设置从来没成功过**，一直跑默认 5s。
+            //     框架里还有个 ...WithoutSideEffects: 版本不需要上下文，用它；设完再读回来确认。
+            {
+                SEL si2 = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:");
+                if ([session respondsToSelector:si2]) {
+                    @try {
+                        void (*fp)(id, SEL, double) = (void (*)(id, SEL, double))objc_msgSend;
+                        fp(session, si2, 0.0);
+                        double now = -1;
+                        SEL rd = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
+                        if ([session respondsToSelector:rd]) {
+                            double (*rf)(id, SEL) = (double (*)(id, SEL))objc_msgSend;
+                            now = rf(session, rd);
+                        }
+                        ALog(@"  ✅ 隐式事件确认间隔 := 0（WithoutSideEffects），回读 = %.3f", now);
+                    } @catch (NSException *e) { ALog(@"  ❌ setImplicit(WithoutSideEffects): %@", e.reason); }
+                } else {
+                    ALog(@"  ⚠️ 没有 WithoutSideEffects 版本，退回带上下文那个");
+                    SEL si = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContext:");
+                    if ([session respondsToSelector:si]) {
+                        @try {
+                            void (*fp)(id, SEL, double) = (void (*)(id, SEL, double))objc_msgSend;
+                            fp(session, si, 0.0);
+                            ALog(@"  ✅ implicitEventConfirmationInterval := 0");
+                        } @catch (NSException *e) { ALog(@"  ❌ setImplicit: %@", e.reason); }
+                    }
+                }
             }
 
             // 13) FBConfiguration setWaitForIdleTimeout:0
@@ -567,14 +591,9 @@ static BOOL AXTapCore(double x, double y) {
             ALog(@"❌ tap：daemonSession 无 synthesizeEvent:completion:");
             return NO;
         }
-        /* ★★ 等 daemon 手上那张截图回来（最多 80ms）再提交手势。
-           daemon 是串行的：20fps 截图每张 20~50ms，合成事件排在后面就要等一整张图；
-           连点时第二下常常就"迟到"或被丢。用户 2026-11-02 反馈的「两次点击之间必须有间隔」
-           根因就在这里。 */
-        {
-            long long wt0 = AXSeqMs();
-            while (g_grabBusy && (AXSeqMs() - wt0) < 80) usleep(2 * 1000);
-        }
+        /* b77 曾在这里等 daemon 手上那张截图回来（≤80ms），后来证明真因不是 daemon 忙，
+           而是 implicitEventConfirmationInterval=5s 没设成 0（见 bootstrap 第 12 步）。
+           那 80ms 等待反而给每一下点击加了延迟，已撤掉。 */
         void (*fp4)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
         long long synT0 = AXSeqMs();
         fp4(gSession, syn, rec, completion);
@@ -1934,13 +1953,10 @@ static volatile int    g_decodeThumb = 2;     /* 「第二步」解码+缩放走
                                                  热点就在这一步，默认改成 GPU 让 Metal 扛缩放和色彩转换。 */
 static volatile int    g_inputKick   = 0;
 static volatile long long g_capPauseUntil = 0;  /* 到此时刻前暂停抓图，先把 daemon 让给合成事件 */
-static volatile int    g_capPauseMs  = 60;      /* 停采时长（0=关闭该策略）
-                                                   ★ 2026-11-02 改回 60（用户反馈「连点第二下没反应」）。
-                                                   2026-10-31 关掉它的理由是"手势合成只要 0~1ms" —— 但那个
-                                                   数字量的是 synthesizeEvent 这个 XPC 调用的**返回耗时**，
-                                                   不是 daemon **真正执行**事件的耗时。daemon 是串行的：
-                                                   20fps 截图每张 20~50ms，队列基本占满，合成事件只能排队。
-                                                   提交完让 60ms 出来给它执行，连点才不会被吃掉。 */
+static volatile int    g_capPauseMs  = 0;       /* 停采时长（0=关闭）
+                                                   b77 曾改成 60（当时以为是 daemon 被截图占满导致连点被挤），
+                                                   后来日志证明真因是 implicitEventConfirmationInterval=5s
+                                                   没设成 0 —— 见 bootstrap 第 12 步。这里回退到 0。 */
 static volatile int    g_staticDrop  = 0;     /* ★ 2026-10-31 用户决定：默认关闭。
                                                  理由：静止降帧会让「静止画面上点一下」永远要等下一帧
                                                  （下限 2fps 时就是最多 500ms 才看到反应），而投屏的
@@ -3357,10 +3373,6 @@ static void AXTouchCommit(void) {
             AXGestureCore(xy, tt, k);
         }
         AXTouchReset();
-        /* ★ 单指这条以前直接 return，把下面那句「提交后停采」跳过了 ——
-           等于 g_capPauseMs 对点击从来就没生效过（只有双指才设）。这里补上：
-           提交完让 daemon 有 60ms 把事件执行完，连点第二下才不会被截图挤掉。 */
-        if (g_capPauseMs > 0) g_capPauseUntil = AXSeqMs() + g_capPauseMs;
         return;
     }
 
