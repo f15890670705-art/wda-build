@@ -733,10 +733,10 @@ static BOOL AXTapCore(double x, double y) {
             @try {
                 double before = [gSession respondsToSelector:rd]
                     ? ((double (*)(id, SEL))objc_msgSend)(gSession, rd) : -1;
-                ((void (*)(id, SEL, double))objc_msgSend)(gSession, s3, 0.05);
+                ((void (*)(id, SEL, double))objc_msgSend)(gSession, s3, 0.02);
                 double after = [gSession respondsToSelector:rd]
                     ? ((double (*)(id, SEL))objc_msgSend)(gSession, rd) : -1;
-                ALog(@"⚙️ tap 线程确认间隔 %.3f → %.3f（线程局部，bootstrap 那次不算）", before, after);
+                ALog(@"⚙️ tap 线程确认间隔 %.3f → %.3f（b96 降到 0.02，实测 0.05 仍要 ~325ms）", before, after);
             } @catch (NSException *e) {
                 ALog(@"⚠️ tap 线程确认间隔设置失败：%@", e.reason);
             }
@@ -753,11 +753,18 @@ static BOOL AXTapCore(double x, double y) {
         if (s_coordMode != 0) {
             @try {
                 NSString *bid = AXFrontBundleID();
+                /* ★★★ b97：查到空就**用 SpringBoard 兜底**，绝不放弃。
+                   b95/b96 在这里 `if (bid.length && ...)` 直接跳过 ⇒ app-coord 一次都没跑过。
+                   SpringBoard 是"系统级"页面：它的归一化坐标就是整屏坐标，事件由系统按
+                   屏幕坐标路由给当前前台 App，同时 daemon 的目标也变成 SpringBoard ——
+                   HOME 之后前台正是它，所以那笔事件不用再等"后台的 hbVideo"确认。
+                   ★ 查不到前台时也无脑用它：比绑死在后台的自己强。 */
+                if (!bid.length) bid = @"com.apple.springboard";
                 Class appCls = NSClassFromString(@"XCUIApplication");
                 SEL ini = NSSelectorFromString(@"initWithBundleIdentifier:");
                 SEL cno = NSSelectorFromString(@"coordinateWithNormalizedOffset:");
                 SEL tapSel = NSSelectorFromString(@"tap");
-                id app = (bid.length && appCls && [appCls instancesRespondToSelector:ini])
+                id app = (appCls && [appCls instancesRespondToSelector:ini])
                     ? ((id (*)(id, SEL, id))objc_msgSend)([appCls alloc], ini, bid) : nil;
                 if (app && [app respondsToSelector:cno]) {
                     UIScreen *us = [UIScreen mainScreen];
@@ -781,7 +788,6 @@ static BOOL AXTapCore(double x, double y) {
                 ALog(@"⚠️ app-coord 异常 %@，回退 synthesizeEvent", e.reason);
             }
         }
-
         Class pathCls = NSClassFromString(@"XCPointerEventPath");
         Class recCls = NSClassFromString(@"XCSynthesizedEventRecord");
         if (!pathCls || !recCls) {
@@ -1260,6 +1266,22 @@ extern "C" BOOL AXAgentPressHome(void) {
        所以这里**不独占**：HID 发完继续把会话版也发一次，用它兜住"HID 没权限"的情况。
        两次 HOME 连发没有副作用（已经在桌面时再按一次还是桌面）。 */
     BOOL hidSent = AXAgentHomeHID(0x40);
+
+    /* ★★★ b96/b97：HOME 之后**主动打一笔 dummy 点击**，把"认目标"的 5 秒在后台吃掉。
+       用户按 HOME 之后要看一下桌面才去点图标，这几秒本来就闲着 —— 让 daemon 在这段时间里
+       把"目标从后台的 hbVideo 换成 SpringBoard"这件事做完，真正点击时就不用等。
+       落点 (2,2) 是状态栏最左边，没有可点元素，副作用仅仅是可能滚回顶部。
+       ★ 另一条 AXWarmSpringboard（读 XCUIApplication.state）也保留，先建会话再打点。 */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(250 * NSEC_PER_MSEC)),
+                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        AXWarmSpringboard();
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)),
+                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+            long long t0 = AXSeqMs();
+            AXTapCore(2.0, 2.0);          /* dummy：不吃用户操作，只用来把目标认好 */
+            ALog(@"🏠 dummy 预热完成（%lldms）", AXSeqMs() - t0);
+        });
+    });
 
     /* ★★★ 2026-11-02 定案：HOME 走**硬件设备事件**，实测提交 0~1ms、用户已确认能回桌面。
        为什么不用 pressButton:：那条走 XPC + 空闲等待，实测每次 5.3~5.5 秒
