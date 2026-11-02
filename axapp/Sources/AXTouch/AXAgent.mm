@@ -598,7 +598,7 @@ static BOOL AXAgentBootstrap(void) {
                         SEL satc = NSSelectorFromString(@"setActiveTestConfiguration:");
                         if ([cfgCls respondsToSelector:satc]) {
                             ((void (*)(id, SEL, id))objc_msgSend)(cfgCls, satc, cfg);
-                            id back = fp(cfgCls, atc);
+                            id back = ((id (*)(id, SEL))objc_msgSend)(cfgCls, atc);
                             ALog(@"  ✅ setActiveTestConfiguration 已设置，回读 %@", back ? @"非空" : @"仍是 nil");
                         } else {
                             ALog(@"  ⚠️ XCTestConfiguration 无 setActiveTestConfiguration:");
