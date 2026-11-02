@@ -939,21 +939,40 @@ extern "C" BOOL AXAgentHomeHID(long usage) {
    根因是 XCTest 的事件通道要"目标 App 在场确认"，而我们的会话目标固定是 hbVideo 自己。
    HID 这条不走测试框架：IOHIDEventCreateDigitizerFingerEvent → hand 容器 →
    IOHIDEventSystemClientDispatchEvent，事件直接进系统触摸流，没有确认、没有目标、0 等待。
-   ★ 坐标：XCPointerEventPath 用 point，HID digitizer 用**屏幕像素** ⇒ × nativeScale。 */
+   ★ 坐标：XCPointerEventPath 用 point，HID digitizer 用**屏幕像素** ⇒ × nativeScale。
+
+   ★★★ b93 修正两处**函数签名错误**（对照 rpcclient / ZXTouch 的 ctypes 定义核过）：
+     IOHIDEventCreateDigitizerEvent(alloc, ts, type, index, identityMask, eventMask,
+         childEventMask, x, y, z, tipPressure, barrelPressure, range, touch, options)   ← 15 个
+     IOHIDEventCreateDigitizerFingerEvent(alloc, ts, index, identity, eventMask, buttonMask,
+         x, y, z, tipPressure, twist, range, touch, options)                            ← 14 个
+   b91 的 finger 少写了 buttonMask、父事件多写了一个 isAbsolute ⇒ 后面 x/y/pressure
+   整体错位，事件发出去也不是"一个点在 (x,y) 的触摸"，系统直接无视。
+   还补上关键的 kIOHIDEventFieldDigitizerIsDisplayIntegrated=1（不设这标记，系统不认这是屏幕触摸）。 */
 typedef void *(*AXHIDDigitizerFn)(CFAllocatorRef, uint64_t, int, uint32_t, uint32_t,
-                                  uint32_t, uint32_t, double, double, double, double,
-                                  double, int, int, uint32_t, int);
+                                  uint32_t, uint32_t, double, double, double,
+                                  double, double, int, int, int);
 typedef void *(*AXHIDFingerFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, uint32_t,
-                               double, double, double, double, double, int, int, int);
+                               uint32_t, double, double, double, double,
+                               double, int, int, int);
 typedef void  (*AXHIDAppendFn)(void *, void *);
 typedef void  (*AXHIDDispatchFn)(void *, void *);
 typedef void *(*AXHIDClientFn)(CFAllocatorRef);
+typedef void  (*AXHIDSetIntFn)(void *, uint32_t, int64_t);
+typedef void  (*AXHIDSetFloatFn)(void *, uint32_t, double);
+
+/* IOHIDEventField（digitizer 基址 0x000B0000） */
+static const uint32_t kAxFieldMajorRadius  = 0x000B0014;
+static const uint32_t kAxFieldMinorRadius  = 0x000B0015;
+static const uint32_t kAxFieldDisplayInteg = 0x000B001A;
 
 static void *g_tchClient   = NULL;
 static AXHIDFingerFn    fFingerEvt  = NULL;
 static AXHIDDigitizerFn fHandEvt    = NULL;
 static AXHIDAppendFn    fEvtAppend  = NULL;
 static AXHIDDispatchFn  fEvtDispatch = NULL;
+static AXHIDSetIntFn    fEvtSetInt   = NULL;
+static AXHIDSetFloatFn  fEvtSetFloat = NULL;
 static int  g_hidTouchInit = 0;      /* 0=未试 1=可用 -1=不可用 */
 /* g_hidTapOn 定义在文件前段（AXAgentTap 要用） */
 
@@ -967,14 +986,55 @@ static int AXHIDTouchInit(void) {
     fHandEvt     = (AXHIDDigitizerFn)dlsym(scope, "IOHIDEventCreateDigitizerEvent");
     fEvtAppend   = (AXHIDAppendFn)dlsym(scope, "IOHIDEventAppendEvent");
     fEvtDispatch = (AXHIDDispatchFn)dlsym(scope, "IOHIDEventSystemClientDispatchEvent");
+    fEvtSetInt   = (AXHIDSetIntFn)dlsym(scope, "IOHIDEventSetIntegerValue");
+    fEvtSetFloat = (AXHIDSetFloatFn)dlsym(scope, "IOHIDEventSetFloatValue");
     if (fCli) g_tchClient = fCli(kCFAllocatorDefault);
-    if (fFingerEvt && fEvtDispatch && g_tchClient) {
+    if (fFingerEvt && fEvtDispatch && fHandEvt && g_tchClient) {
         g_hidTouchInit = 1;
     }
-    ALog(@"🔧 HID 触摸初始化：client=%p finger=%p hand=%p append=%p dispatch=%p → %s",
+    UIScreen *sc = [UIScreen mainScreen];
+    ALog(@"🔧 HID 触摸初始化：client=%p finger=%p hand=%p append=%p dispatch=%p setint=%p "
+         "屏=%dx%d scale=%.2f → %s",
          g_tchClient, (void *)fFingerEvt, (void *)fHandEvt, (void *)fEvtAppend,
-         (void *)fEvtDispatch, g_hidTouchInit == 1 ? "可用" : "不可用");
+         (void *)fEvtDispatch, (void *)fEvtSetInt,
+         sc ? (int)sc.bounds.size.width : 0, sc ? (int)sc.bounds.size.height : 0,
+         sc ? (double)sc.nativeScale : 0,
+         g_hidTouchInit == 1 ? "可用" : "不可用");
     return g_hidTouchInit;
+}
+
+/* 发一个手指状态。hand=父事件（container），finger=子事件。
+   形状照 ZXTouch：父 index=99 / identityMask=1 / eventMask=0 / range=0 / touch=0；
+   子 index=1 / identity=2；mask down=0x07(Range|Touch|Position)、up=0x06(Touch|Position)。 */
+static BOOL AXHIDPostFinger(double px, double py, int down) {
+    uint64_t ts = mach_absolute_time();
+    uint32_t cmask = down ? 0x07u : 0x06u;
+    void *finger = fFingerEvt(kCFAllocatorDefault, ts,
+                              /*index*/ 1, /*identity*/ 2, /*eventMask*/ cmask,
+                              /*buttonMask*/ 0,
+                              px, py, 0.0,
+                              /*tipPressure*/ down ? 0.5 : 0.0,
+                              /*twist*/ 0.0,
+                              /*range*/ down ? 1 : 0, /*touch*/ down ? 1 : 0,
+                              /*options*/ 0);
+    if (!finger) { ALog(@"❌ HID 触摸：finger 构造失败"); return NO; }
+    if (fEvtSetFloat) {
+        fEvtSetFloat(finger, kAxFieldMajorRadius, 0.04);
+        fEvtSetFloat(finger, kAxFieldMinorRadius, 0.04);
+    }
+    void *hand = fHandEvt(kCFAllocatorDefault, ts,
+                          /*type*/ 3 /*Hand*/, /*index*/ 99, /*identityMask*/ 1,
+                          /*eventMask*/ 0, /*childEventMask*/ 0,
+                          0, 0, 0, 0, 0,
+                          /*range*/ 0, /*touch*/ 0, /*options*/ 0);
+    if (!hand) { ALog(@"❌ HID 触摸：hand 构造失败"); return NO; }
+    fEvtAppend(hand, finger);
+    if (fEvtSetInt) {
+        /* ★ 不设这个，系统不认这是「屏幕上的触摸」——这是最常见的坑 */
+        fEvtSetInt(hand, kAxFieldDisplayInteg, 1);
+    }
+    fEvtDispatch(g_tchClient, hand);
+    return YES;
 }
 
 /* down=1 按下 / down=0 抬起。只发 finger，不占控制线程。 */
@@ -984,25 +1044,13 @@ extern "C" BOOL AXAgentHIDTouch(double xPt, double yPt, int down) {
         UIScreen *sc = [UIScreen mainScreen];
         double scale = sc ? (double)sc.nativeScale : 1.0;
         double px = xPt * scale, py = yPt * scale;
-        uint64_t ts = mach_absolute_time();
-        uint32_t mask = down ? 0x03u : 0x03u;   /* Range|Touch 一直带上，靠 range/touch 位表示状态 */
-        void *finger = fFingerEvt(kCFAllocatorDefault, ts, 1, 2, mask,
-                                 px, py, 0.0,
-                                 down ? 1.0 : 0.0, 0.0,
-                                 down ? 1 : 0, down ? 1 : 0, 0);
-        if (!finger) { ALog(@"❌ HID 触摸：finger 事件构造失败"); return NO; }
-        if (fHandEvt && fEvtAppend) {
-            /* type=3 是 Hand，作为容器把手指事件装进去（系统触摸流认这个结构） */
-            void *hand = fHandEvt(kCFAllocatorDefault, ts, 3, 0, 0, mask, 0,
-                                  0, 0, 0, 0, 0, 1, 1, 0, 1);
-            if (hand) {
-                fEvtAppend(hand, finger);
-                fEvtDispatch(g_tchClient, hand);
-                return YES;
-            }
+        static BOOL s_logged = NO;
+        if (!s_logged) {
+            s_logged = YES;
+            ALog(@"👆 HID 首个坐标：pt(%.1f, %.1f) → px(%.1f, %.1f) scale=%.2f",
+                 xPt, yPt, px, py, scale);
         }
-        fEvtDispatch(g_tchClient, finger);
-        return YES;
+        return AXHIDPostFinger(px, py, down);
     } @catch (NSException *e) {
         ALog(@"⚠️ HID 触摸异常：%@", e.reason);
         return NO;
