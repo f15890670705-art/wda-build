@@ -658,6 +658,28 @@ static long long AXSeqMs(void) {
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
+/* ★ 当前前台 App 的 bundleID（SpringBoardServices 私有函数）。
+   b94 失败原因：`coordinateWithNormalizedOffset:` 是 **XCUIElement** 的方法，XCUIScreen 上没有，
+   所以拿不到坐标对象。正确姿势是 GCUIApplication(前台 App).coordinateWithNormalizedOffset →
+   tap：这样坐标落在该 App 的坐标空间里，daemon 的目标也是它，确认不会空等。 */
+static NSString *AXFrontBundleID(void) {
+    static CFStringRef (*fFront)(void) = NULL;
+    static BOOL tried = NO;
+    if (!tried) {
+        tried = YES;
+        void *h = dlopen("/System/Library/PrivateFrameworks/SpringBoardServices.framework/SpringBoardServices",
+                         RTLD_LAZY);
+        if (h) fFront = (CFStringRef (*)(void))dlsym(h, "SBSCopyFrontmostApplicationDisplayIdentifier");
+        ALog(@"🔎 SpringBoardServices frontmost=%p", (void *)fFront);
+    }
+    if (!fFront) return nil;
+    CFStringRef s = fFront();
+    if (!s) return nil;
+    NSString *r = [(__bridge NSString *)s copy];
+    CFRelease(s);
+    return r;
+}
+
 /* ★ HID 触摸通道开关（b91）与入口前置声明：
    AXAgentTap 在文件前段，触摸实现放在 HOME 附近（要用 AXSeqMs/日志），故先声明。 */
 /* ★ b94 默认**关**：b92/b93 实测 HID 的 digitizer 事件被系统静默丢弃（普通 App 进程没有
@@ -730,31 +752,33 @@ static BOOL AXTapCore(double x, double y) {
         static int s_coordMode = -1;   /* -1 未试 / 1 可用 / 0 不可用 */
         if (s_coordMode != 0) {
             @try {
-                Class scrCls2 = NSClassFromString(@"XCUIScreen");
-                SEL mainScr = NSSelectorFromString(@"mainScreen");
+                NSString *bid = AXFrontBundleID();
+                Class appCls = NSClassFromString(@"XCUIApplication");
+                SEL ini = NSSelectorFromString(@"initWithBundleIdentifier:");
                 SEL cno = NSSelectorFromString(@"coordinateWithNormalizedOffset:");
-                id sc2 = (scrCls2 && [scrCls2 respondsToSelector:mainScr])
-                    ? ((id (*)(id, SEL))objc_msgSend)(scrCls2, mainScr) : nil;
-                if (sc2 && [sc2 respondsToSelector:cno]) {
+                SEL tapSel = NSSelectorFromString(@"tap");
+                id app = (bid.length && appCls && [appCls instancesRespondToSelector:ini])
+                    ? ((id (*)(id, SEL, id))objc_msgSend)([appCls alloc], ini, bid) : nil;
+                if (app && [app respondsToSelector:cno]) {
                     UIScreen *us = [UIScreen mainScreen];
                     CGSize sz = us ? us.bounds.size : CGSizeMake(1, 1);
                     double w = sz.width > 0 ? sz.width : 1, h = sz.height > 0 ? sz.height : 1;
                     CGVector off = CGVectorMake(x / w, y / h);
                     long long t0 = AXSeqMs();
-                    id coord = ((id (*)(id, SEL, CGVector))objc_msgSend)(sc2, cno, off);
-                    SEL tapSel = NSSelectorFromString(@"tap");
+                    id coord = ((id (*)(id, SEL, CGVector))objc_msgSend)(app, cno, off);
                     if (coord && [coord respondsToSelector:tapSel]) {
                         ((void (*)(id, SEL))objc_msgSend)(coord, tapSel);
                         s_coordMode = 1;
-                        ALog(@"👆 coord tap(%.1f, %.1f) 同步 %lldms", x, y, AXSeqMs() - t0);
+                        ALog(@"👆 app-coord tap %@ (%.1f,%.1f) 同步 %lldms",
+                             bid, x, y, AXSeqMs() - t0);
                         return YES;
                     }
                 }
                 s_coordMode = 0;
-                ALog(@"⚠️ XCUICoordinate 不可用，回退 synthesizeEvent");
+                ALog(@"⚠️ app-coord 不可用（bid=%@），回退 synthesizeEvent", bid ?: @"nil");
             } @catch (NSException *e) {
                 s_coordMode = 0;
-                ALog(@"⚠️ XCUICoordinate 异常 %@，回退 synthesizeEvent", e.reason);
+                ALog(@"⚠️ app-coord 异常 %@，回退 synthesizeEvent", e.reason);
             }
         }
 
@@ -1209,14 +1233,18 @@ static void AXWarmSpringboard(void) {
             if (!appCls) return;
             SEL ini = NSSelectorFromString(@"initWithBundleIdentifier:");
             if (![appCls instancesRespondToSelector:ini]) return;
-            id app = ((id (*)(id, SEL, id))objc_msgSend)([appCls alloc], ini, @"com.apple.springboard");
+            /* ★ b95：HOME 之后前台就是 SpringBoard。这里**不调 activate**（那会真的切 App、
+               还可能拖长），只读一次 state —— 读 state 就会让 daemon 为这个 App 建立
+               automation session，把"第一笔事件要等 3~5 秒认目标"的成本挪到后台。 */
+            NSString *bid = AXFrontBundleID();
+            if (!bid.length) bid = @"com.apple.springboard";
+            id app = ((id (*)(id, SEL, id))objc_msgSend)([appCls alloc], ini, bid);
             if (!app) return;
             long long t0 = AXSeqMs();
-            SEL act = NSSelectorFromString(@"activate");
-            if ([app respondsToSelector:act]) {
-                ((void (*)(id, SEL))objc_msgSend)(app, act);
-            }
-            ALog(@"🏠 已把会话目标切到 SpringBoard（预热 %lldms）", AXSeqMs() - t0);
+            SEL stSel = NSSelectorFromString(@"state");
+            long st = [app respondsToSelector:stSel]
+                ? ((long (*)(id, SEL))objc_msgSend)(app, stSel) : -1;
+            ALog(@"🏠 SpringBoard 预热完成 bid=%@ state=%ld（%lldms）", bid, st, AXSeqMs() - t0);
         } @catch (NSException *e) {
             ALog(@"⚠️ SpringBoard 预热失败：%@", e.reason);
         }
