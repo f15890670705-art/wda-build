@@ -660,10 +660,11 @@ static long long AXSeqMs(void) {
 
 /* ★ HID 触摸通道开关（b91）与入口前置声明：
    AXAgentTap 在文件前段，触摸实现放在 HOME 附近（要用 AXSeqMs/日志），故先声明。 */
-/* ★ b91 默认**开**：XCTest 那条确认已经确认是残废的（每笔都超时失败），
-   不默认开就等于继续让用户等 4 秒。HID 不可用时 AXAgentHIDTap 返回 NO，自动落回 XCTest。
-   要退回旧路径发一条 {"cmd":"hidtap","on":0} 即可。 */
-static volatile int g_hidTapOn = 1;
+/* ★ b94 默认**关**：b92/b93 实测 HID 的 digitizer 事件被系统静默丢弃（普通 App 进程没有
+   "来源认证"，键盘事件没这道校验所以 HOME 可用），开了等于点击全失效。
+   代码和开关都留着，将来有 senderID/BKSHIDEventSetDigitizerInfo 再启。
+   需要时发 {"cmd":"hidtap","on":1}。 */
+static volatile int g_hidTapOn = 0;
 extern "C" BOOL AXAgentHIDTap(double x, double y);
 extern "C" BOOL AXAgentHIDTouch(double xPt, double yPt, int down);
 
@@ -716,6 +717,44 @@ static BOOL AXTapCore(double x, double y) {
                 ALog(@"⚙️ tap 线程确认间隔 %.3f → %.3f（线程局部，bootstrap 那次不算）", before, after);
             } @catch (NSException *e) {
                 ALog(@"⚠️ tap 线程确认间隔设置失败：%@", e.reason);
+            }
+        }
+
+        /* ★★★ 2026-11-02 b94：先试 **XCUICoordinate.tap**。
+           b91~b93 的 HID 直发在 App 进程里被 backboardd 判"来源无效"（不报错、静默丢弃），
+           键盘事件没这层校验所以 HOME 能用、触摸不能，这条路先放弃。
+           裸 XCSynthesizedEventRecord 的问题是**没有目标 App 上下文**，daemon 的确认永远失败
+           （日志：确认 3000~4000ms、err 一路累加）⇒ 每点一下等 4 秒。
+           XCUICoordinate 走 XCUIElement 那套事件生成器，daemon 能把它归到当前前台 App，
+           这就是 WDA 点击不慢的原因。坐标用「屏幕归一化偏移」，不绑定具体元素。 */
+        static int s_coordMode = -1;   /* -1 未试 / 1 可用 / 0 不可用 */
+        if (s_coordMode != 0) {
+            @try {
+                Class scrCls2 = NSClassFromString(@"XCUIScreen");
+                SEL mainScr = NSSelectorFromString(@"mainScreen");
+                SEL cno = NSSelectorFromString(@"coordinateWithNormalizedOffset:");
+                id sc2 = (scrCls2 && [scrCls2 respondsToSelector:mainScr])
+                    ? ((id (*)(id, SEL))objc_msgSend)(scrCls2, mainScr) : nil;
+                if (sc2 && [sc2 respondsToSelector:cno]) {
+                    UIScreen *us = [UIScreen mainScreen];
+                    CGSize sz = us ? us.bounds.size : CGSizeMake(1, 1);
+                    double w = sz.width > 0 ? sz.width : 1, h = sz.height > 0 ? sz.height : 1;
+                    CGVector off = CGVectorMake(x / w, y / h);
+                    long long t0 = AXSeqMs();
+                    id coord = ((id (*)(id, SEL, CGVector))objc_msgSend)(sc2, cno, off);
+                    SEL tapSel = NSSelectorFromString(@"tap");
+                    if (coord && [coord respondsToSelector:tapSel]) {
+                        ((void (*)(id, SEL))objc_msgSend)(coord, tapSel);
+                        s_coordMode = 1;
+                        ALog(@"👆 coord tap(%.1f, %.1f) 同步 %lldms", x, y, AXSeqMs() - t0);
+                        return YES;
+                    }
+                }
+                s_coordMode = 0;
+                ALog(@"⚠️ XCUICoordinate 不可用，回退 synthesizeEvent");
+            } @catch (NSException *e) {
+                s_coordMode = 0;
+                ALog(@"⚠️ XCUICoordinate 异常 %@，回退 synthesizeEvent", e.reason);
             }
         }
 
