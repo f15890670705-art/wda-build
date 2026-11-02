@@ -587,10 +587,39 @@ static BOOL AXAgentBootstrap(void) {
                         [cfg setValue:[NSUUID UUID] forKey:@"sessionIdentifier"];
                         [cfg setValue:@"AXAgent" forKey:@"productModuleName"];
                         ALog(@"  ✅ 新建 XCTestConfiguration（sessionIdentifier/productModuleName=AXAgent）");
+                        /* ★★★ 2026-11-02 b98：建完必须**设为 active**，否则
+                           `+[XCTestConfiguration activeTestConfiguration]` 一直是 nil，
+                           系统就判定"这台设备没配置成 UI 测试"⇒ XCUIApplication 直接用不了：
+                           `Device is not configured for UI testing - use of XCUIApplication is not
+                            supported. This can happen when XCUIApplication is used in a unit test
+                            bundle instead of a UI test bundle.`（b97 日志实证）
+                           这一条也是"确认永远失败、HOME 后必等 5 秒"的根子 —— daemon 拿不到
+                           有效配置，就只能按默认超时干等。 */
+                        SEL satc = NSSelectorFromString(@"setActiveTestConfiguration:");
+                        if ([cfgCls respondsToSelector:satc]) {
+                            ((void (*)(id, SEL, id))objc_msgSend)(cfgCls, satc, cfg);
+                            id back = fp(cfgCls, atc);
+                            ALog(@"  ✅ setActiveTestConfiguration 已设置，回读 %@", back ? @"非空" : @"仍是 nil");
+                        } else {
+                            ALog(@"  ⚠️ XCTestConfiguration 无 setActiveTestConfiguration:");
+                        }
                     } @catch (NSException *e) { ALog(@"  ❌ XCTestConfiguration: %@", e.reason); }
                 } else {
                     ALog(@"  XCTestConfiguration 已存在: %@", cfg);
                 }
+            }
+
+            /* b98：打印「设备是否被配置成 UI 测试」—— 这是 XCUIApplication 能不能用的总开关，
+               也是 b97 那条 `Device is not configured for UI testing` 的直接判据。 */
+            {
+                Class devCls = NSClassFromString(@"XCUIDevice");
+                SEL sd = NSSelectorFromString(@"sharedDevice");
+                id dev = (devCls && [devCls respondsToSelector:sd])
+                    ? ((id (*)(id, SEL))objc_msgSend)(devCls, sd) : nil;
+                SEL cu = NSSelectorFromString(@"configuredForUITesting");
+                BOOL cuOK = (dev && [dev respondsToSelector:cu])
+                    ? ((BOOL (*)(id, SEL))objc_msgSend)(dev, cu) : NO;
+                ALog(@"  🔎 XCUIDevice configuredForUITesting = %d（0=XCUIApplication 用不了）", (int)cuOK);
             }
 
             // 12) 隐式事件确认间隔：**不再尝试修改**（原来那句必然抛 "Current context must not be nil"）
