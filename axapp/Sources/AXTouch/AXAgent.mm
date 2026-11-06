@@ -1398,81 +1398,197 @@ extern "C" BOOL AXAgentPressHome(void) {
 
 #pragma mark - WDA /wda/homescreen 旁路（2026-11-06）
 
-/* ★★ 现象：WDA 模式（8100）里点一次 HOME，/wda/homescreen 不回执，
-   而且这条 HTTP 请求一直占着通道，后面的命令全部排队。
-   链路（WDA 源码 + 框架符号表实锤）：
-     POST /wda/homescreen → +[FBCustomCommands handleHomescreenCommand:]
-       → -[XCUIDevice(FBHelpers) fb_goToHomescreenWithError:]
-       → -[XCUIDevice pressButton:] → XCTest / testmanagerd 等事件确认
-     HOME 后前台变成 SpringBoard，而我们的自动化会话目标一直挂在 hbVideo 上，
-     确认永远等不回来 ⇒ 请求不返回、通道被占（与 10010 上「HOME 5 秒」同源）。
-   修法：把这一条命令换成已验证的硬件旁路 AXAgentPressHome()
-     （纯 HID page 0x0C / usage 0x40 + 会话版 XCDeviceEvent，0~35ms、不等确认），
-     再直接返回 WDA 自己的 FBResponseWithOK()，HTTP 立刻回 200。
-   ★ 只动 homescreen 这一条：tap / swipe / screenshot 和其它 WDA 端点一律不碰。
-   ★ 若框架里 FBResponseWithOK 拿不到（老版 WDA 可能是 inline），自动降级为
-     替换 -[XCUIDevice fb_goToHomescreenWithError:]，回包仍由 WDA 原 handler 生成，
-     效果同样是「立刻 200、不占通道」。 */
+/* ★★ WDA 模式（8100）里点一次 HOME 不回执、并一直占着 HTTP 通道。
+   框架符号表（docs/wdalib-extracted/WebDriverAgentLib）实锤 **两条** HOME 通道：
+     POST /wda/homescreen  → +[FBCustomCommands handleHomescreenCommand:]
+                           → -[XCUIDevice(FBHelpers) fb_goToHomescreenWithError:]
+     POST /wda/pressButton → +[FBCustomCommands handlePressButtonCommand:]
+                           → -[XCUIDevice(FBHelpers) fb_pressButton:error:] / :forDuration:error:
+   两条最后都落到 XCTest 同步按键；普通 App 没有 test context ⇒ 事件确认永不回来，
+   HOME 又切走前台 ⇒ HTTP 请求要等满隐式确认间隔（约 5 秒）才回。
+   b99 只换了 handleHomescreenCommand: 一条，客户端走 /wda/pressButton 时照样等 5 秒。
+   ★ b100：HTTP 层两条 + FBHelpers 层三条一起拦，name 不是 home 的按钮一律走原实现，
+     tap / swipe / screenshot 与其它端点一律不碰。
+   ★ 发键只用已验证的硬件旁路（HID page 0x0C / usage 0x40 + 会话版 XCDeviceEvent，
+     0~35ms、不等确认）；FBResponseWithOK 拿不到时 HTTP 层不换，由 WDA 原 handler
+     在 FBHelpers 立即返回 YES 后自己回 200。
+   ★ 不 hook XCTest 的 -[XCUIDevice pressButton:]：会影响音量/锁屏，且和
+     AXAgentPressHome 的兜底路径互相递归。 */
 
 /* FBResponseWithOK() 是 WebDriverAgentLib 导出的 C 函数（符号 _FBResponseWithOK）。 */
-static id (*AXWDAOK)(void) = NULL;
+static id   (*AXWDAOK)(void) = NULL;
+static id   (*AXWDAPressBtnOrig)(id, SEL, id) = NULL;
+static BOOL (*AXWDAFbPressOrig)(id, SEL, id, NSError **) = NULL;
+static BOOL (*AXWDAFbDurOrigObj)(id, SEL, id, id, NSError **) = NULL;
+static BOOL (*AXWDAFbDurOrigDbl)(id, SEL, id, double, NSError **) = NULL;
 
-/* 主路：整条 +[FBCustomCommands handleHomescreenCommand:] 换掉。
-   签名对齐 WDA：+ (id<FBResponsePayload>)handleHomescreenCommand:(FBRouteRequest *)request */
-static id AXWDAHomeFast(id self, SEL _cmd, id request) {
+static BOOL AXWDAIsHome(id name) {
+    if (![name isKindOfClass:[NSString class]]) return NO;
+    return [[(NSString *)name lowercaseString] containsString:@"home"];
+}
+
+/* 取 FBRouteRequest.arguments[@"name"]；个别版本叫 buttonName，两个都认。 */
+static id AXWDARequestName(id request) {
+    @try {
+        SEL a = NSSelectorFromString(@"arguments");
+        if (![request respondsToSelector:a]) return nil;
+        id args = ((id (*)(id, SEL))objc_msgSend)(request, a);
+        if (![args isKindOfClass:[NSDictionary class]]) return nil;
+        id n = [args objectForKey:@"name"];
+        return n ?: [args objectForKey:@"buttonName"];
+    } @catch (NSException *e) { return nil; }
+}
+
+/* 所有 HOME hook 共用的发键动作：只发不等，绝不调用任何 XCTest 同步按键通道。 */
+static void AXWDAFireHome(const char *tag) {
     long long t0 = AXSeqMs();
     BOOL ok = AXAgentPressHome();
-    /* 会话没建立时 AXAgentPressHome 会直接返回 NO；纯 HID 直发不依赖会话，补一次。
-       已经在桌面时连发两次 HOME 无副作用（见 AXAgentPressHome 里的说明）。 */
+    /* 会话没建立时 AXAgentPressHome 直接返回 NO；纯 HID 直发不依赖会话，补一次。
+       已经在桌面时连发两次 HOME 无副作用。 */
     if (!ok) ok = AXAgentHomeHID(0x40);
-    ALog(@"🌐 /wda/homescreen → 旁路 HOME %@（%lldms，立即回 200）",
-         ok ? @"已发" : @"HID 不可用", AXSeqMs() - t0);
+    ALog(@"🌐 %s → 旁路 HOME %@（%lldms）", tag, ok ? @"已发" : @"HID 不可用", AXSeqMs() - t0);
+}
+
+/* HTTP 层：整条 +[FBCustomCommands handleHomescreenCommand:] 换掉。
+   签名对齐 WDA：+ (id<FBResponsePayload>)handleHomescreenCommand:(FBRouteRequest *)request */
+static id AXWDAHomeFast(id self, SEL _cmd, id request) {
+    AXWDAFireHome("/wda/homescreen");
     /* 通道优先：哪怕 HOME 没发出去也立刻回包，绝不让请求挂住占通道。 */
     return AXWDAOK ? AXWDAOK() : nil;
 }
 
-/* 降级路：只换 HOME 的下游方法，成功分支让 WDA 原 handler 自己 FBResponseWithOK()。
-   签名对齐 - (BOOL)fb_goToHomescreenWithError:(NSError **)error */
+/* HTTP 层：+[FBCustomCommands handlePressButtonCommand:] —— 只对 home 旁路。
+   ★ b99 漏的就是这条（/wda/pressButton）。非 home 按钮（音量/锁屏等）走原 IMP。 */
+static id AXWDAPressBtnFast(id self, SEL _cmd, id request) {
+    id name = AXWDARequestName(request);
+    if (AXWDAIsHome(name)) {
+        AXWDAFireHome("/wda/pressButton(home)");
+        return AXWDAOK ? AXWDAOK() : nil;
+    }
+    if (AXWDAPressBtnOrig) return AXWDAPressBtnOrig(self, _cmd, request);
+    return AXWDAOK ? AXWDAOK() : nil;
+}
+
+/* FBHelpers 层：- (BOOL)fb_goToHomescreenWithError:(NSError **)error。
+   由 WDA 原 handler 生成回包，不依赖 FBResponseWithOK。 */
 static BOOL AXWDAHomeGo(id self, SEL _cmd, NSError **error) {
-    long long t0 = AXSeqMs();
-    BOOL ok = AXAgentPressHome();
-    if (!ok) ok = AXAgentHomeHID(0x40);
+    AXWDAFireHome("fb_goToHomescreenWithError:");
     if (error) *error = nil;
-    ALog(@"🌐 fb_goToHomescreenWithError: → 旁路 HOME %@（%lldms）",
-         ok ? @"已发" : @"HID 不可用", AXSeqMs() - t0);
     return YES;
 }
 
-/* 由 SafeCall.mm 在启动 WDA HTTP 服务前调用。
-   只有装成功才置 hooked；框架没加载完导致失败时，下次启动服务会自动重试。
-   重复安装（两条启动路径并发）只是把同一个 IMP 再设一次，无害。 */
-extern "C" void AXInstallWDAHomeBypass(void) {
-    static BOOL hooked = NO;
-    if (hooked) return;
-
-    Class cmdCls = NSClassFromString(@"FBCustomCommands");
-    SEL   cmdSel = NSSelectorFromString(@"handleHomescreenCommand:");
-    Method cmdM  = cmdCls ? class_getClassMethod(cmdCls, cmdSel) : NULL;
-    void *okResp = dlsym(RTLD_DEFAULT, "FBResponseWithOK");
-    if (cmdM && okResp) {
-        AXWDAOK = (id (*)(void))okResp;
-        method_setImplementation(cmdM, (IMP)AXWDAHomeFast);
-        hooked = YES;
-        ALog(@"✅ WDA HOME 旁路已装：+[FBCustomCommands handleHomescreenCommand:]（立即回 200）");
-        return;
+/* FBHelpers 层：- (BOOL)fb_pressButton:(NSString *)name error:(NSError **)error */
+static BOOL AXWDAFbPressFast(id self, SEL _cmd, id name, NSError **error) {
+    if (AXWDAIsHome(name)) {
+        AXWDAFireHome("fb_pressButton:error:(home)");
+        if (error) *error = nil;
+        return YES;
     }
-    ALog(@"⚠️ WDA HOME 主路不可用（类=%@ 方法=%@ FBResponseWithOK=%p），走降级",
-         cmdCls ? @"有" : @"无", cmdM ? @"有" : @"无", okResp);
+    return AXWDAFbPressOrig ? AXWDAFbPressOrig(self, _cmd, name, error) : YES;
+}
 
+/* FBHelpers 层：fb_pressButton:forDuration:error: 的 duration 在不同 WDA 版本里
+   可能是 NSNumber* 或 double ⇒ 按运行时 type encoding 选 IMP 原型，避免 ABI 不匹配。 */
+static BOOL AXWDAFbDurObj(id self, SEL _cmd, id name, id dur, NSError **error) {
+    if (AXWDAIsHome(name)) {
+        AXWDAFireHome("fb_pressButton:duration:(home)");
+        if (error) *error = nil;
+        return YES;
+    }
+    return AXWDAFbDurOrigObj ? AXWDAFbDurOrigObj(self, _cmd, name, dur, error) : YES;
+}
+static BOOL AXWDAFbDurDbl(id self, SEL _cmd, id name, double dur, NSError **error) {
+    if (AXWDAIsHome(name)) {
+        AXWDAFireHome("fb_pressButton:duration:(home)");
+        if (error) *error = nil;
+        return YES;
+    }
+    return AXWDAFbDurOrigDbl ? AXWDAFbDurOrigDbl(self, _cmd, name, dur, error) : YES;
+}
+
+/* 由 SafeCall.mm 在启动 WDA HTTP 服务前调用。
+   ★ 逐项安装、逐项记忆：框架是一个个 dlopen 的，第一次调用时可能只加载了一部分类
+     ⇒ 没装上的项 600ms 后自动重试（最多 8 次）。b99 是「一次失败就再没机会」，这里补上。
+   重复安装（自动起服务 + 10010 server 两条路径）只补没装上的项，不会把原 IMP 覆盖成自己。 */
+static BOOL gWDAHs = NO, gWDAPb = NO, gWDAFbGo = NO, gWDAFbPress = NO, gWDAFbDur = NO;
+
+static void AXWDAInstallOnce(void) {
+    Class cmdCls = NSClassFromString(@"FBCustomCommands");
     Class devCls = NSClassFromString(@"XCUIDevice");
-    SEL   goSel  = NSSelectorFromString(@"fb_goToHomescreenWithError:");
-    Method goM   = devCls ? class_getInstanceMethod(devCls, goSel) : NULL;
-    if (goM) {
-        method_setImplementation(goM, (IMP)AXWDAHomeGo);
-        hooked = YES;
-        ALog(@"✅ WDA HOME 旁路已装：-[XCUIDevice fb_goToHomescreenWithError:]（WDA 原 handler 回 200）");
-    } else {
-        ALog(@"❌ WDA HOME 旁路未装：框架未加载或方法名变了（下次启动服务会重试）");
+    if (!AXWDAOK) {
+        void *p = dlsym(RTLD_DEFAULT, "FBResponseWithOK");
+        if (p) AXWDAOK = (id (*)(void))p;
+    }
+
+    /* HTTP 层：需要能立刻造回包；拿不到 FBResponseWithOK 就交给 FBHelpers 层 + WDA 原 handler。 */
+    if (!gWDAHs && cmdCls && AXWDAOK) {
+        Method m = class_getClassMethod(cmdCls, NSSelectorFromString(@"handleHomescreenCommand:"));
+        if (m) {
+            method_setImplementation(m, (IMP)AXWDAHomeFast);
+            gWDAHs = YES;
+            ALog(@"✅ WDA HOME 旁路已装：/wda/homescreen（立即回 200）");
+        }
+    }
+    if (!gWDAPb && cmdCls && AXWDAOK) {
+        Method m = class_getClassMethod(cmdCls, NSSelectorFromString(@"handlePressButtonCommand:"));
+        if (m) {
+            AXWDAPressBtnOrig = (id (*)(id, SEL, id))method_setImplementation(m, (IMP)AXWDAPressBtnFast);
+            gWDAPb = YES;
+            ALog(@"✅ WDA HOME 旁路已装：/wda/pressButton（home 立即回 200，其它按钮放行）");
+        }
+    }
+
+    /* FBHelpers 层：总装，不依赖 FBResponseWithOK，是最终兜底。 */
+    if (!gWDAFbGo && devCls) {
+        Method m = class_getInstanceMethod(devCls, NSSelectorFromString(@"fb_goToHomescreenWithError:"));
+        if (m) {
+            method_setImplementation(m, (IMP)AXWDAHomeGo);
+            gWDAFbGo = YES;
+            ALog(@"✅ WDA HOME 旁路已装：fb_goToHomescreenWithError:");
+        }
+    }
+    if (!gWDAFbPress && devCls) {
+        Method m = class_getInstanceMethod(devCls, NSSelectorFromString(@"fb_pressButton:error:"));
+        if (m) {
+            AXWDAFbPressOrig = (BOOL (*)(id, SEL, id, NSError **))method_setImplementation(m, (IMP)AXWDAFbPressFast);
+            gWDAFbPress = YES;
+            ALog(@"✅ WDA HOME 旁路已装：fb_pressButton:error:");
+        }
+    }
+    if (!gWDAFbDur && devCls) {
+        Method m = class_getInstanceMethod(devCls, NSSelectorFromString(@"fb_pressButton:forDuration:error:"));
+        if (m) {
+            char arg[64] = {0};
+            method_getArgumentType(m, 3, arg, sizeof(arg));   /* 3 = duration */
+            if (arg[0] == 'd') {
+                AXWDAFbDurOrigDbl = (BOOL (*)(id, SEL, id, double, NSError **))method_setImplementation(m, (IMP)AXWDAFbDurDbl);
+            } else {
+                AXWDAFbDurOrigObj = (BOOL (*)(id, SEL, id, id, NSError **))method_setImplementation(m, (IMP)AXWDAFbDurObj);
+            }
+            gWDAFbDur = YES;
+            ALog(@"✅ WDA HOME 旁路已装：fb_pressButton:forDuration:error:（duration=%s）", arg);
+        }
+    }
+}
+
+extern "C" void AXInstallWDAHomeBypass(void) {
+    AXWDAInstallOnce();
+    /* 只要 FBHelpers 两条主兜底没装齐就继续重试（框架可能是懒加载的）。 */
+    static int attempts = 0;
+    if (!gWDAFbGo || !gWDAFbPress) {
+        if (attempts < 8) {
+            attempts++;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(600 * NSEC_PER_MSEC)),
+                           dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+                AXInstallWDAHomeBypass();
+            });
+        } else {
+            static BOOL logged = NO;
+            if (!logged) {
+                logged = YES;
+                ALog(@"❌ WDA HOME 旁路未装：框架未加载或方法名变了（已重试 %d 次）", attempts);
+            }
+        }
     }
 }
 
