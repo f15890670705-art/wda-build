@@ -34,7 +34,7 @@ targets:
       properties:
         CFBundleDisplayName: hbVideo
         CFBundleShortVersionString: "2.0"
-        CFBundleVersion: "111"
+        CFBundleVersion: "112"
         UIBackgroundModes:
           - audio
           - location
