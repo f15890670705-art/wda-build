@@ -1396,6 +1396,86 @@ extern "C" BOOL AXAgentPressHome(void) {
     return YES;
 }
 
+#pragma mark - WDA /wda/homescreen 旁路（2026-11-06）
+
+/* ★★ 现象：WDA 模式（8100）里点一次 HOME，/wda/homescreen 不回执，
+   而且这条 HTTP 请求一直占着通道，后面的命令全部排队。
+   链路（WDA 源码 + 框架符号表实锤）：
+     POST /wda/homescreen → +[FBCustomCommands handleHomescreenCommand:]
+       → -[XCUIDevice(FBHelpers) fb_goToHomescreenWithError:]
+       → -[XCUIDevice pressButton:] → XCTest / testmanagerd 等事件确认
+     HOME 后前台变成 SpringBoard，而我们的自动化会话目标一直挂在 hbVideo 上，
+     确认永远等不回来 ⇒ 请求不返回、通道被占（与 10010 上「HOME 5 秒」同源）。
+   修法：把这一条命令换成已验证的硬件旁路 AXAgentPressHome()
+     （纯 HID page 0x0C / usage 0x40 + 会话版 XCDeviceEvent，0~35ms、不等确认），
+     再直接返回 WDA 自己的 FBResponseWithOK()，HTTP 立刻回 200。
+   ★ 只动 homescreen 这一条：tap / swipe / screenshot 和其它 WDA 端点一律不碰。
+   ★ 若框架里 FBResponseWithOK 拿不到（老版 WDA 可能是 inline），自动降级为
+     替换 -[XCUIDevice fb_goToHomescreenWithError:]，回包仍由 WDA 原 handler 生成，
+     效果同样是「立刻 200、不占通道」。 */
+
+/* FBResponseWithOK() 是 WebDriverAgentLib 导出的 C 函数（符号 _FBResponseWithOK）。 */
+static id (*AXWDAOK)(void) = NULL;
+
+/* 主路：整条 +[FBCustomCommands handleHomescreenCommand:] 换掉。
+   签名对齐 WDA：+ (id<FBResponsePayload>)handleHomescreenCommand:(FBRouteRequest *)request */
+static id AXWDAHomeFast(id self, SEL _cmd, id request) {
+    long long t0 = AXSeqMs();
+    BOOL ok = AXAgentPressHome();
+    /* 会话没建立时 AXAgentPressHome 会直接返回 NO；纯 HID 直发不依赖会话，补一次。
+       已经在桌面时连发两次 HOME 无副作用（见 AXAgentPressHome 里的说明）。 */
+    if (!ok) ok = AXAgentHomeHID(0x40);
+    ALog(@"🌐 /wda/homescreen → 旁路 HOME %@（%lldms，立即回 200）",
+         ok ? @"已发" : @"HID 不可用", AXSeqMs() - t0);
+    /* 通道优先：哪怕 HOME 没发出去也立刻回包，绝不让请求挂住占通道。 */
+    return AXWDAOK ? AXWDAOK() : nil;
+}
+
+/* 降级路：只换 HOME 的下游方法，成功分支让 WDA 原 handler 自己 FBResponseWithOK()。
+   签名对齐 - (BOOL)fb_goToHomescreenWithError:(NSError **)error */
+static BOOL AXWDAHomeGo(id self, SEL _cmd, NSError **error) {
+    long long t0 = AXSeqMs();
+    BOOL ok = AXAgentPressHome();
+    if (!ok) ok = AXAgentHomeHID(0x40);
+    if (error) *error = nil;
+    ALog(@"🌐 fb_goToHomescreenWithError: → 旁路 HOME %@（%lldms）",
+         ok ? @"已发" : @"HID 不可用", AXSeqMs() - t0);
+    return YES;
+}
+
+/* 由 SafeCall.mm 在启动 WDA HTTP 服务前调用。
+   只有装成功才置 hooked；框架没加载完导致失败时，下次启动服务会自动重试。
+   重复安装（两条启动路径并发）只是把同一个 IMP 再设一次，无害。 */
+extern "C" void AXInstallWDAHomeBypass(void) {
+    static BOOL hooked = NO;
+    if (hooked) return;
+
+    Class cmdCls = NSClassFromString(@"FBCustomCommands");
+    SEL   cmdSel = NSSelectorFromString(@"handleHomescreenCommand:");
+    Method cmdM  = cmdCls ? class_getClassMethod(cmdCls, cmdSel) : NULL;
+    void *okResp = dlsym(RTLD_DEFAULT, "FBResponseWithOK");
+    if (cmdM && okResp) {
+        AXWDAOK = (id (*)(void))okResp;
+        method_setImplementation(cmdM, (IMP)AXWDAHomeFast);
+        hooked = YES;
+        ALog(@"✅ WDA HOME 旁路已装：+[FBCustomCommands handleHomescreenCommand:]（立即回 200）");
+        return;
+    }
+    ALog(@"⚠️ WDA HOME 主路不可用（类=%@ 方法=%@ FBResponseWithOK=%p），走降级",
+         cmdCls ? @"有" : @"无", cmdM ? @"有" : @"无", okResp);
+
+    Class devCls = NSClassFromString(@"XCUIDevice");
+    SEL   goSel  = NSSelectorFromString(@"fb_goToHomescreenWithError:");
+    Method goM   = devCls ? class_getInstanceMethod(devCls, goSel) : NULL;
+    if (goM) {
+        method_setImplementation(goM, (IMP)AXWDAHomeGo);
+        hooked = YES;
+        ALog(@"✅ WDA HOME 旁路已装：-[XCUIDevice fb_goToHomescreenWithError:]（WDA 原 handler 回 200）");
+    } else {
+        ALog(@"❌ WDA HOME 旁路未装：框架未加载或方法名变了（下次启动服务会重试）");
+    }
+}
+
 static BOOL AXGestureCore(const double *xy, const double *t, int n) {
     if (!gReady || !gSession) { ALog(@"❌ gesture 失败：会话未就绪"); return NO; }
     if (n < 2) { ALog(@"❌ gesture 失败：点数不足"); return NO; }
