@@ -58,9 +58,10 @@ extern "C" NSString *AXProbeDaemonSession(void) {
 }
 
 extern "C" NSString *AXStartWDAServer(void) {
-    /* ★ 2026-11-06：/wda/homescreen 原来要等 XCTest 的确认（HOME 后前台变 SpringBoard，
-       确认永远不回来）⇒ 请求不回执、一直占着通道。这里在服务接收第一个请求之前把那条
-       HOME 命令换成硬件旁路，立即回 200。只装一次，装不上会自己重试。 */
+    /* ★ 2026-11-06：WDA 的 HOME 原来要等 XCTest 的确认（HOME 后前台变 SpringBoard，
+       确认永远不回来）⇒ 请求不回执、一直占着通道。这里在收第一个请求之前把 HOME
+       所有通道（/wda/homescreen、/wda/pressButton、FBHelpers 三个方法）换成硬件旁路。
+       逐项安装、装不上会自己重试；服务起来后下面还会再补装一次。 */
     AXInstallWDAHomeBypass();
     Class cls = NSClassFromString(@"FBWebServer");
     if (cls == Nil) return @"FBWebServer 类不存在";
@@ -77,9 +78,13 @@ extern "C" NSString *AXStartWDAServer(void) {
     static id retained = nil;
     retained = server;
 
-    return AXSafeCall(^{
+    NSString *r = AXSafeCall(^{
         ((void (*)(id, SEL))objc_msgSend)(server, sel);
     });
+    /* ★ b100：startHTTPServer 之后框架类肯定已注册，再补装一次（幂等，只补没装上的项）。
+       开头那次若因框架懒加载没装上，这次就能补齐，不必等 600ms 的重试。 */
+    AXInstallWDAHomeBypass();
+    return r;
 }
 
 extern "C" void AXStartWDAServerThread(NSString **outLog) {
