@@ -234,23 +234,25 @@ final class ControlServer {
                     AXAgentStartSticky()
                     resp = "{\"ok\":true,\"note\":\"bootstrap started\"}"
                 case "tap":
+                    /* 统一坐标：屏幕分辨率像素（本机 1290x2796），如 (645,1398) = 屏中心 */
                     let x = (obj["x"] as? Double) ?? 0
                     let y = (obj["y"] as? Double) ?? 0
-                    let r = AXAgentTap(x, y)
+                    let r = AXAgentTapPx(x, y)
                     resp = "{\"ok\":\(r)}"
                 case "swipe":
-                    let r = AXAgentSwipe((obj["x1"] as? Double) ?? 0, (obj["y1"] as? Double) ?? 0,
-                                         (obj["x2"] as? Double) ?? 0, (obj["y2"] as? Double) ?? 0,
-                                         (obj["duration"] as? Double) ?? 0.25)
+                    let r = AXAgentSwipePx((obj["x1"] as? Double) ?? 0, (obj["y1"] as? Double) ?? 0,
+                                           (obj["x2"] as? Double) ?? 0, (obj["y2"] as? Double) ?? 0,
+                                           (obj["duration"] as? Double) ?? 0.25)
                     resp = "{\"ok\":\(r)}"
                 case "pinch":
-                    /* {"cmd":"pinch","cx":215,"cy":466,"gap0":100,"gap1":300,"dur":0.35}
-                       gap0<gap1 = 双指张开(放大)；gap0>gap1 = 捏合(缩小) */
-                    let pin = AXAgentPinch((obj["cx"] as? Double) ?? 0,
-                                           (obj["cy"] as? Double) ?? 0,
-                                           (obj["gap0"] as? Double) ?? 200,
-                                           (obj["gap1"] as? Double) ?? 200,
-                                           (obj["dur"] as? Double) ?? 0.35)
+                    /* {"cmd":"pinch","cx":645,"cy":1398,"gap0":300,"gap1":900,"dur":0.35}
+                       gap0<gap1 = 双指张开(放大)；gap0>gap1 = 捏合(缩小)
+                       中心与 gap 都是分辨率像素 */
+                    let pin = AXAgentPinchPx((obj["cx"] as? Double) ?? 0,
+                                             (obj["cy"] as? Double) ?? 0,
+                                             (obj["gap0"] as? Double) ?? 600,
+                                             (obj["gap1"] as? Double) ?? 600,
+                                             (obj["dur"] as? Double) ?? 0.35)
                     resp = "{\"ok\":\(pin)}"
                 case "text":
                     /* {"cmd":"text","v":"hello"} —— ASCII 直打；中文用 paste */
@@ -273,9 +275,10 @@ final class ControlServer {
                     resp = (try? String(data: JSONSerialization.data(withJSONObject: pd), encoding: .utf8)) ?? "{\"ok\":false}"
                 case "touchseq":
                     /* 流式触控实验：
-                       {"cmd":"touchseq","mode":0|1,"x1":100,"y1":300,"x2":300,"y2":700,"steps":12,"gap":20}
+                       {"cmd":"touchseq","mode":0|1,"x1":300,"y1":900,"x2":900,"y2":2100,"steps":12,"gap":20}
+                       （坐标统一为屏幕分辨率像素）
                        mode 0 = 整段一次提交（对照）；mode 1 = 分段 + persistent state（实验） */
-                    let r = AXAgentTouchSeq(Int32((obj["mode"] as? Int) ?? 0),
+                    let r = AXAgentTouchSeqPx(Int32((obj["mode"] as? Int) ?? 0),
                                             (obj["x1"] as? Double) ?? 0,
                                             (obj["y1"] as? Double) ?? 0,
                                             (obj["x2"] as? Double) ?? 0,
@@ -285,10 +288,11 @@ final class ControlServer {
                     let d: [String: Any] = ["ok": true, "result": r]
                     resp = (try? String(data: JSONSerialization.data(withJSONObject: d), encoding: .utf8)) ?? "{\"ok\":false}"
                 case "longpress":
-                    let r = AXAgentLongPress((obj["x"] as? Double) ?? 0, (obj["y"] as? Double) ?? 0,
-                                             (obj["duration"] as? Double) ?? 1.0)
+                    let r = AXAgentLongPressPx((obj["x"] as? Double) ?? 0, (obj["y"] as? Double) ?? 0,
+                                               (obj["duration"] as? Double) ?? 1.0)
                     resp = "{\"ok\":\(r)}"
                 case "touch":
+                    /* events 里的 x/y 统一为屏幕分辨率像素；delay 仍是秒，逐笔累加成时间戳 */
                     if let evs = obj["events"] as? [[String: Any]], evs.count >= 2 {
                         var xy = [Double]()
                         var ts = [Double]()
@@ -302,7 +306,7 @@ final class ControlServer {
                         var ok = false
                         xy.withUnsafeBufferPointer { xb in
                             ts.withUnsafeBufferPointer { tb in
-                                ok = AXAgentGesture(xb.baseAddress!, tb.baseAddress!, Int32(evs.count))
+                                ok = AXAgentGesturePx(xb.baseAddress!, tb.baseAddress!, Int32(evs.count))
                             }
                         }
                         resp = "{\"ok\":\(ok)}"
@@ -347,13 +351,13 @@ final class ControlServer {
                 case "hidtap":
                     /* {"cmd":"hidtap","on":1}  开 HID 触摸（0ms，不走 XCTest）
                        {"cmd":"hidtap"}         查当前状态
-                       {"cmd":"hidtap","on":1,"x":120,"y":300}  顺便点一下（point 坐标） */
+                       {"cmd":"hidtap","on":1,"x":360,"y":900}  顺便点一下（分辨率像素） */
                     if let onv = obj["on"] as? Int {
                         AXAgentSetHIDTap(Int32(onv))
                     }
                     var okFlag = true
                     if let tx = obj["x"] as? Double, let ty = obj["y"] as? Double {
-                        okFlag = AXAgentHIDTap(tx, ty)
+                        okFlag = AXAgentHIDTapPx(tx, ty)
                     }
                     resp = "{\"ok\":\(okFlag),\"hidtap\":\(AXAgentGetHIDTap())}"
                 case "devinfo":
