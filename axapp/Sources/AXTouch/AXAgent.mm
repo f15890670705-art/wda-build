@@ -753,17 +753,33 @@ extern "C" BOOL AXAgentHIDTouch(double xPt, double yPt, int down);
    HOME / 任务键手势也按同一套像素尺寸定义，不再直接写死 point。
    ★ 27185 的 AXTouchHandle 收的是 PC 当前画面帧坐标（w/h 随报文带来），
      它本来就是按画面分辨率算的，PC 侧不动，这里也不改。 */
+/* ★★★ 2026-11-07：设备自适应 —— 不写死任何机型尺寸。
+   基准取 UIScreen.nativeBounds（设备真实物理像素，iOS 8+ 恒为竖屏方向）；
+   point ↔ 像素的比例用 nativeBounds.width / bounds.width 算，
+   而不是直接信 nativeScale：降采样机型上两者可能不一致，用比值才自洽。
+   于是 2x / 3x / 降采样 / 不同屏占比的设备都自动适配。 */
 static double AXCoordScale(void) {
     UIScreen *sc = [UIScreen mainScreen];
-    double s = sc ? (double)sc.nativeScale : 3.0;
+    if (!sc) return 1.0;
+    CGRect nb = sc.nativeBounds;
+    CGSize  pt = sc.bounds.size;
+    if (nb.size.width > 0 && pt.width > 0) return nb.size.width / pt.width;
+    double s = (double)sc.nativeScale;
     return s > 0 ? s : 1.0;
 }
 static void AXCoordPixelSize(double *w, double *h) {
     UIScreen *sc = [UIScreen mainScreen];
-    CGSize p = sc ? sc.bounds.size : CGSizeMake(430, 932);
-    double s = AXCoordScale();
-    *w = (p.width  > 0 ? p.width  : 430.0) * s;
-    *h = (p.height > 0 ? p.height : 932.0) * s;
+    CGRect nb = sc ? sc.nativeBounds : CGRectZero;
+    if (nb.size.width > 0 && nb.size.height > 0) {
+        *w = nb.size.width;
+        *h = nb.size.height;
+    } else {
+        /* 极端兜底：仍只按当前设备算，绝不拿别的机型尺寸顶替 */
+        CGSize pt = sc ? sc.bounds.size : CGSizeZero;
+        double s = AXCoordScale();
+        *w = pt.width  * s;
+        *h = pt.height * s;
+    }
 }
 static double AXCoordPt(double v) { return v / AXCoordScale(); }
 
@@ -771,6 +787,12 @@ static double AXCoordPt(double v) { return v / AXCoordScale(); }
    取中间 30%~70%，避开左右边缘手势区；一次手势内部 x 保持不变，仍是纯竖直上滑。 */
 static double AXRandomGestureX(double w) {
     double lo = w * 0.30, hi = w * 0.70;
+    double r = (double)arc4random_uniform(10000) / 9999.0;
+    return lo + (hi - lo) * r;
+}
+
+/* 手势总时长每次随机（单位：秒），别固定成同一个值。 */
+static double AXRandomTime(double lo, double hi) {
     double r = (double)arc4random_uniform(10000) / 9999.0;
     return lo + (hi - lo) * r;
 }
@@ -1229,40 +1251,52 @@ static BOOL AXGestureCore(const double *xy, const double *t, int n);
    各通路探针）已从本文件删除；手势走 synthesizeEvent，与点击同一条通道，不构造硬件
    按键事件、不切会话目标、不跑预热。WDA 8100 的 HOME 旁路也指向这里。
    系统行为（Apple Face ID 手势指南）：无 Home 键机型
-     · 底边快速上滑一小段（1/5 屏高）、80ms 内抬手、无停顿 = 回主屏
-     · 慢速上滑到中部短暂停住再抬手                        = App 切换器（任务键）
+     · 底边快速上滑一小段（1/5 屏高）、60~70ms 内抬手、无停顿 = 回主屏
+     · 上滑 2/5 屏高、短暂停住再抬手（总 200~250ms）        = App 切换器（任务键）
    判据是「抬手前有没有停住」，不是单纯的快慢。
-   ★ HOME 按用户实测反馈：不用拉到中部，拉 1/5 屏高就够，全程 70ms；
+   ★ HOME：拉 1/5 屏高，总时长每次在 60~70ms 之间随机；
      每次调用随机换 x（中间 30%~70%），别固定同一条竖线。
-   ★ 任务键停顿仍按用户实测反馈取 0.12s（100~150ms）。
-   坐标单位 = 屏幕分辨率像素（本机 1290x2796），进系统输入层前统一落成 point。 */
+   ★ 任务键：距离 2/5 屏高，总时长每次在 200~250ms 之间随机；
+     抬手前同坐标停住 100ms（进切换器的判据，不再缩短）。
+   ★ 尺寸全部按当前设备运行时算：1/5 屏高、30%~70% 宽、随机 x 都是比例，
+     scale 也由设备算出，不同分辨率 / 2x / 3x / 降采样机型通用，无任何写死机型数值。
+   坐标单位 = 设备屏幕物理分辨率像素，进系统输入层前统一落成 point。 */
 static BOOL AXSwipeFromBottom(BOOL taskSwitcher) {
     double w = 0, h = 0;
-    AXCoordPixelSize(&w, &h);      /* 分辨率像素，如 1290x2796 */
+    AXCoordPixelSize(&w, &h);      /* 设备真实物理分辨率，运行时取 */
     double s  = AXCoordScale();
+    if (w <= 0 || h <= 0 || s <= 0) {
+        ALog(@"❌ HOME 手势：取不到屏幕分辨率，放弃（绝不按猜的尺寸上滑）");
+        return NO;
+    }
     double cx = AXRandomGestureX(w);   /* 每次不同，一次手势内保持 */
     double y0 = h - 2.0 * s;       /* 绝对底边（落回 point 仍是 h_pt-2） */
-    double ym = h * 0.5;           /* 屏幕中部 */
 
     double xy[12] = {0}, t[6] = {0};
     int n = 0;
     if (!taskSwitcher) {
-        /* 快滑 HOME：只从底边往上拉 1/5 屏高，70ms 抬手（<80ms），抬手前没有任何停顿。
+        /* 快滑 HOME：只从底边往上拉 1/5 屏高，总时长 60~70ms 内随机，抬手前无停顿。
            末点坐标会被 AXGestureCore 忽略，只取时间戳，所以最后一点重复终点即可。 */
         double d = h * 0.20;
+        double T = AXRandomTime(0.060, 0.070);
         double ys[5] = { y0, y0 - d * 0.35, y0 - d * 0.70, y0 - d, y0 - d };
-        double ts[5] = { 0.0, 0.015, 0.030, 0.050, 0.070 };
+        double ts[5] = { 0.0, T * 0.21, T * 0.43, T * 0.71, T };
         n = 5;
         for (int i = 0; i < n; i++) {
             xy[i*2] = AXCoordPt(cx); xy[i*2+1] = AXCoordPt(ys[i]); t[i] = ts[i];
         }
     } else {
-        /* 慢滑任务键：0.30s 到中部，同坐标停 0.12s，0.45s 抬手。
+        /* 任务键：上滑 2/5 屏高，总时长 200~250ms 内随机，抬手前同坐标停 100ms。
            AXGestureCore 把最后一个点的时间戳当 liftUp、忽略它的坐标，
            所以停顿必须放在中间点（同坐标、offset 递增）。
-           ★ 用户实测反馈：抬手前的停顿 0.45s 太长，100~150ms 就够。 */
-        double ys[6] = { y0, h * 0.82, h * 0.66, ym, ym, ym };
-        double ts[6] = { 0.0, 0.10, 0.20, 0.30, 0.42, 0.45 };
+           移动段 = 总时长 - 停顿 - 抬手余量，随总时长一起变。 */
+        double d  = h * 0.40;
+        double ye = y0 - d;
+        double T  = AXRandomTime(0.200, 0.250);
+        double pause = 0.100, lead = 0.020;
+        double mv = T - pause - lead;      /* 0.080~0.130s */
+        double ys[6] = { y0, y0 - d * 0.35, y0 - d * 0.70, ye, ye, ye };
+        double ts[6] = { 0.0, mv * 0.33, mv * 0.66, mv, mv + pause, T };
         n = 6;
         for (int i = 0; i < n; i++) {
             xy[i*2] = AXCoordPt(cx); xy[i*2+1] = AXCoordPt(ys[i]); t[i] = ts[i];
@@ -1270,9 +1304,9 @@ static BOOL AXSwipeFromBottom(BOOL taskSwitcher) {
     }
     long long t0 = AXSeqMs();
     BOOL ok = AXGestureCore(xy, t, n);
-    ALog(@"🏠 %@手势（x=%.0fpt 底边pt %.0f → 终点pt %.0f，末点 %.2fs，屏 %.0fx%.0f px）%@ %lldms",
+    ALog(@"🏠 %@手势（x=%.0fpt 底边pt %.0f → 终点pt %.0f，末点 %.2fs，屏 %.0fx%.0f px scale%.2f）%@ %lldms",
          taskSwitcher ? @"任务键慢滑" : @"HOME 快滑",
-         AXCoordPt(cx), AXCoordPt(y0), AXCoordPt(xy[(n-2)*2+1]), t[n-1], w, h,
+         AXCoordPt(cx), AXCoordPt(y0), AXCoordPt(xy[(n-2)*2+1]), t[n-1], w, h, s,
          ok ? @"已提交" : @"失败", AXSeqMs() - t0);
     return ok;
 }
