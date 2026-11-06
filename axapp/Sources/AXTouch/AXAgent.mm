@@ -714,7 +714,9 @@ static NSString *AXFrontBundleID(void) {
 /* ★ b94 默认**关**：b92/b93 实测 HID 的 digitizer 事件被系统静默丢弃（普通 App 进程没有
    "来源认证"，键盘事件没这道校验所以 HOME 可用），开了等于点击全失效。
    代码和开关都留着，将来有 senderID/BKSHIDEventSetDigitizerInfo 再启。
-   需要时发 {"cmd":"hidtap","on":1}。 */
+   ★ b102：已补上当初缺的 senderID（见 AXHIDPostFinger），并把 client 换成 Monitor 型。
+   **默认仍关**，先用 {"cmd":"hidtap","on":1} 真机验证触摸确实生效，再把这个初值改成 1 固化；
+   验证不通过 {"cmd":"hidtap","on":0} 立刻回退，默认路径一行没变。 */
 static volatile int g_hidTapOn = 0;
 extern "C" BOOL AXAgentHIDTap(double x, double y);
 extern "C" BOOL AXAgentHIDTouch(double xPt, double yPt, int down);
@@ -1068,6 +1070,8 @@ typedef void  (*AXHIDDispatchFn)(void *, void *);
 typedef void *(*AXHIDClientFn)(CFAllocatorRef);
 typedef void  (*AXHIDSetIntFn)(void *, uint32_t, int64_t);
 typedef void  (*AXHIDSetFloatFn)(void *, uint32_t, double);
+/* b102：给 digitizer 事件补「来源身份」。b94 判定触摸被静默丢弃，缺的就是这一步。 */
+typedef void  (*AXHIDSetSenderFn)(void *, uint64_t);
 
 /* IOHIDEventField（digitizer 基址 0x000B0000） */
 static const uint32_t kAxFieldMajorRadius  = 0x000B0014;
@@ -1081,6 +1085,7 @@ static AXHIDAppendFn    fEvtAppend  = NULL;
 static AXHIDDispatchFn  fEvtDispatch = NULL;
 static AXHIDSetIntFn    fEvtSetInt   = NULL;
 static AXHIDSetFloatFn  fEvtSetFloat = NULL;
+static AXHIDSetSenderFn fEvtSetSender = NULL;
 static int  g_hidTouchInit = 0;      /* 0=未试 1=可用 -1=不可用 */
 /* g_hidTapOn 定义在文件前段（AXAgentTap 要用） */
 
@@ -1096,15 +1101,22 @@ static int AXHIDTouchInit(void) {
     fEvtDispatch = (AXHIDDispatchFn)dlsym(scope, "IOHIDEventSystemClientDispatchEvent");
     fEvtSetInt   = (AXHIDSetIntFn)dlsym(scope, "IOHIDEventSetIntegerValue");
     fEvtSetFloat = (AXHIDSetFloatFn)dlsym(scope, "IOHIDEventSetFloatValue");
-    if (fCli) g_tchClient = fCli(kCFAllocatorDefault);
+    fEvtSetSender = (AXHIDSetSenderFn)dlsym(scope, "IOHIDEventSetSenderID");
+    /* ★ b102：client 改用与「已实测可用的 HID 键盘通道」同一套创建方式。
+       iOS 13+ 只有带 type 的版本，type=1(Monitor) 才有注入权限；旧的无 type 版本
+       拿到的 client 对 digitizer 事件可能只收不发 —— 这正是 b94 静默丢弃的可疑点之一。 */
+    void *(*fClientWithType)(CFAllocatorRef, int, CFDictionaryRef) =
+        (void *(*)(CFAllocatorRef, int, CFDictionaryRef))dlsym(scope, "IOHIDEventSystemClientCreateWithType");
+    if (fClientWithType) g_tchClient = fClientWithType(kCFAllocatorDefault, 1, NULL);
+    if (!g_tchClient && fCli) g_tchClient = fCli(kCFAllocatorDefault);
     if (fFingerEvt && fEvtDispatch && fHandEvt && g_tchClient) {
         g_hidTouchInit = 1;
     }
     UIScreen *sc = [UIScreen mainScreen];
-    ALog(@"🔧 HID 触摸初始化：client=%p finger=%p hand=%p append=%p dispatch=%p setint=%p "
-         "屏=%dx%d scale=%.2f → %s",
-         g_tchClient, (void *)fFingerEvt, (void *)fHandEvt, (void *)fEvtAppend,
-         (void *)fEvtDispatch, (void *)fEvtSetInt,
+    ALog(@"🔧 HID 触摸初始化：client=%p(withType=%p) finger=%p hand=%p append=%p dispatch=%p "
+         "setint=%p sender=%p 屏=%dx%d scale=%.2f → %s",
+         g_tchClient, (void *)fClientWithType, (void *)fFingerEvt, (void *)fHandEvt,
+         (void *)fEvtAppend, (void *)fEvtDispatch, (void *)fEvtSetInt, (void *)fEvtSetSender,
          sc ? (int)sc.bounds.size.width : 0, sc ? (int)sc.bounds.size.height : 0,
          sc ? (double)sc.nativeScale : 0,
          g_hidTouchInit == 1 ? "可用" : "不可用");
@@ -1140,6 +1152,18 @@ static BOOL AXHIDPostFinger(double px, double py, int down) {
     if (fEvtSetInt) {
         /* ★ 不设这个，系统不认这是「屏幕上的触摸」——这是最常见的坑 */
         fEvtSetInt(hand, kAxFieldDisplayInteg, 1);
+    }
+    /* ★★★ b102：b94 判定「普通 App 的 digitizer 事件被 backboardd 静默丢弃」，
+       缺的就是**来源身份**：键盘事件自带系统来源所以 HOME 能用，触摸事件没有。
+       补 IOHIDEventSetSenderID(hand, backboardd 的 senderID) 再投递。
+       符号不存在就保持原样（不崩、不递归），日志会明确写有没有补上。 */
+    if (fEvtSetSender) {
+        fEvtSetSender(hand, 0x800000073731AAB0ULL);
+        static BOOL s_senderLogged = NO;
+        if (!s_senderLogged) {
+            s_senderLogged = YES;
+            ALog(@"🔑 HID 触摸已补 senderID=0x800000073731AAB0（来源认证）");
+        }
     }
     fEvtDispatch(g_tchClient, hand);
     return YES;
