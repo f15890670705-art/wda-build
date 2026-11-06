@@ -535,9 +535,8 @@ static BOOL AXAgentBootstrap(void) {
             //     （Mach-O C 符号，dlsym 名 = _XCTSet... / _XCTEvent...）；设备日志里 9b
             //     探针这两个也都是「有」，只是一直**只探测不修改**。
             //     9c / AXEnsureCfmInterval 改的是 synthesizeEvent 用的 implicit interval；
-            //     HOME 那笔 performDeviceEvent 不走 synthesizeEvent，吃的是这个全局
-            //     event confirmation timeout —— 默认 5.000 秒，正好对上按完 HOME 后
-            //     要等的那 5 秒。这里压到 0.02（绝不给 0，b78 实测设 0 会闪退）。
+            //     这个是进程内全局的 event confirmation timeout，默认 5.000 秒，
+            //     点击与手势的事件确认都会吃它。这里压到 0.02（绝不给 0，b78 实测设 0 会闪退）。
             //     ★ 只在 bootstrap 设一次：这是进程内全局变量，daemon 改不到。
             {
                 double (*getTO)(void)   = (double (*)(void))dlsym(RTLD_DEFAULT, "_XCTEventConfirmationTimeout");
@@ -568,14 +567,13 @@ static BOOL AXAgentBootstrap(void) {
                 }
             }
 
-            // 9e) 关掉「等 App 空闲」—— HOME / 滑动的 5 秒就耗在这上面（详见 AXInstallQuiescenceKiller 注释）
+            // 9e) 关掉「等 App 空闲」—— 合成事件前那 5 秒等待耗在这上面（详见 AXInstallQuiescenceKiller 注释）
             AXInstallQuiescenceKiller();
 
             // 9f) 这几个私有入口到底挂在哪个类上（我们打在 daemonSession 上是 unrecognized selector，
             //     说明类打错了；AScript 能用，它必然是打在对的对象上）
             AXFindSelectorOwners("_XCT_synthesizeEvent:implicitConfirmationInterval:completion:");
             AXFindSelectorOwners("_XCT_synthesizeEvent:completion:");
-            AXFindSelectorOwners("_silentPressButton:");
             /* 也有可能它根本不是 ObjC 方法，而是一个 C 函数（XCTestCore 里带这串名字） */
             {
                 void *fpC = dlsym(RTLD_DEFAULT, "_XCT_synthesizeEvent");
@@ -769,13 +767,6 @@ static volatile int       g_tapSynN   = 0;    /* 提交次数 */
 static volatile int       g_tapCfmN   = 0;    /* 确认回调次数 */
 static volatile int       g_tapCfmErr = 0;    /* 确认带错（daemon 拒绝）的次数 */
 
-/* ★★★ b103：HOME 预热的「完成闸门」。只写纯 C 变量 —— completion 块里绝不捕获
-   任何 ObjC 对象（b35/b36 的 SIGSEGV 教训）。
-   g_warmPending=1 表示后台正在等 dummy 那笔事件的确认，completion 一到就清 0；
-   g_warmBusy 防连按 HOME 时叠出多个等待线程。 */
-static volatile int       g_warmPending = 0;
-static volatile int       g_warmBusy    = 0;
-
 /* 核心实现（提交完立刻返回，不等待）。控制通道必须用这个 ——
    控制线程是串行的，这里一阻塞，后面的点击/滑动全在队列里排队，
    表现就是"点了半天才反应"。 */
@@ -909,8 +900,6 @@ static BOOL AXTapCore(double x, double y) {
             g_tapCfmMs = (g_tapSynAt > 0) ? (t - g_tapSynAt) : -1;
             if (err) g_tapCfmErr++;
             g_tapCfmN++;
-            /* ★ b103：HOME 后台预热在等这一笔的确认。只写纯 C 标志，零捕获。 */
-            if (g_warmPending) g_warmPending = 0;
         };
         SEL syn = NSSelectorFromString(@"synthesizeEvent:completion:");
         if (![gSession respondsToSelector:syn]) {
@@ -1025,59 +1014,6 @@ extern "C" void AXAgentStartSticky(void) {
 #pragma mark - 5. 手势（swipe / longpress / 任意轨迹）
 
 /// xy: [x0,y0, x1,y1, ...]  t: 每个点的时间偏移(秒)，最后一个点是 liftUp
-/* 按 Home 键（用自动化会话里的 XCUIDevice.pressButton:），用于自己复现"退到后台" */
-/* ★★★ 2026-11-02 b89：**纯 HID 直发 HOME**（真正绕开 XCTest 全部通道）。
-   为什么还要再来一条：XCDeviceEvent + 会话 performDeviceEvent 在 hometest 探针里
-   "看起来有效"（提交 0~1ms），但真机按 HOME 仍不回桌面 —— 因为事件只是交给了
-   XCTest 的 daemon，还要过它的确认与目标切换（目标一直挂在 hbVideo 上）。
-   hometest mode 4 之所以"有效"，靠的正是探针里那 200ms 的等待 + 之后人眼看桌面。
-   这里直接把「硬件按键」塞进系统 HID 流，不经过任何测试框架：
-     IOHIDEventCreateKeyboardEvent(0, kHIDPage_Consumer=0x0C, usage=0x40(Menu), down/up)
-     IOHIDEventSystemClientDispatchEvent(client, event)
-   代价：需要 com.apple.private.hid.client.event-dispatch（TrollStore 签名是否给未知），
-   失败时 dispatch 无返回值（静默），所以下面保留探测 + 逐级降级。 */
-typedef void *(*AXHIDKbFn)(CFAllocatorRef, uint64_t, uint32_t, uint32_t, unsigned char);
-
-extern "C" BOOL AXAgentHomeHID(long usage) {
-    static AXHIDKbFn fCreate = NULL;
-    static void *(*fClientCreate)(CFAllocatorRef) = NULL;
-    static void (*fDispatch)(void *, void *) = NULL;
-    static void *s_client = NULL;
-    static BOOL s_inited = NO;
-    static BOOL s_ok = NO;
-    if (!s_inited) {
-        s_inited = YES;
-        void *h = dlopen("/System/Library/Frameworks/IOKit.framework/IOKit", RTLD_LAZY | RTLD_GLOBAL);
-        void *scope = h ? h : RTLD_DEFAULT;
-        fCreate       = (AXHIDKbFn)dlsym(scope, "IOHIDEventCreateKeyboardEvent");
-        fClientCreate = (void *(*)(CFAllocatorRef))dlsym(scope, "IOHIDEventSystemClientCreate");
-        fDispatch     = (void (*)(void *, void *))dlsym(scope, "IOHIDEventSystemClientDispatchEvent");
-        if (!fClientCreate) {
-            /* iOS 13+ 只有带 type 的版本：IOHIDEventSystemClientCreateWithType(alloc, type, props)
-               type=1 是 Monitor 客户端（能收发事件）。★ 必须按 3 参数调用，少一个参数会崩。 */
-            void *(*f2)(CFAllocatorRef, int, CFDictionaryRef) =
-                (void *(*)(CFAllocatorRef, int, CFDictionaryRef))dlsym(scope, "IOHIDEventSystemClientCreateWithType");
-            if (f2) s_client = f2(kCFAllocatorDefault, 1, NULL);
-        } else {
-            s_client = fClientCreate(kCFAllocatorDefault);
-        }
-        s_ok = (fCreate && fDispatch && s_client);
-        ALog(@"🔧 HID 直发初始化：IOKit=%p create=%p client=%p(%p) dispatch=%p → %s",
-             h, (void *)fCreate, (void *)fClientCreate, s_client, (void *)fDispatch,
-             s_ok ? "可用" : "不可用");
-    }
-    if (!s_ok) return NO;
-    long long t0 = AXSeqMs();
-    void *down = fCreate(kCFAllocatorDefault, 0, 0x0C, (uint32_t)usage, 1);
-    void *up   = fCreate(kCFAllocatorDefault, 0, 0x0C, (uint32_t)usage, 0);
-    if (!down || !up) { ALog(@"❌ HID 事件构造失败 down=%p up=%p", down, up); return NO; }
-    fDispatch(s_client, down);
-    usleep(30 * 1000);
-    fDispatch(s_client, up);
-    ALog(@"🏠 home = 纯 HID 直发 page=0x0C usage=0x%lx（%lldms，不等确认）", usage, AXSeqMs() - t0);
-    return YES;
-}
-
 /* ★★★ 2026-11-02 b91：**HID 直发触摸**（绕开 XCTest 合成链）。
    为什么必须换：b89/b90 日志实证 —— `synthesizeEvent:completion:` 每笔的确认**全部失败**
    （err 一直涨），耗时 0.5~4 秒随机，那就是 daemon 等一个永远不会来的确认。
@@ -1256,262 +1192,62 @@ extern "C" void AXAgentSetHIDTap(int on) {
 
 extern "C" int AXAgentGetHIDTap(void) { return g_hidTapOn; }
 
-/* ★★ 2026-11-02 HOME 四条通路的实测探针（只探测，不改主路径）。
-   背景：`pressButton:` 每次 5.5 秒（XPC 到 daemon + 空闲等待）。从框架符号表挖到两条**硬件级**通路，
-   都不经过 UI 元素操作：
-     A. XCUIButtonConsole: -[XCUIButtonConsole initWithScreen:] + _silentlyPressButton:forDuration:
-     B. XCDeviceEvent:     +[XCDeviceEvent deviceEventWithPage:usage:duration:] +
-                           -[XCTRunnerDaemonSession performDeviceEvent:completion:]
-   B 里的 page/usage 是 HID 用法码：page 0x0C(Consumer) + usage 0x223(AC Home) 或 0x40(Menu)。
-   用 {"cmd":"hometest","mode":0..4} 逐条试，日志里带耗时，看哪条能秒回。 */
-static volatile long long g_evtCfmMs  = -1;
-static volatile int       g_evtCfmErr = -1;
+/* AXGestureCore 定义在文件后段（手势区），这里前置声明供 HOME 手势调用。 */
+static BOOL AXGestureCore(const double *xy, const double *t, int n);
 
-extern "C" long long AXAgentHomeTest(int mode) {
-    if (!gReady) { ALog(@"❌ hometest: 会话未就绪"); return -1; }
+/* ★★★ 2026-11-06 b108：HOME / 任务键统一走**底边系统手势**。
+   模拟 Home 键那一整套（XCTest 设备事件 / 纯 HID 按键 / HOME 后重认目标 / dummy 预热 /
+   各通路探针）已从本文件删除；手势走 synthesizeEvent，与点击同一条通道，不构造硬件
+   按键事件、不切会话目标、不跑预热。WDA 8100 的 HOME 旁路也指向这里。
+   系统行为（Apple Face ID 手势指南）：无 Home 键机型
+     · 从屏幕绝对底边快速上滑、到中部立即抬手（无停顿）= 回主屏
+     · 慢速上滑到中部短暂停住再抬手              = App 切换器（任务键）
+   判据是「抬手前有没有在中部停住」，不是单纯的快慢。
+   ★ 任务键停顿按用户实测反馈取 0.12s（100~150ms），不用资料里的 0.3~0.5s。
+   坐标单位 = UIScreen point（本机实测 430x932），不是视频帧 332x720、也不是物理像素。 */
+static BOOL AXSwipeFromBottom(BOOL taskSwitcher) {
+    UIScreen *sc = [UIScreen mainScreen];
+    CGSize sz = sc ? sc.bounds.size : CGSizeMake(430, 932);
+    double w  = sz.width  > 0 ? sz.width  : 430.0;
+    double h  = sz.height > 0 ? sz.height : 932.0;
+    double cx = w * 0.5;
+    double y0 = h - 2.0;          /* 绝对底边：起点抬高会被当前 App 当成滚动 */
+    double ym = h * 0.5;          /* 屏幕中部 */
+
+    double xy[12] = {0}, t[6] = {0};
+    int n = 0;
+    if (!taskSwitcher) {
+        /* 快滑 HOME：0.12s 走完，抬手前没有任何停顿 */
+        double ys[5] = { y0, h * 0.86, h * 0.66, ym, ym };
+        double ts[5] = { 0.0, 0.02, 0.05, 0.08, 0.12 };
+        n = 5;
+        for (int i = 0; i < n; i++) { xy[i*2] = cx; xy[i*2+1] = ys[i]; t[i] = ts[i]; }
+    } else {
+        /* 慢滑任务键：0.30s 到中部，同坐标停 0.12s，0.45s 抬手。
+           AXGestureCore 把最后一个点的时间戳当 liftUp、忽略它的坐标，
+           所以停顿必须放在中间点（同坐标、offset 递增）。
+           ★ 用户实测反馈：抬手前的停顿 0.45s 太长，100~150ms 就够。 */
+        double ys[6] = { y0, h * 0.82, h * 0.66, ym, ym, ym };
+        double ts[6] = { 0.0, 0.10, 0.20, 0.30, 0.42, 0.45 };
+        n = 6;
+        for (int i = 0; i < n; i++) { xy[i*2] = cx; xy[i*2+1] = ys[i]; t[i] = ts[i]; }
+    }
     long long t0 = AXSeqMs();
-    @try {
-        if (mode == 0) {                                  /* 对照：现在的 pressButton */
-            Class scrCls = NSClassFromString(@"XCUIScreen");
-            id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
-            id dev = ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device"));
-            ((void (*)(id, SEL, long))objc_msgSend)(dev, NSSelectorFromString(@"pressButton:"), 1);
-            ALog(@"🧪 hometest[0 pressButton] %lldms", AXSeqMs() - t0);
-        } else if (mode == 1) {                            /* 对照：_silentPressButton */
-            Class scrCls = NSClassFromString(@"XCUIScreen");
-            id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
-            id dev = ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device"));
-            ((void (*)(id, SEL, long))objc_msgSend)(dev, NSSelectorFromString(@"_silentPressButton:"), 1);
-            ALog(@"🧪 hometest[1 _silentPressButton] %lldms", AXSeqMs() - t0);
-        } else if (mode == 2) {                            /* A. XCUIButtonConsole 静默按键 */
-            Class ccCls = NSClassFromString(@"XCUIButtonConsole");
-            Class scrCls = NSClassFromString(@"XCUIScreen");
-            id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
-            SEL ini = NSSelectorFromString(@"initWithScreen:");
-            id console = ((id (*)(id, SEL, id))objc_msgSend)([ccCls alloc], ini, screen);
-            SEL sp = NSSelectorFromString(@"_silentlyPressButton:forDuration:");
-            if (![console respondsToSelector:sp]) { ALog(@"🧪 hometest[2] 无 _silentlyPressButton:forDuration:"); return -1; }
-            ((void (*)(id, SEL, long, double))objc_msgSend)(console, sp, 1, 0.05);
-            ALog(@"🧪 hometest[2 XCUIButtonConsole 静默] %lldms", AXSeqMs() - t0);
-        } else if (mode >= 5) {                            /* C. 纯 HID 直发（b89） */
-            long usage = (mode == 6) ? 0x223 : 0x40;        /* Menu / AC Home */
-            BOOL ok = AXAgentHomeHID(usage);
-            ALog(@"🧪 hometest[%d HID直发 usage=0x%lx] %s 总耗时 %lldms",
-                 mode, usage, ok ? "已发" : "不可用", AXSeqMs() - t0);
-        } else {                                           /* B. 硬件设备事件 */
-            long page = 12;                                 /* kHIDPage_Consumer */
-            long usage = (mode == 3) ? 0x223 : 0x40;        /* AC Home / Menu */
-            Class deCls = NSClassFromString(@"XCDeviceEvent");
-            SEL mk = NSSelectorFromString(@"deviceEventWithPage:usage:duration:");
-            if (![deCls respondsToSelector:mk]) { ALog(@"🧪 hometest[%d] 无 deviceEventWithPage:usage:duration:", mode); return -1; }
-            id ev = ((id (*)(id, SEL, long, long, double))objc_msgSend)(deCls, mk, page, usage, 0.05);
-            SEL pd = NSSelectorFromString(@"performDeviceEvent:completion:");
-            if (![gSession respondsToSelector:pd]) { ALog(@"🧪 hometest[%d] 会话无 performDeviceEvent:completion:", mode); return -1; }
-            g_evtCfmMs = -1; g_evtCfmErr = -1;
-            long long sub = AXSeqMs();
-            ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, pd, ev, ^(id err) {
-                g_evtCfmMs = AXSeqMs() - sub;
-                g_evtCfmErr = err ? 1 : 0;
-            });
-            ALog(@"🧪 hometest[%d deviceEvent page=%ld usage=0x%lx] 提交 %lldms", mode, page, usage, AXSeqMs() - t0);
-            usleep(200 * 1000);   /* 等 200ms 看回包，探针专用 */
-            ALog(@"🧪 hometest[%d] 回调 %lldms err=%d", mode, g_evtCfmMs, g_evtCfmErr);
-        }
-    } @catch (NSException *e) {
-        ALog(@"🧪 hometest[%d] 异常：%@", mode, e.reason);
-        return -1;
-    }
-    return AXSeqMs() - t0;
-}
-
-/* ★ HOME 之后需要让自动化会话重新认一次目标。
-   b103~b105 用 XCUIApplication 读 state 来触发，实测每轮都抛
-   `Device is not configured for UI testing`，等于没做；b106 改成直接重发
-   requestAutomationSession...（见下方实现）。 */
-static volatile int g_retargetDone = 1;
-static volatile long long g_retargetAtMs = 0;
-static volatile long long g_retargetReplyMs = -1;
-
-/* ★ 2026-11-06 b106：原来这里用 XCUIApplication 读 state 来"认目标"，
-   但每轮日志都是 `⚠️ SpringBoard 预热失败：Device is not configured for UI testing`
-   ⇒ 这条路径在这台设备上从来没成功过，等于 HOME 后的认目标一直没人做。
-   改成用会话自己的入口重新发一次 requestAutomationSessionForTestTargetWithPID:
-   （bootstrap 起会话用的就是它），把 daemon 那次"重新认目标"主动提前触发，
-   而不是等它自己按 5 秒超时被动发生。
-   ★ reply 块不捕获任何 ObjC 对象（只用全局标量），避免 XPC 回调时野指针。 */
-static void AXWarmSpringboard(void) {
-    g_retargetReplyMs = -1;
-    if (!gSession) { g_retargetDone = 1; return; }
-    SEL rs = NSSelectorFromString(@"requestAutomationSessionForTestTargetWithPID:preferredBackendPath:reply:");
-    if (![gSession respondsToSelector:rs]) {
-        ALog(@"⚠️ 会话无 requestAutomationSession，跳过重认目标");
-        g_retargetDone = 1;
-        return;
-    }
-    g_retargetDone = 0;
-    @try {
-        g_retargetAtMs = AXSeqMs();
-        /* ★ XPC 回调里只写 C 全局标量：不捕获对象、不调 Objective-C 方法、不写日志
-           （b77 在 completion 里写日志崩过，b79 起保持空块最安全）。 */
-        void (^reply)(id) = ^(id a) {
-            g_retargetReplyMs = AXSeqMs() - g_retargetAtMs;
-            g_retargetDone = 1;
-        };
-        ((void (*)(id, SEL, int, id, id))objc_msgSend)(
-            gSession, rs, (int)getpid(), nil, reply);
-        ALog(@"🏠 会话重认目标已发出（pid=%d，%lldms）",
-             (int)getpid(), AXSeqMs() - g_retargetAtMs);
-    } @catch (NSException *e) {
-        g_retargetDone = 1;
-        ALog(@"⚠️ 会话重认目标异常：%@", e.reason);
-    }
-}
-
-/* ★★★ b103：HOME 后预热必须「真等到做完」，而不是提交完就报完成。
-   b96/b97 原来在 dispatch_after 里 AXTapCore(2,2) 异步提交完就打
-   「🏠 dummy 预热完成（2ms）」—— 那 2ms 只是本地调用返回，daemon 侧
-   「HOME 后重新认目标」的一次性开销根本还没走完，于是原封不动落到用户
-   第一笔真实点击上。用户实测：HOME 后点一下要等约 5 秒，而**点击接点击很快**
-   ⇒ 点击链路本身没病，只有 HOME 之后那一笔要付一次代价（AXAgent.mm:1405 注释
-   早就写过「回到桌面后第一笔点击要重新认目标，日志 4477ms」）。
-   改法：提交 dummy 后在后台 QOS_CLASS_UTILITY 线程等 completion（最多 6 秒）。
-   ★★ b106 更正：b103~b105 的日志显示 dummy 1~52ms 就「确认已到」，但真实点击
-   仍不生效 ⇒ 那 5 秒**不在事件确认上**，等 dummy 没吃到它。同时每轮都有
-   `⚠️ SpringBoard 预热失败：Device is not configured for UI testing`，说明负责
-   认目标的 XCUIApplication 路径一直没跑通。b106 改为主动重发
-   requestAutomationSession... 并等它的 reply，见 AXWarmSpringboard。
-   控制线程完全不参与，HOME 路径和正常点击路径一行没动。 */
-static void AXWarmAfterHome(void) {
-    if (g_warmBusy) return;              /* 连按 HOME 不叠等待线程 */
-    g_warmBusy = 1;
-    AXWarmSpringboard();                 /* b106：主动重认会话目标（原来那条一直失败） */
-    long long t0 = AXSeqMs();
-    g_warmPending = 1;
-    AXTapCore(2.0, 2.0);                /* dummy：状态栏最左，无可点元素 */
-    /* 同时等「认目标 reply」和「dummy completion」；两者都可能永不回来，
-       所以总上限 6 秒。本函数在后台队列，不占控制线程。 */
-    while ((g_warmPending || !g_retargetDone) && (AXSeqMs() - t0) < 6000) {
-        usleep(10 * 1000);
-    }
-    BOOL arrived = (g_warmPending == 0);
-    ALog(@"🏠 HOME 后预热完成（%lldms：认目标 %@，dummy 确认=%@）",
-         AXSeqMs() - t0,
-         g_retargetReplyMs >= 0
-             ? [NSString stringWithFormat:@"reply %lldms 已回", g_retargetReplyMs]
-             : @"reply 未回/超时",
-         arrived ? @"已到" : @"未到");
-    g_warmPending = 0;
-    g_warmBusy = 0;
+    BOOL ok = AXGestureCore(xy, t, n);
+    ALog(@"🏠 %@手势（底边 %.0f → 中部 %.0f，末点 %.2fs，屏 %.0fx%.0f）%@ %lldms",
+         taskSwitcher ? @"任务键慢滑" : @"HOME 快滑", y0, ym, t[n-1], w, h,
+         ok ? @"已提交" : @"失败", AXSeqMs() - t0);
+    return ok;
 }
 
 extern "C" BOOL AXAgentPressHome(void) {
     if (!gReady) { ALog(@"❌ pressHome: 会话未就绪"); return NO; }
-    /* ★ b101：HOME 会切前台 / 触发控制通道重建，事件上下文很可能跟着换掉。
-       这里先把当前线程的确认间隔压住，dummy 预热那笔才不会按 5 秒干等。 */
-    AXEnsureCfmInterval("home");
+    return AXSwipeFromBottom(NO);
+}
 
-    /* ★★★ 2026-11-02 b89：第一优先 = 纯 HID 直发（page 0x0C / usage 0x40 Menu）。
-       这条不经过 XCTest，没有确认、没有目标切换、没有 quiescence，发完即回桌面。
-       ★ 2026-11-06 b104 实测：HID 单独发出**并不能回桌面**（用户实测 HOME 不生效），
-       它只是不报错。所以 HID 只当"无副作用的一次尝试"，真正回桌面仍要靠下面
-       XCTest 那两条。 */
-    BOOL hidSent = AXAgentHomeHID(0x40);
-
-    /* ★★★ b103：预热改成「提交 + 真等到做完」，详见 AXWarmAfterHome 注释。
-       b96/b97 原来只是异步提交完 2ms 就报完成，daemon 侧的一次性开销没吃到；
-       延迟也从原来两段 250+150ms 缩到 80ms，让那次开销尽早开始计时。 */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(80 * NSEC_PER_MSEC)),
-                   dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        AXWarmAfterHome();
-    });
-
-    /* ★★ 2026-11-06 b105：撤销 b104 的 early return。
-       b104 只留 HID 直发、砍掉下面这笔 XCTest performDeviceEvent 后，用户实测
-       **HOME 完全不生效** ⇒ HID 直发只是"发了没报错"，真正回桌面靠的是下面这笔
-       XCDeviceEvent。所以 HOME 路径原样恢复（b103 行为），本版不再动别处。 */
-
-    /* ★★★ 2026-11-02 定案：HOME 走**硬件设备事件**，实测提交 0~1ms、用户已确认能回桌面。
-       为什么不用 pressButton:：那条走 XPC + 空闲等待，实测每次 5.3~5.5 秒
-       （pressButton / _silentPressButton / XCUIButtonConsole 三条都一样慢，b84 探针实测数据）。
-       设备事件这条路是直接用 HID 用法码构造「硬件按键」：
-         +[XCDeviceEvent deviceEventWithPage:usage:duration:]  (page=12 Consumer, usage=0x40 Menu)
-         → 首选 -[XCTRunnerDaemonSession performDeviceEvent:completion:]（发送即返回，不堵控制线程）
-         → 退 -[XCUIDevice performDeviceEvent:error:]（WDA 的写法，但**同步阻塞 5.5 秒**，实测堵死控制线程）
-       用法码来自 b84 实测：0x40(Menu) 有效、0x223(AC Home) 无效。 */
-    {
-        Class deCls = NSClassFromString(@"XCDeviceEvent");
-        SEL mk = NSSelectorFromString(@"deviceEventWithPage:usage:duration:");
-        if (deCls && [deCls respondsToSelector:mk]) {
-            @try {
-                long long t0 = AXSeqMs();
-                id ev = ((id (*)(id, SEL, long, long, double))objc_msgSend)(deCls, mk, 12, 0x40, 0.05);
-                if (ev) {
-                    /* ★☆ 先走**发送即返回**的会话版，再退同步版。
-                       实测（b87 日志）：`-[XCUIDevice performDeviceEvent:error:]` 是**同步阻塞**的，
-                       每次 5.5 秒 —— 它把我们的控制线程堵死，这 5.5 秒里 socket 都读不了，
-                       用户按完 HOME 紧接着的那一下点击只能躺在 TCP 缓冲里等着 ⇒ 就是「点一下等几秒」。
-                       会话版 completion 永不回调，但**立刻返回**，控制线程不阻塞，下一笔点击马上能处理。
-                       （代价：daemon 那边这笔事件可能要挂一会儿，但实测接着点的那笔确认只要 1ms，不影响。） */
-                    SEL pd = NSSelectorFromString(@"performDeviceEvent:completion:");
-                    if ([gSession respondsToSelector:pd]) {
-                        void (^done)(id) = ^(id e) { /* 不捕获对象 */ };
-                        ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, pd, ev, done);
-                        ALog(@"🏠 home = 会话 performDeviceEvent（%lldms，发送即返回）hid=%d", AXSeqMs() - t0, (int)hidSent);
-                        return YES;
-                    }
-                    /* 退路：同步版（会阻塞 5.5 秒，但不阻塞也比回不了桌面强） */
-                    Class scrCls = NSClassFromString(@"XCUIScreen");
-                    id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
-                    id dev = screen ? ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device")) : nil;
-                    SEL pde = NSSelectorFromString(@"performDeviceEvent:error:");
-                    if (dev && [dev respondsToSelector:pde]) {
-                        NSError *err = nil;
-                        ((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(dev, pde, ev, &err);
-                        ALog(@"🏠 home = XCUIDevice performDeviceEvent（%lldms）err=%@",
-                             AXSeqMs() - t0, err ? err.localizedDescription : @"无");
-                        return YES;
-                    }
-                }
-                ALog(@"⚠️ pressHome: deviceEvent 构造失败，回退按键");
-            } @catch (NSException *e) {
-                ALog(@"⚠️ pressHome: deviceEvent 异常 %@，回退按键", e.reason);
-            }
-        }
-    }
-
-    /* ★ b89：HID 已经发出去了，就**不要**再走按键通道 —— 那条每次 5.5 秒，
-       只会白堵控制线程（用户最恨的"按完 HOME 点一下要等几秒"）。
-       只有 HID 连符号都拿不到（hidSent=NO）才用按键兜底。 */
-    /* ★ b90：HID 直发成功后也要把会话目标切到 SpringBoard —— b89 在这里直接 return，
-       漏掉了预热，回到桌面后第一笔点击要重新认目标（日志 4477ms 就是这么来的）。 */
-    if (hidSent) { ALog(@"🏠 home 已由 HID 直发（跳过按键盘通道，预热 SpringBoard）"); AXWarmSpringboard(); return YES; }
-
-    Class scrCls = NSClassFromString(@"XCUIScreen");
-    if (!scrCls) return NO;
-    id screen = ((id (*)(id, SEL))objc_msgSend)(scrCls, NSSelectorFromString(@"mainScreen"));
-    if (!screen) return NO;
-    id dev = ((id (*)(id, SEL))objc_msgSend)(screen, NSSelectorFromString(@"device"));
-    if (!dev) { ALog(@"❌ pressHome: 无 device"); return NO; }
-    SEL pb = NSSelectorFromString(@"pressButton:");
-    if (![dev respondsToSelector:pb]) { ALog(@"❌ pressHome: 无 pressButton:"); return NO; }
-    long long phT0 = AXSeqMs();
-    /* ★★ 2026-11-02 照 AScript 的做法：优先用**静默版** `_silentPressButton:`。
-       普通 pressButton: 会等 App 空闲（quiescence，默认 5 秒），目标 App 一直在动就每次等满，
-       实测日志里相邻两次 pressHome 正好 5.5 秒。静默版不走那套等待。
-       框架符号表里确实有 -[XCUIDevice _silentPressButton:] 与 -[XCUIButtonConsole _silentlyPressButton:forDuration:]。 */
-    SEL spb = NSSelectorFromString(@"_silentPressButton:");
-    static BOOL s_silentLogged = NO;
-    if ([dev respondsToSelector:spb]) {
-        ((void (*)(id, SEL, long))objc_msgSend)(dev, spb, 1);   /* XCUIDeviceButtonHome = 1 */
-        if (!s_silentLogged) { s_silentLogged = YES; ALog(@"🏠 走 _silentPressButton:（不等空闲）"); }
-        ALog(@"🏠 pressHome 已发送（静默版，耗时 %lldms）", AXSeqMs() - phT0);
-        AXWarmSpringboard();
-        return YES;
-    }
-    ((void (*)(id, SEL, long))objc_msgSend)(dev, pb, 1);   /* XCUIDeviceButtonHome = 1 */
-    ALog(@"🏠 pressHome 已发送（普通版，调用耗时 %lldms）", AXSeqMs() - phT0);
-    AXWarmSpringboard();
-    return YES;
+extern "C" BOOL AXAgentPressTaskSwitcher(void) {
+    if (!gReady) { ALog(@"❌ pressTask: 会话未就绪"); return NO; }
+    return AXSwipeFromBottom(YES);
 }
 
 #pragma mark - WDA /wda/homescreen 旁路（2026-11-06）
@@ -1527,11 +1263,10 @@ extern "C" BOOL AXAgentPressHome(void) {
    b99 只换了 handleHomescreenCommand: 一条，客户端走 /wda/pressButton 时照样等 5 秒。
    ★ b100：HTTP 层两条 + FBHelpers 层三条一起拦，name 不是 home 的按钮一律走原实现，
      tap / swipe / screenshot 与其它端点一律不碰。
-   ★ 发键只用已验证的硬件旁路（HID page 0x0C / usage 0x40 + 会话版 XCDeviceEvent，
-     0~35ms、不等确认）；FBResponseWithOK 拿不到时 HTTP 层不换，由 WDA 原 handler
-     在 FBHelpers 立即返回 YES 后自己回 200。
-   ★ 不 hook XCTest 的 -[XCUIDevice pressButton:]：会影响音量/锁屏，且和
-     AXAgentPressHome 的兜底路径互相递归。 */
+   ★ b108 起：旁路里不再发模拟 Home 键，统一调 AXAgentPressHome() 走底边手势，
+     提交完立即回包，不等任何事件确认。FBResponseWithOK 拿不到时 HTTP 层不换，
+     由 WDA 原 handler 在 FBHelpers 立即返回 YES 后自己回 200。
+   ★ 不 hook XCTest 的 -[XCUIDevice pressButton:]：会影响音量/锁屏。 */
 
 /* FBResponseWithOK() 是 WebDriverAgentLib 导出的 C 函数（符号 _FBResponseWithOK）。 */
 static id   (*AXWDAOK)(void) = NULL;
@@ -1557,14 +1292,11 @@ static id AXWDARequestName(id request) {
     } @catch (NSException *e) { return nil; }
 }
 
-/* 所有 HOME hook 共用的发键动作：只发不等，绝不调用任何 XCTest 同步按键通道。 */
+/* 所有 HOME hook 共用的动作：发底边手势，提交完立即回包，不碰 XCTest 同步按键通道。 */
 static void AXWDAFireHome(const char *tag) {
     long long t0 = AXSeqMs();
     BOOL ok = AXAgentPressHome();
-    /* 会话没建立时 AXAgentPressHome 直接返回 NO；纯 HID 直发不依赖会话，补一次。
-       已经在桌面时连发两次 HOME 无副作用。 */
-    if (!ok) ok = AXAgentHomeHID(0x40);
-    ALog(@"🌐 %s → 旁路 HOME %@（%lldms）", tag, ok ? @"已发" : @"HID 不可用", AXSeqMs() - t0);
+    ALog(@"🌐 %s → 旁路 HOME %@（%lldms）", tag, ok ? @"已发" : @"未发", AXSeqMs() - t0);
 }
 
 /* HTTP 层：整条 +[FBCustomCommands handleHomescreenCommand:] 换掉。
@@ -4546,8 +4278,9 @@ static void AXTouchHandle(const uint8_t *b) {
 
 static void AXCtrlKeycode(uint32_t kc) {
     switch (kc) {
-        case 3:   AXAgentPressHome();           break;   /* Home */
+        case 3:   AXAgentPressHome();           break;   /* Home → 底边快滑 */
         case 4:   AXAgentPressHome();           break;   /* Back → iOS 无返回键，等价 Home */
+        case 187: AXAgentPressTaskSwitcher();  break;   /* Recent / 任务键 → 底边慢滑 + 中部停 120ms */
         case 66:  AXAgentKey(@"\r", 0);         break;   /* Enter */
         case 67:  AXAgentKey(@"\b", 0);         break;   /* Del/退格 */
         default:  ALog(@"  ⌨️ 未映射的 keycode=%u（忽略）", kc); break;
