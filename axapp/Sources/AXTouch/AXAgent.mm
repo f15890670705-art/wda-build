@@ -742,6 +742,13 @@ static volatile int       g_tapSynN   = 0;    /* 提交次数 */
 static volatile int       g_tapCfmN   = 0;    /* 确认回调次数 */
 static volatile int       g_tapCfmErr = 0;    /* 确认带错（daemon 拒绝）的次数 */
 
+/* ★★★ b103：HOME 预热的「完成闸门」。只写纯 C 变量 —— completion 块里绝不捕获
+   任何 ObjC 对象（b35/b36 的 SIGSEGV 教训）。
+   g_warmPending=1 表示后台正在等 dummy 那笔事件的确认，completion 一到就清 0；
+   g_warmBusy 防连按 HOME 时叠出多个等待线程。 */
+static volatile int       g_warmPending = 0;
+static volatile int       g_warmBusy    = 0;
+
 /* 核心实现（提交完立刻返回，不等待）。控制通道必须用这个 ——
    控制线程是串行的，这里一阻塞，后面的点击/滑动全在队列里排队，
    表现就是"点了半天才反应"。 */
@@ -875,6 +882,8 @@ static BOOL AXTapCore(double x, double y) {
             g_tapCfmMs = (g_tapSynAt > 0) ? (t - g_tapSynAt) : -1;
             if (err) g_tapCfmErr++;
             g_tapCfmN++;
+            /* ★ b103：HOME 后台预热在等这一笔的确认。只写纯 C 标志，零捕获。 */
+            if (g_warmPending) g_warmPending = 0;
         };
         SEL syn = NSSelectorFromString(@"synthesizeEvent:completion:");
         if (![gSession respondsToSelector:syn]) {
@@ -1320,6 +1329,37 @@ static void AXWarmSpringboard(void) {
     });
 }
 
+/* ★★★ b103：HOME 后预热必须「真等到做完」，而不是提交完就报完成。
+   b96/b97 原来在 dispatch_after 里 AXTapCore(2,2) 异步提交完就打
+   「🏠 dummy 预热完成（2ms）」—— 那 2ms 只是本地调用返回，daemon 侧
+   「HOME 后重新认目标」的一次性开销根本还没走完，于是原封不动落到用户
+   第一笔真实点击上。用户实测：HOME 后点一下要等约 5 秒，而**点击接点击很快**
+   ⇒ 点击链路本身没病，只有 HOME 之后那一笔要付一次代价（AXAgent.mm:1405 注释
+   早就写过「回到桌面后第一笔点击要重新认目标，日志 4477ms」）。
+   改法：提交 dummy 后，在后台 QOS_CLASS_UTILITY 线程**同步等 completion 回来**
+   （最多 6 秒），把这次开销耗在用户按完 HOME、还在看桌面没点下去的空闲里。
+   控制线程完全不参与，点击提交路径一行没动，8100 / Runner / HID 触摸全不碰。
+   ★ 判定日志：打出「确认已到」且耗时数秒 ⇒ 确实吃掉了，第一笔点击应当立刻生效；
+     若 1~2ms 就「确认已到」⇒ 那 5 秒不在事件确认上，改查编码/画面侧，别再往点击堆补丁。 */
+static void AXWarmAfterHome(void) {
+    if (g_warmBusy) return;              /* 连按 HOME 不叠等待线程 */
+    g_warmBusy = 1;
+    AXWarmSpringboard();                 /* 原有认目标，保留不动 */
+    long long t0 = AXSeqMs();
+    g_warmPending = 1;
+    AXTapCore(2.0, 2.0);                /* dummy：状态栏最左，无可点元素 */
+    /* completion 可能永不回调（HOME 那笔 deviceEvent 就是这样），所以必须有超时上限。
+       10ms 轮询纯 C 忙等，CPU 占用可忽略；本函数在后台队列，不占控制线程。 */
+    while (g_warmPending && (AXSeqMs() - t0) < 6000) {
+        usleep(10 * 1000);
+    }
+    BOOL arrived = (g_warmPending == 0);
+    ALog(@"🏠 dummy 预热完成（%lldms，%@）", AXSeqMs() - t0,
+         arrived ? @"确认已到" : @"等满 6s 上限");
+    g_warmPending = 0;
+    g_warmBusy = 0;
+}
+
 extern "C" BOOL AXAgentPressHome(void) {
     if (!gReady) { ALog(@"❌ pressHome: 会话未就绪"); return NO; }
     /* ★ b101：HOME 会切前台 / 触发控制通道重建，事件上下文很可能跟着换掉。
@@ -1333,20 +1373,12 @@ extern "C" BOOL AXAgentPressHome(void) {
        两次 HOME 连发没有副作用（已经在桌面时再按一次还是桌面）。 */
     BOOL hidSent = AXAgentHomeHID(0x40);
 
-    /* ★★★ b96/b97：HOME 之后**主动打一笔 dummy 点击**，把"认目标"的 5 秒在后台吃掉。
-       用户按 HOME 之后要看一下桌面才去点图标，这几秒本来就闲着 —— 让 daemon 在这段时间里
-       把"目标从后台的 hbVideo 换成 SpringBoard"这件事做完，真正点击时就不用等。
-       落点 (2,2) 是状态栏最左边，没有可点元素，副作用仅仅是可能滚回顶部。
-       ★ 另一条 AXWarmSpringboard（读 XCUIApplication.state）也保留，先建会话再打点。 */
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(250 * NSEC_PER_MSEC)),
+    /* ★★★ b103：预热改成「提交 + 真等到做完」，详见 AXWarmAfterHome 注释。
+       b96/b97 原来只是异步提交完 2ms 就报完成，daemon 侧的一次性开销没吃到；
+       延迟也从原来两段 250+150ms 缩到 80ms，让那次开销尽早开始计时。 */
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(80 * NSEC_PER_MSEC)),
                    dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        AXWarmSpringboard();
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(150 * NSEC_PER_MSEC)),
-                       dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-            long long t0 = AXSeqMs();
-            AXTapCore(2.0, 2.0);          /* dummy：不吃用户操作，只用来把目标认好 */
-            ALog(@"🏠 dummy 预热完成（%lldms）", AXSeqMs() - t0);
-        });
+        AXWarmAfterHome();
     });
 
     /* ★★★ 2026-11-02 定案：HOME 走**硬件设备事件**，实测提交 0~1ms、用户已确认能回桌面。
