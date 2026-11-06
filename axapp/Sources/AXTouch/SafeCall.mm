@@ -11,6 +11,9 @@
 #include <unistd.h>
 #include <fcntl.h>
 
+// AXAgent.mm 里实现：WDA /wda/homescreen 的 HOME 旁路（必须在 HTTP 服务起来之前装）
+extern "C" void AXInstallWDAHomeBypass(void);
+
 // ObjC++ 文件：既能捕 NSException 也能捕 C++ 异常
 // （XCTest 内部抛的是 C++ 异常 → std::terminate → abort，纯 .m 里的 @catch(...) 抓不到）
 
@@ -55,6 +58,10 @@ extern "C" NSString *AXProbeDaemonSession(void) {
 }
 
 extern "C" NSString *AXStartWDAServer(void) {
+    /* ★ 2026-11-06：/wda/homescreen 原来要等 XCTest 的确认（HOME 后前台变 SpringBoard，
+       确认永远不回来）⇒ 请求不回执、一直占着通道。这里在服务接收第一个请求之前把那条
+       HOME 命令换成硬件旁路，立即回 200。只装一次，装不上会自己重试。 */
+    AXInstallWDAHomeBypass();
     Class cls = NSClassFromString(@"FBWebServer");
     if (cls == Nil) return @"FBWebServer 类不存在";
     __block id server = nil;
