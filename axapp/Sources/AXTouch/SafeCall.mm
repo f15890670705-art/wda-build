@@ -60,8 +60,8 @@ extern "C" NSString *AXProbeDaemonSession(void) {
 extern "C" NSString *AXStartWDAServer(void) {
     /* ★ 2026-11-06：WDA 的 HOME 原来要等 XCTest 的确认（HOME 后前台变 SpringBoard，
        确认永远不回来）⇒ 请求不回执、一直占着通道。这里在收第一个请求之前把 HOME
-       所有通道（/wda/homescreen、/wda/pressButton、FBHelpers 三个方法）换成硬件旁路。
-       逐项安装、装不上会自己重试；服务起来后下面还会再补装一次。 */
+       所有通道（/wda/homescreen、/wda/pressButton、FBHelpers 三个方法）指向底边手势，
+       提交后立即回包。逐项安装、装不上会自己重试；服务起来后下面还会再补装一次。 */
     AXInstallWDAHomeBypass();
     Class cls = NSClassFromString(@"FBWebServer");
     if (cls == Nil) return @"FBWebServer 类不存在";
