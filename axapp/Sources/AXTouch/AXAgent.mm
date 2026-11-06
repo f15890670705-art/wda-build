@@ -743,33 +743,43 @@ static volatile int       g_tapCfmErr = 0;    /* 确认带错（daemon 拒绝）
 /* 核心实现（提交完立刻返回，不等待）。控制通道必须用这个 ——
    控制线程是串行的，这里一阻塞，后面的点击/滑动全在队列里排队，
    表现就是"点了半天才反应"。 */
+/* ★★★ 2026-11-06 b101：修「按完 HOME 紧接着点一下要等约 5 秒才生效」。
+   `implicitEventConfirmationIntervalForCurrentContext` 这一族是**线程局部 + 上下文相关**的：
+   b90 只在「第一次提交 tap 的那个线程」设过一次 0.02（static BOOL s_cfmInit），
+   之后控制通道重连、HOME 切前台换了线程或 context 重建，新上下文又回到默认 **5.000**
+   ⇒ daemon 那边每笔事件都按 5 秒干等确认，用户感受就是「HOME 快、点击慢 5 秒」。
+   agent.log 实证：bootstrap 读到 5.000、设成 0.050，tap 线程设过一次 0.020，
+   但后续 `上次确认` 仍是 2175ms / 3352ms、心跳平均 1346ms ⇒ 那个设置早就失效了。
+   修法：每条会合成事件的路径、**每笔事件都在当前线程重设一次**（一次 objc_msgSend，
+   开销可忽略；绝不能设 0，b78 实测会闪退，0.02 已在跑且安全）。
+   值本来就是目标值时不打日志；退回 5 秒才打一行，方便 agent.log 一眼判定。 */
+static void AXEnsureCfmInterval(const char *tag) {
+    if (!gSession) return;
+    SEL s3 = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:");
+    SEL rd = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
+    if (![gSession respondsToSelector:s3]) return;
+    @try {
+        double before = [gSession respondsToSelector:rd]
+            ? ((double (*)(id, SEL))objc_msgSend)(gSession, rd) : -1;
+        ((void (*)(id, SEL, double))objc_msgSend)(gSession, s3, 0.02);
+        double after = [gSession respondsToSelector:rd]
+            ? ((double (*)(id, SEL))objc_msgSend)(gSession, rd) : -1;
+        if (before < 0 || before > 0.021 || after > 0.021) {
+            ALog(@"⚙️ %s 确认间隔 %.3f → %.3f（每笔重设，防退回 5s）", tag, before, after);
+        }
+    } @catch (NSException *e) {
+        ALog(@"⚠️ %s 确认间隔设置失败：%@", tag, e.reason);
+    }
+}
+
 static BOOL AXTapCore(double x, double y) {
     if (!gReady || !gSession) {
         ALog(@"❌ tap 失败：会话未就绪");
         return NO;
     }
     @try {
-        /* ★★★ 2026-11-02 b90：`...ForCurrentContext` 这一族是**线程局部**的！
-           bootstrap 在启动线程设 0.05（日志回读确实 0.050），但点击跑在控制线程，
-           那一侧的 context 还是默认 **5.000** ⇒ 每笔点击仍然干等 4.5 秒
-           （b89 日志实证：`确认=4477ms err=1`，用户感受就是"按完 HOME 点一下要等 5 秒"）。
-           所以必须在**真正合成事件的那条线程**上再设一次。只设一次，之后跟着线程走。 */
-        static BOOL s_cfmInit = NO;
-        if (!s_cfmInit) {
-            s_cfmInit = YES;
-            SEL s3 = NSSelectorFromString(@"setImplicitEventConfirmationIntervalForCurrentContextWithoutSideEffects:");
-            SEL rd = NSSelectorFromString(@"implicitEventConfirmationIntervalForCurrentContext");
-            @try {
-                double before = [gSession respondsToSelector:rd]
-                    ? ((double (*)(id, SEL))objc_msgSend)(gSession, rd) : -1;
-                ((void (*)(id, SEL, double))objc_msgSend)(gSession, s3, 0.02);
-                double after = [gSession respondsToSelector:rd]
-                    ? ((double (*)(id, SEL))objc_msgSend)(gSession, rd) : -1;
-                ALog(@"⚙️ tap 线程确认间隔 %.3f → %.3f（b96 降到 0.02，实测 0.05 仍要 ~325ms）", before, after);
-            } @catch (NSException *e) {
-                ALog(@"⚠️ tap 线程确认间隔设置失败：%@", e.reason);
-            }
-        }
+        /* ★ 每笔 tap 都在当前线程重设，别再只设一次（详见 AXEnsureCfmInterval）。 */
+        AXEnsureCfmInterval("tap");
 
         /* ★★★ 2026-11-02 b94：先试 **XCUICoordinate.tap**。
            b91~b93 的 HID 直发在 App 进程里被 backboardd 判"来源无效"（不报错、静默丢弃），
@@ -1288,6 +1298,9 @@ static void AXWarmSpringboard(void) {
 
 extern "C" BOOL AXAgentPressHome(void) {
     if (!gReady) { ALog(@"❌ pressHome: 会话未就绪"); return NO; }
+    /* ★ b101：HOME 会切前台 / 触发控制通道重建，事件上下文很可能跟着换掉。
+       这里先把当前线程的确认间隔压住，dummy 预热那笔才不会按 5 秒干等。 */
+    AXEnsureCfmInterval("home");
 
     /* ★★★ 2026-11-02 b89：第一优先 = 纯 HID 直发（page 0x0C / usage 0x40 Menu）。
        这条不经过 XCTest，没有确认、没有目标切换、没有 quiescence，发完即回桌面。
@@ -1595,6 +1608,7 @@ extern "C" void AXInstallWDAHomeBypass(void) {
 static BOOL AXGestureCore(const double *xy, const double *t, int n) {
     if (!gReady || !gSession) { ALog(@"❌ gesture 失败：会话未就绪"); return NO; }
     if (n < 2) { ALog(@"❌ gesture 失败：点数不足"); return NO; }
+    AXEnsureCfmInterval("gesture");   /* ★ b101：同 tap，每笔在当前线程重设，防退回 5s */
     @try {
         Class pathCls = NSClassFromString(@"XCPointerEventPath");
         Class recCls  = NSClassFromString(@"XCSynthesizedEventRecord");
