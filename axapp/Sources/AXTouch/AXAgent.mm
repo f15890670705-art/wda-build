@@ -1297,36 +1297,47 @@ extern "C" long long AXAgentHomeTest(int mode) {
     return AXSeqMs() - t0;
 }
 
-/* ★ 2026-11-02：HOME 之后把会话目标切到 SpringBoard（桌面）。
-   现象：按 HOME 后立刻点一个坐标，**手机屏幕本身**要等几秒才有反应。
-   原因：我们的自动化会话是 requestAutomationSessionForTestTargetWithPID:(getpid()) 起的，
-   目标一直挂在 hbVideo 上；回到桌面后前台变成 com.apple.springboard，
-   第一笔事件要等 XCTest 重新认目标（默认约 5 秒）。
-   WDA 的 fb_goToHomescreenWithError: 之后会 fb_waitUntilRunning 一下 SpringBoard，
-   我们照做：异步 activate 一次，慢也慢在后台线程，不挡用户操作。 */
+/* ★ HOME 之后需要让自动化会话重新认一次目标。
+   b103~b105 用 XCUIApplication 读 state 来触发，实测每轮都抛
+   `Device is not configured for UI testing`，等于没做；b106 改成直接重发
+   requestAutomationSession...（见下方实现）。 */
+static volatile int g_retargetDone = 1;
+static volatile long long g_retargetAtMs = 0;
+static volatile long long g_retargetReplyMs = -1;
+
+/* ★ 2026-11-06 b106：原来这里用 XCUIApplication 读 state 来"认目标"，
+   但每轮日志都是 `⚠️ SpringBoard 预热失败：Device is not configured for UI testing`
+   ⇒ 这条路径在这台设备上从来没成功过，等于 HOME 后的认目标一直没人做。
+   改成用会话自己的入口重新发一次 requestAutomationSessionForTestTargetWithPID:
+   （bootstrap 起会话用的就是它），把 daemon 那次"重新认目标"主动提前触发，
+   而不是等它自己按 5 秒超时被动发生。
+   ★ reply 块不捕获任何 ObjC 对象（只用全局标量），避免 XPC 回调时野指针。 */
 static void AXWarmSpringboard(void) {
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        @try {
-            Class appCls = NSClassFromString(@"XCUIApplication");
-            if (!appCls) return;
-            SEL ini = NSSelectorFromString(@"initWithBundleIdentifier:");
-            if (![appCls instancesRespondToSelector:ini]) return;
-            /* ★ b95：HOME 之后前台就是 SpringBoard。这里**不调 activate**（那会真的切 App、
-               还可能拖长），只读一次 state —— 读 state 就会让 daemon 为这个 App 建立
-               automation session，把"第一笔事件要等 3~5 秒认目标"的成本挪到后台。 */
-            NSString *bid = AXFrontBundleID();
-            if (!bid.length) bid = @"com.apple.springboard";
-            id app = ((id (*)(id, SEL, id))objc_msgSend)([appCls alloc], ini, bid);
-            if (!app) return;
-            long long t0 = AXSeqMs();
-            SEL stSel = NSSelectorFromString(@"state");
-            long st = [app respondsToSelector:stSel]
-                ? ((long (*)(id, SEL))objc_msgSend)(app, stSel) : -1;
-            ALog(@"🏠 SpringBoard 预热完成 bid=%@ state=%ld（%lldms）", bid, st, AXSeqMs() - t0);
-        } @catch (NSException *e) {
-            ALog(@"⚠️ SpringBoard 预热失败：%@", e.reason);
-        }
-    });
+    g_retargetReplyMs = -1;
+    if (!gSession) { g_retargetDone = 1; return; }
+    SEL rs = NSSelectorFromString(@"requestAutomationSessionForTestTargetWithPID:preferredBackendPath:reply:");
+    if (![gSession respondsToSelector:rs]) {
+        ALog(@"⚠️ 会话无 requestAutomationSession，跳过重认目标");
+        g_retargetDone = 1;
+        return;
+    }
+    g_retargetDone = 0;
+    @try {
+        g_retargetAtMs = AXSeqMs();
+        /* ★ XPC 回调里只写 C 全局标量：不捕获对象、不调 Objective-C 方法、不写日志
+           （b77 在 completion 里写日志崩过，b79 起保持空块最安全）。 */
+        void (^reply)(id) = ^(id a) {
+            g_retargetReplyMs = AXSeqMs() - g_retargetAtMs;
+            g_retargetDone = 1;
+        };
+        ((void (*)(id, SEL, int, id, id))objc_msgSend)(
+            gSession, rs, (int)getpid(), nil, reply);
+        ALog(@"🏠 会话重认目标已发出（pid=%d，%lldms）",
+             (int)getpid(), AXSeqMs() - g_retargetAtMs);
+    } @catch (NSException *e) {
+        g_retargetDone = 1;
+        ALog(@"⚠️ 会话重认目标异常：%@", e.reason);
+    }
 }
 
 /* ★★★ b103：HOME 后预热必须「真等到做完」，而不是提交完就报完成。
@@ -1336,26 +1347,32 @@ static void AXWarmSpringboard(void) {
    第一笔真实点击上。用户实测：HOME 后点一下要等约 5 秒，而**点击接点击很快**
    ⇒ 点击链路本身没病，只有 HOME 之后那一笔要付一次代价（AXAgent.mm:1405 注释
    早就写过「回到桌面后第一笔点击要重新认目标，日志 4477ms」）。
-   改法：提交 dummy 后，在后台 QOS_CLASS_UTILITY 线程**同步等 completion 回来**
-   （最多 6 秒），把这次开销耗在用户按完 HOME、还在看桌面没点下去的空闲里。
-   控制线程完全不参与，点击提交路径一行没动，8100 / Runner / HID 触摸全不碰。
-   ★ 判定日志：打出「确认已到」且耗时数秒 ⇒ 确实吃掉了，第一笔点击应当立刻生效；
-     若 1~2ms 就「确认已到」⇒ 那 5 秒不在事件确认上，改查编码/画面侧，别再往点击堆补丁。 */
+   改法：提交 dummy 后在后台 QOS_CLASS_UTILITY 线程等 completion（最多 6 秒）。
+   ★★ b106 更正：b103~b105 的日志显示 dummy 1~52ms 就「确认已到」，但真实点击
+   仍不生效 ⇒ 那 5 秒**不在事件确认上**，等 dummy 没吃到它。同时每轮都有
+   `⚠️ SpringBoard 预热失败：Device is not configured for UI testing`，说明负责
+   认目标的 XCUIApplication 路径一直没跑通。b106 改为主动重发
+   requestAutomationSession... 并等它的 reply，见 AXWarmSpringboard。
+   控制线程完全不参与，HOME 路径和正常点击路径一行没动。 */
 static void AXWarmAfterHome(void) {
     if (g_warmBusy) return;              /* 连按 HOME 不叠等待线程 */
     g_warmBusy = 1;
-    AXWarmSpringboard();                 /* 原有认目标，保留不动 */
+    AXWarmSpringboard();                 /* b106：主动重认会话目标（原来那条一直失败） */
     long long t0 = AXSeqMs();
     g_warmPending = 1;
     AXTapCore(2.0, 2.0);                /* dummy：状态栏最左，无可点元素 */
-    /* completion 可能永不回调（HOME 那笔 deviceEvent 就是这样），所以必须有超时上限。
-       10ms 轮询纯 C 忙等，CPU 占用可忽略；本函数在后台队列，不占控制线程。 */
-    while (g_warmPending && (AXSeqMs() - t0) < 6000) {
+    /* 同时等「认目标 reply」和「dummy completion」；两者都可能永不回来，
+       所以总上限 6 秒。本函数在后台队列，不占控制线程。 */
+    while ((g_warmPending || !g_retargetDone) && (AXSeqMs() - t0) < 6000) {
         usleep(10 * 1000);
     }
     BOOL arrived = (g_warmPending == 0);
-    ALog(@"🏠 dummy 预热完成（%lldms，%@）", AXSeqMs() - t0,
-         arrived ? @"确认已到" : @"等满 6s 上限");
+    ALog(@"🏠 HOME 后预热完成（%lldms：认目标 %@，dummy 确认=%@）",
+         AXSeqMs() - t0,
+         g_retargetReplyMs >= 0
+             ? [NSString stringWithFormat:@"reply %lldms 已回", g_retargetReplyMs]
+             : @"reply 未回/超时",
+         arrived ? @"已到" : @"未到");
     g_warmPending = 0;
     g_warmBusy = 0;
 }
