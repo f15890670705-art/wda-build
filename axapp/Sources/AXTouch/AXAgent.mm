@@ -1368,8 +1368,9 @@ extern "C" BOOL AXAgentPressHome(void) {
 
     /* ★★★ 2026-11-02 b89：第一优先 = 纯 HID 直发（page 0x0C / usage 0x40 Menu）。
        这条不经过 XCTest，没有确认、没有目标切换、没有 quiescence，发完即回桌面。
-       ★ 2026-11-06 改：HID 成功就**只走这一条**（见下方 early return），不再补发会话版；
-       只有 HID 拿不到 / 发不出去时，才用下面 XCTest 那两条兜底。 */
+       ★ 2026-11-06 b104 实测：HID 单独发出**并不能回桌面**（用户实测 HOME 不生效），
+       它只是不报错。所以 HID 只当"无副作用的一次尝试"，真正回桌面仍要靠下面
+       XCTest 那两条。 */
     BOOL hidSent = AXAgentHomeHID(0x40);
 
     /* ★★★ b103：预热改成「提交 + 真等到做完」，详见 AXWarmAfterHome 注释。
@@ -1380,20 +1381,10 @@ extern "C" BOOL AXAgentPressHome(void) {
         AXWarmAfterHome();
     });
 
-    /* ★★★ 2026-11-06：HID 直发成功时**不再补发** XCTest 的 performDeviceEvent。
-       实测事实：HOME 后紧跟的点击（200ms）不触发，等约 10 秒才触发；HOME 本身一直生效，
-       点击接点击也很快 ⇒ 只有 HOME 这一笔在 daemon 侧留下了一次性开销。
-       日志里每轮都有「🏠 home = 会话 performDeviceEvent（0ms，发送即返回）hid=1」——
-       这笔虽不堵控制线程，但 completion 永不回调（下面 1400 行注释早就写过
-       「daemon 那边这笔事件可能要挂一会儿」），后续 synthesizeEvent 的点击要排队等它超时，
-       表现就是「按完 HOME 点一下要等几秒」。HID HOME 不经过 XCTest、不切会话目标、
-       不占 daemon 通道，单独就够回桌面（b89 实测用户已确认能回桌面）。
-       只有 HID 拿不到 / 发不出去时，才用下面 XCTest 那两条兜底。
-       ★ 判据：日志不再出现「会话 performDeviceEvent」，且 HOME 后立刻点击应生效。 */
-    if (hidSent) {
-        ALog(@"🏠 home = 纯 HID 直发（跳过 XCTest performDeviceEvent，避免 daemon 占通道）");
-        return YES;
-    }
+    /* ★★ 2026-11-06 b105：撤销 b104 的 early return。
+       b104 只留 HID 直发、砍掉下面这笔 XCTest performDeviceEvent 后，用户实测
+       **HOME 完全不生效** ⇒ HID 直发只是"发了没报错"，真正回桌面靠的是下面这笔
+       XCDeviceEvent。所以 HOME 路径原样恢复（b103 行为），本版不再动别处。 */
 
     /* ★★★ 2026-11-02 定案：HOME 走**硬件设备事件**，实测提交 0~1ms、用户已确认能回桌面。
        为什么不用 pressButton:：那条走 XPC + 空闲等待，实测每次 5.3~5.5 秒
