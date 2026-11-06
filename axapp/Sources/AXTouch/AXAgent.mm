@@ -529,6 +529,33 @@ static BOOL AXAgentBootstrap(void) {
                 }
             }
 
+            // 9c2) ★★★ 2026-11-06 b107：补上 AScript 的 -[tuneTestmanagerdStateTimeout] 这一步。
+            //     静态实证：XCUIAutomation.framework 的 arm64 导出符号表里有
+            //       __XCTSetEventConfirmationTimeout / __XCTEventConfirmationTimeout
+            //     （Mach-O C 符号，dlsym 名 = _XCTSet... / _XCTEvent...）；设备日志里 9b
+            //     探针这两个也都是「有」，只是一直**只探测不修改**。
+            //     9c / AXEnsureCfmInterval 改的是 synthesizeEvent 用的 implicit interval；
+            //     HOME 那笔 performDeviceEvent 不走 synthesizeEvent，吃的是这个全局
+            //     event confirmation timeout —— 默认 5.000 秒，正好对上按完 HOME 后
+            //     要等的那 5 秒。这里压到 0.02（绝不给 0，b78 实测设 0 会闪退）。
+            //     ★ 只在 bootstrap 设一次：这是进程内全局变量，daemon 改不到。
+            {
+                double (*getTO)(void)   = (double (*)(void))dlsym(RTLD_DEFAULT, "_XCTEventConfirmationTimeout");
+                void   (*setTO)(double) = (void (*)(double))dlsym(RTLD_DEFAULT, "_XCTSetEventConfirmationTimeout");
+                double before = getTO ? getTO() : -1.0;
+                ALog(@"  🔎 全局事件确认超时 = %.3f（get=%@ set=%@）",
+                     before, getTO ? @"有" : @"无", setTO ? @"有" : @"无");
+                if (setTO) {
+                    @try {
+                        setTO(0.02);
+                        double after = getTO ? getTO() : -1.0;
+                        ALog(@"  ⚙️ 全局事件确认超时 %.3f → 0.02，回读 = %.3f", before, after);
+                    } @catch (NSException *e) {
+                        ALog(@"  ⚠️ 全局事件确认超时设置异常：%@", e.reason);
+                    }
+                }
+            }
+
             // 9d) AScript 里也用了 setWaitForIdleTimeout:（静默等待应用 idle 的超时）。
             //     设 0 = 不等 idle，避免每次点击前先等 App「闲下来」。
             {
