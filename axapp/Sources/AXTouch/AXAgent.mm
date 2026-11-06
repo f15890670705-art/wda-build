@@ -1256,8 +1256,8 @@ static BOOL AXGestureCore(const double *xy, const double *t, int n);
    判据是「抬手前有没有停住」，不是单纯的快慢。
    ★ HOME：拉 1/5 屏高，总时长每次在 60~70ms 之间随机；
      每次调用随机换 x（中间 30%~70%），别固定同一条竖线。
-   ★ 任务键：距离 2/5 屏高，总时长每次在 200~250ms 之间随机；
-     抬手前同坐标停住 50~60ms（进切换器的判据，按实测反馈再缩短）。
+   ★ 任务键：距离 2/5 屏高，总时长每次在 180~220ms 之间随机；
+     抬手前同坐标停住 10~20ms（按实测反馈再缩短）。
    ★ 尺寸全部按当前设备运行时算：1/5 屏高、30%~70% 宽、随机 x 都是比例，
      scale 也由设备算出，不同分辨率 / 2x / 3x / 降采样机型通用，无任何写死机型数值。
    坐标单位 = 设备屏幕物理分辨率像素，进系统输入层前统一落成 point。 */
@@ -1286,15 +1286,15 @@ static BOOL AXSwipeFromBottom(BOOL taskSwitcher) {
             xy[i*2] = AXCoordPt(cx); xy[i*2+1] = AXCoordPt(ys[i]); t[i] = ts[i];
         }
     } else {
-        /* 任务键：上滑 2/5 屏高，总时长 200~250ms 内随机，抬手前同坐标停 50~60ms。
+        /* 任务键：上滑 2/5 屏高，总时长 180~220ms 内随机，抬手前同坐标停 10~20ms。
            AXGestureCore 把最后一个点的时间戳当 liftUp、忽略它的坐标，
            所以停顿必须放在中间点（同坐标、offset 递增）。
            移动段 = 总时长 - 停顿 - 抬手余量，随总时长一起变。 */
         double d  = h * 0.40;
         double ye = y0 - d;
-        double T  = AXRandomTime(0.200, 0.250);
-        double pause = AXRandomTime(0.050, 0.060), lead = 0.020;
-        double mv = T - pause - lead;      /* 0.120~0.180s */
+        double T  = AXRandomTime(0.180, 0.220);
+        double pause = AXRandomTime(0.010, 0.020), lead = 0.020;
+        double mv = T - pause - lead;      /* 0.140~0.190s，随 T/pause 一起随机 */
         double ys[6] = { y0, y0 - d * 0.35, y0 - d * 0.70, ye, ye, ye };
         double ts[6] = { 0.0, mv * 0.33, mv * 0.66, mv, mv + pause, T };
         n = 6;
