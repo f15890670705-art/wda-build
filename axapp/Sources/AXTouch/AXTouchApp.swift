@@ -339,6 +339,9 @@ final class ControlServer {
                 case "getudid":
                     let cur = AXStreamCurrentUDID() ?? ""
                     resp = "{\"ok\":true,\"udid\":\"\(cur)\"}"
+                case "task":
+                    /* {"cmd":"task"} 底边慢滑 + 中部停顿 → App 切换器（任务键） */
+                    resp = "{\"ok\":\(AXAgentPressTaskSwitcher())}"
                 case "home":
                     resp = "{\"ok\":\(AXAgentPressHome())}"
                 case "hidtap":
@@ -433,14 +436,6 @@ final class ControlServer {
                     let v = (obj["v"] as? Double) ?? 1.0
                     AXSetEventConfirmInterval(v)
                     resp = "{\"ok\":true,\"cfmto\":\(v)}"
-                case "hometest":
-                    /* {"cmd":"hometest","mode":0..6} —— HOME 各通路的耗时探针
-                       0=pressButton(对照) 1=_silentPressButton(对照)
-                       2=XCUIButtonConsole 静默按键 3=XCDeviceEvent page12/ACHome 4=XCDeviceEvent page12/Menu
-                       5=纯 HID 直发 page0x0C/Menu(0x40)  6=纯 HID 直发 page0x0C/ACHome(0x223) */
-                    let hm = (obj["mode"] as? Int) ?? 0
-                    let ms = AXAgentHomeTest(Int32(hm))
-                    resp = "{\"ok\":true,\"mode\":\(hm),\"ms\":\(ms)}"
                 case "stream":
                     /* {"cmd":"stream","op":"start|stop|status"} */
                     let op = (obj["op"] as? String) ?? "status"
