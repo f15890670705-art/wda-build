@@ -234,7 +234,8 @@ final class ControlServer {
                     AXAgentStartSticky()
                     resp = "{\"ok\":true,\"note\":\"bootstrap started\"}"
                 case "tap":
-                    /* 统一坐标：屏幕分辨率像素（本机 1290x2796），如 (645,1398) = 屏中心 */
+                    /* 统一坐标：设备屏幕物理分辨率像素（运行时按 UIScreen 取，具体尺寸看 log）。
+                       屏中心 = (屏宽/2, 屏高/2)，不同设备自动适配 */
                     let x = (obj["x"] as? Double) ?? 0
                     let y = (obj["y"] as? Double) ?? 0
                     let r = AXAgentTapPx(x, y)
@@ -245,9 +246,9 @@ final class ControlServer {
                                            (obj["duration"] as? Double) ?? 0.25)
                     resp = "{\"ok\":\(r)}"
                 case "pinch":
-                    /* {"cmd":"pinch","cx":645,"cy":1398,"gap0":300,"gap1":900,"dur":0.35}
+                    /* cx/cy 填 (屏宽/2, 屏高/2)，gap0/gap1 同为物理像素距离；
                        gap0<gap1 = 双指张开(放大)；gap0>gap1 = 捏合(缩小)
-                       中心与 gap 都是分辨率像素 */
+                       所有数值按当前设备实际分辨率算 */
                     let pin = AXAgentPinchPx((obj["cx"] as? Double) ?? 0,
                                              (obj["cy"] as? Double) ?? 0,
                                              (obj["gap0"] as? Double) ?? 600,
@@ -351,7 +352,7 @@ final class ControlServer {
                 case "hidtap":
                     /* {"cmd":"hidtap","on":1}  开 HID 触摸（0ms，不走 XCTest）
                        {"cmd":"hidtap"}         查当前状态
-                       {"cmd":"hidtap","on":1,"x":360,"y":900}  顺便点一下（分辨率像素） */
+                       {"cmd":"hidtap","on":1,"x":<px>,"y":<px>}  顺便点一下（设备物理像素） */
                     if let onv = obj["on"] as? Int {
                         AXAgentSetHIDTap(Int32(onv))
                     }
