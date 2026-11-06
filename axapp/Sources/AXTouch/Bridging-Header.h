@@ -13,6 +13,14 @@ NSString *AXBootstrapProbe(void);
 NSString *AXRunRSDProbe(void);
 BOOL AXAgentBootstrapNow(void);
 BOOL AXAgentTap(double x, double y);
+/* 10010 统一入口：全部收「屏幕分辨率像素」坐标 */
+BOOL AXAgentTapPx(double x, double y);
+BOOL AXAgentSwipePx(double x1, double y1, double x2, double y2, double dur);
+BOOL AXAgentLongPressPx(double x, double y, double dur);
+BOOL AXAgentPinchPx(double cx, double cy, double g0, double g1, double dur);
+BOOL AXAgentHIDTapPx(double x, double y);
+BOOL AXAgentGesturePx(const double *xy, const double *t, int n);
+NSString *AXAgentTouchSeqPx(int mode, double x1, double y1, double x2, double y2, int steps, int gapMs);
 BOOL AXAgentIsReady(void);
 NSString *AXAgentLastError(void);
 NSString *AXAgentLogPath(void);
