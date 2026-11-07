@@ -1645,7 +1645,8 @@ extern "C" BOOL AXAgentPinch(double cx, double cy, double startGap, double endGa
 
 /* 文本输入：XCPointerEventPath initForTextInput + typeText:atOffset:typingSpeed:shouldRedact:
    （反汇编确认签名 v44@0:8@16d24Q32B40）
-   ★ ASCII 稳；CJK 建议走 paste（HID 注入对非键盘字符不可靠）。 */
+   ★ typingSpeed 必须 >0：传 0 会抛 NSInternalInconsistencyException
+     (Invalid parameter not satisfying: keyEventsPerSecond > 0)，整条通道直接失效。 */
 extern "C" BOOL AXAgentTypeText(NSString *text) {
     if (!gReady || !gSession) { ALog(@"❌ text 失败：会话未就绪"); return NO; }
     if (text.length == 0) return NO;
@@ -1661,13 +1662,13 @@ extern "C" BOOL AXAgentTypeText(NSString *text) {
         SEL tt = NSSelectorFromString(@"typeText:atOffset:typingSpeed:shouldRedact:");
         if (![path respondsToSelector:tt]) { ALog(@"❌ text: 无 typeText: 方法"); return NO; }
         ((void (*)(id, SEL, id, double, unsigned long, BOOL))objc_msgSend)(
-            path, tt, text, 0.0, (unsigned long)0, NO);
+            path, tt, text, 0.0, (unsigned long)30, NO);   /* 30 键/秒，必须 >0 */
 
         ((void (*)(id, SEL, id))objc_msgSend)(rec,
             NSSelectorFromString(@"addPointerEventPath:"), path);
 
-        BOOL ok = AXSubmitEventRecord(rec, 0.15 + MIN(2.0, text.length * 0.02));
-        ALog(@"  ⌨️ 文本输入 %lu 字 ok=%d", (unsigned long)text.length, ok);
+        BOOL ok = AXSubmitEventRecord(rec, 0.30 + MIN(4.0, (double)text.length / 30.0 + 0.5));
+        ALog(@"  ⌨️ 文本输入 %lu 字 speed=30 ok=%d", (unsigned long)text.length, ok);
         return ok;
     } @catch (NSException *e) {
         ALog(@"❌ text 异常: %@ / %@", e.name, e.reason);
@@ -1741,6 +1742,14 @@ extern "C" BOOL AXAgentPaste(NSString *text) {
     ALog(@"  📋 剪贴板写入 %lu 字 → 主线程读回 %lu 字 %@",
          (unsigned long)text.length, (unsigned long)back.length,
          back.length ? @"✓" : @"❌ 为空");
+    if (back.length == 0) {
+        /* 剪贴板写不进去（本进程在后台时系统静默拒绝），不再发无效的 Cmd+V，
+           改走不依赖剪贴板的文本注入通道。 */
+        ALog(@"  📋 剪贴板不可用 → 改走文本注入");
+        BOOL ok = AXAgentTypeText(text ?: @"");
+        ALog(@"  📋 粘贴(文本注入兜底) %lu 字 ok=%d", (unsigned long)text.length, ok);
+        return ok;
+    }
     BOOL ok = AXAgentKey(@"v", (1UL << 20));
     ALog(@"  📋 粘贴 %lu 字（已写剪贴板 + Cmd+V）ok=%d", (unsigned long)text.length, ok);
     return ok;
