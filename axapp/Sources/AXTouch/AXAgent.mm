@@ -1706,11 +1706,41 @@ extern "C" BOOL AXAgentKey(NSString *key, unsigned long mods) {
     }
 }
 
+/* ★★★ 2026-11-08：UIPasteboard 读写必须落主线程。
+   10010 的命令跑在 ax.ctl 后台队列、27185 跑在控制线程，两者都不是主线程；
+   实测（b112 / 10010）：pbset 返回 ok:true、paste 日志显示 Cmd+V ok=1，
+   但紧接着 pbget 读回空串 ⇒ 剪贴板根本没写进去，Cmd+V 自然粘不出东西。
+   以前三个函数都在调用线程直接碰剪贴板，且 return YES 从不校验，所以一直没暴露。 */
+static void AXPasteboardSetOnMain(NSString *text) {
+    if ([NSThread isMainThread]) {
+        [UIPasteboard generalPasteboard].string = text;
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            [UIPasteboard generalPasteboard].string = text;
+        });
+    }
+}
+static NSString *AXPasteboardGetOnMain(void) {
+    __block NSString *v = nil;
+    if ([NSThread isMainThread]) {
+        v = [UIPasteboard generalPasteboard].string;
+    } else {
+        dispatch_sync(dispatch_get_main_queue(), ^{
+            v = [UIPasteboard generalPasteboard].string;
+        });
+    }
+    return v ?: @"";
+}
+
 /* 粘贴：把文本写进系统剪贴板，再发 Cmd+V。
    CJK 只能走这条（HID 逐键打不出中文）。
    ★ iOS 16+ 目标 App 首次读剪贴板会弹「允许粘贴」，不点允许就粘不上 —— 系统行为，绕不过。 */
 extern "C" BOOL AXAgentPaste(NSString *text) {
-    if (text) [UIPasteboard generalPasteboard].string = text;
+    if (text) AXPasteboardSetOnMain(text);
+    NSString *back = AXPasteboardGetOnMain();
+    ALog(@"  📋 剪贴板写入 %lu 字 → 主线程读回 %lu 字 %@",
+         (unsigned long)text.length, (unsigned long)back.length,
+         back.length ? @"✓" : @"❌ 为空");
     BOOL ok = AXAgentKey(@"v", (1UL << 20));
     ALog(@"  📋 粘贴 %lu 字（已写剪贴板 + Cmd+V）ok=%d", (unsigned long)text.length, ok);
     return ok;
@@ -1718,15 +1748,18 @@ extern "C" BOOL AXAgentPaste(NSString *text) {
 
 /* 读系统剪贴板（手机 → PC 的"复制"） */
 extern "C" NSString *AXAgentPasteboardGet(void) {
-    NSString *v = [UIPasteboard generalPasteboard].string ?: @"";
-    return v;
+    return AXPasteboardGetOnMain();
 }
 
 /* 只写剪贴板，不发按键（PC 端要自己控制粘贴时机时用） */
 extern "C" BOOL AXAgentPasteboardSet(NSString *text) {
     if (!text) return NO;
-    [UIPasteboard generalPasteboard].string = text;
-    return YES;
+    AXPasteboardSetOnMain(text);
+    NSString *back = AXPasteboardGetOnMain();
+    ALog(@"  📋 pbset %lu 字 → 主线程读回 %lu 字 %@",
+         (unsigned long)text.length, (unsigned long)back.length,
+         back.length ? @"✓" : @"❌ 为空");
+    return back.length > 0;
 }
 
 #pragma mark - 5c. 流式触控实验（分段提交 vs 整段提交）
