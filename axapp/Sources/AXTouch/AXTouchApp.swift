@@ -315,8 +315,12 @@ final class ControlServer {
                         resp = "{\"ok\":false,\"error\":\"需要 events 数组(>=2 点)\"}"
                     }
                 case "recprobe":
+                    /* 起录 → 录 2.5s → 自动停 → 打印 uuid/文件/分块回调线索；约 6s 后看日志 */
                     DispatchQueue.global().async { _ = AXAgentProbeRecording() }
-                    resp = "{\"ok\":true,\"note\":\"probe started, 4s later check agent.log\"}"
+                    resp = "{\"ok\":true,\"note\":\"probe started, auto-stop after 2.5s, ~6s later check agent.log\"}"
+                case "recstop":
+                    let sr = AXAgentStopRecording() ?? "nil"
+                    resp = "{\"ok\":true,\"result\":\"\(sr)\"}"
                 case "apptimeout":
                     /* {"cmd":"apptimeout","v":0.01} —— 调 _XCTSetApplicationStateTimeout */
                     let v = (obj["v"] as? Double) ?? 0.01
