@@ -2831,6 +2831,9 @@ static CGColorSpaceRef  g_rgbCS = NULL;
    不能直接把 g_encW/g_encH 清 0 —— accept 侧发 preamble 用的就是它们，
    清 0 会让新客户端收到 0x0 的 preamble。 */
 static volatile int     g_encDirty = 0;
+/* ★ 帧率/码率变更：控制线程只置位，由编码线程在帧循环里应用到 g_vt。
+   控制线程绝不能直接碰 VT 会话（见 AXApplyVideoParams）。 */
+static volatile int     g_vtParamDirty = 0;
 /* ★ 2026-10-31 发热定位用「分段跑」开关（10010 的 {"cmd":"bench","mode":N}）。
    手机烫的时候靠猜没用，把链路一段段摘掉看温度才准：
      0 = 正常全链路（默认）
@@ -3526,6 +3529,18 @@ static void *AXEncodeLoop(void *arg) {
             }
             if (!AXVTEnsure(tw, th)) { usleep(100 * 1000); continue; }
 
+            /* 帧率/码率由编码线程自己应用：控制线程只置 g_vtParamDirty，
+               绝不在这里之外碰 g_vt，避免与 EncodeFrame 竞态。 */
+            if (g_vtParamDirty) {
+                g_vtParamDirty = 0;
+                if (g_vt) {
+                    VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_ExpectedFrameRate,
+                                         (__bridge CFNumberRef)@(g_fps));
+                    VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_AverageBitRate,
+                                         (__bridge CFNumberRef)@(g_bitrate));
+                }
+            }
+
             /* 只有第一次连上（或重建后）才发 session 头 + preamble */
             if (!g_preambleSent) {
                 pthread_mutex_lock(&g_clientMu);
@@ -4153,35 +4168,30 @@ static BOOL AXReplayKitStart(void) {
 }
 
 /* 运行期应用画质参数（PC 的 0x40 走这里，10010 的 fps 命令也走这里）。
-   - fps：立刻影响编码循环的排程
-   - bitrate：直接改现有 VT 会话的 ABR 目标，不重建
-   - maxSide：分辨率变了必须重建编码会话（下一帧自动建），并强制一个关键帧
+   ★★ 2026-11-07 崩溃根因：这个函数跑在 27185 控制线程上，以前在这里直接
+      VTSessionSetProperty / AXVTDrop("分辨率变更")，也就是控制线程会 invalidate
+      + CFRelease 掉 g_vt；而编码线程此刻正在 VTCompressionSessionEncodeFrame(g_vt,...)。
+      两边没有任何同步 → 开大屏（0x40 改 maxSide）时稳定野指针闪退，10010 随之消失。
+      现在控制线程只改全局参数并置脏标记，所有对 g_vt 的操作都留给编码线程：
+        - fps / bitrate → g_vtParamDirty，帧循环里 SetProperty
+        - maxSide       → g_encDirty，帧循环重算尺寸后 AXVTEnsure 自行重建会话
    ★ 不重发 preamble：PC 侧解码器是从 SPS 里读新尺寸的（rebuild 由 dec.FrameSize() 触发），
-     往已建的流里再发一遍 preamble 会把 PC 的包解析打乱（就是 10-31 那次闪退）。 */
+     往已建的流里再发一遍 preamble 会把 PC 的包解析打乱（就是 10-31 那次闪退）。
+     AXVTEnsure 重建会话时会置 g_needConfig=YES，只补 SPS/PPS。 */
 static void AXApplyVideoParams(uint32_t fps, uint32_t bitrateBps, uint32_t maxSide) {
-    if (fps > 0) {
-        g_fps = (int)fps;
-        if (g_vt) {
-            VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_ExpectedFrameRate,
-                                 (__bridge CFNumberRef)@(g_fps));
-        }
-    }
-    if (bitrateBps > 0) {
-        g_bitrate = (int)bitrateBps;
-        if (g_vt) {
-            VTSessionSetProperty(g_vt, kVTCompressionPropertyKey_AverageBitRate,
-                                 (__bridge CFNumberRef)@(g_bitrate));
-        }
-    }
+    BOOL paramDirty = NO;
+    if (fps > 0)        { g_fps = (int)fps;            paramDirty = YES; }
+    if (bitrateBps > 0) { g_bitrate = (int)bitrateBps; paramDirty = YES; }
     if (maxSide > 0 && (int)maxSide != g_maxSide) {
         g_maxSide = (int)maxSide;
         g_force_key = 1;
         /* ★ 必须让主循环重算编码尺寸：主循环是「tw = g_encW; 只有 tw==0 才按 maxSide 重算」，
            不标脏的话下一帧照样拿旧尺寸去 AXVTEnsure（还会命中 early-return），调 maxSide 等于没调。 */
         g_encDirty = 1;
-        AXVTDrop("分辨率变更");
     }
-    ALogShim(@"🎚 画质参数 fps=%d  %dkbps  maxSide=%d", g_fps, g_bitrate / 1000, g_maxSide);
+    if (paramDirty) g_vtParamDirty = 1;
+    ALogShim(@"🎚 画质参数 fps=%d  %dkbps  maxSide=%d（下一帧生效）",
+             g_fps, g_bitrate / 1000, g_maxSide);
 }
 
 #pragma mark - 7. 控制通道 27185（scrcpy 二进制消息 + AES-256-CTR）
