@@ -4435,8 +4435,16 @@ static void AXCtrlKeycode(uint32_t kc) {
         case 3:   AXAgentPressHome();           break;   /* Home → 底边快滑 */
         case 4:   AXAgentPressHome();           break;   /* Back → iOS 无返回键，等价 Home */
         case 187: AXAgentPressTaskSwitcher();  break;   /* Recent / 任务键 → 底边慢滑 + 中部停 120ms */
-        case 66:  AXAgentKey(@"\r", 0);         break;   /* Enter */
-        case 67:  AXAgentKey(@"\b", 0);         break;   /* Del/退格 */
+        /* 回车与删除键同因：typeKey:@"\r" 提交 ok=1 但不换行，改走文本注入。 */
+        case 66:  ALog(@"  ⌨️ 回车 → 文本注入 \\r");
+                  AXAgentTypeText(@"\r");        break;
+        /* ★ 2026-11-07：删除键改走文本注入。原来 AXAgentKey(@"\b", 0) 走
+           typeKey:modifiers:，日志 ok=1 但屏幕不删字（控制字符被当普通字符吞掉）；
+           typeText:@"\b" 才是把退格交给文本系统的那条路（b114 已修好 text 通道）。
+           PC 的 Backspace=67 / Delete=112，iOS 无「向前删除」，两条都按退格处理。 */
+        case 67:
+        case 112: ALog(@"  ⌨️ 删除键 keycode=%u → 文本注入 \\b", kc);
+                  AXAgentTypeText(@"\b");        break;
         default:  ALog(@"  ⌨️ 未映射的 keycode=%u（忽略）", kc); break;
     }
 }
