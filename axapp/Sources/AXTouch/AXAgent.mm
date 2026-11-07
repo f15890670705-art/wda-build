@@ -3527,7 +3527,26 @@ static void *AXEncodeLoop(void *arg) {
                 if (tw < 16) tw = 16;
                 if (th < 16) th = 16;
             }
+            int prevW = g_encW, prevH = g_encH;
             if (!AXVTEnsure(tw, th)) { usleep(100 * 1000); continue; }
+            /* ★★ 2026-11-07 修「WDA 模式开大屏画面被放大、只显示左上角一块」：
+               0x40 改 maxSide 后编码尺寸变了（138x300 ↔ 460x1000），但以前这里只补
+               SPS/PPS、**不重发 12B session 头**。PC 端只有收到 session 头（12B 包头
+               bit31）才会 onSize() 重建显示缓冲，否则仍按旧尺寸收新尺寸的帧 ⇒
+               只显示左上角一块，铺满大屏就成了「画面被放大裁切」。巨魔版
+               mirror_stream.m 在每次分辨率变化都会 mirror_send_session_now()，
+               AXTouch 漏了这一条（b117 修好开大屏闪退后才第一次跑到这里，暴露出来）。
+               ★ session 头会让 PC 清空 configNAL，所以必须同时强制本帧为 IDR，
+                 让 VT 回调先把新的 SPS/PPS 作为单独 CONFIG 包发过去，否则 PC 会一直
+                 丢帧直到下一个关键帧（最长 10s）。
+               ★ 绝不重发 preamble：那是连接级握手，重发会被 PC 当成 12B 包头解析
+                 （2026-10-31 解出荒谬宽高 → 分配 1GB → 闪退）。 */
+            if (prevW > 0 && prevH > 0 && (g_encW != prevW || g_encH != prevH)) {
+                AXSendSessionHeader(g_encW, g_encH);
+                g_force_key = 1;
+                ALogShim(@"📺 编码尺寸变更 %dx%d → %dx%d，已重发 session 头并强制关键帧",
+                         prevW, prevH, g_encW, g_encH);
+            }
 
             /* 帧率/码率由编码线程自己应用：控制线程只置 g_vtParamDirty，
                绝不在这里之外碰 g_vt，避免与 EncodeFrame 竞态。 */
