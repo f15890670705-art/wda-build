@@ -1647,16 +1647,36 @@ extern "C" BOOL AXAgentPinch(double cx, double cy, double startGap, double endGa
    （反汇编确认签名 v44@0:8@16d24Q32B40）
    ★ typingSpeed 必须 >0：传 0 会抛 NSInternalInconsistencyException
      (Invalid parameter not satisfying: keyEventsPerSecond > 0)，整条通道直接失效。
-   ★ 2026-11-07：原来 30 键/秒，且提交后无条件硬睡 0.30+字数/30+0.5 秒
-     （单字符也接近 0.9 秒）。synthesizeEvent:completion: 是异步提交，事件按
-     record 自带的时间线自行回放，控制线程睡那么久只会把后面的按键/点击全堵住，
-     PC 逐字打字就变成排队。现在提高注入速度，只留事件落地的一点余量。 */
-static const unsigned long kAXTypeSpeed = 60;
+   ★ 2026-11-07 b116 把速度提到 60 且提交后只睡 0.15s → 用户实测「字母打太快会漏字」：
+     synthesizeEvent:completion: 是异步提交，上一条 record 还在后台回放，下一条就压进去，
+     daemon 把相邻的文本事件合并/丢弃。改成严格串行：等上一条的 completion 落地才提交
+     下一条；注入速度退回 b114 验证过不漏字的 30 键/秒。不再靠固定长睡去赌时间。
+   ★ completion 里只写 C 静态变量，不捕获/不 retain 任何 ObjC 对象（b35/b36 野指针教训）。 */
+static const unsigned long kAXTypeSpeed = 30;
+static volatile int  g_textInFlight = 0;   /* 1 = 上一条文本事件还没被确认 */
+static double        g_textLastSubmit = 0;
 
 extern "C" BOOL AXAgentTypeText(NSString *text) {
     if (!gReady || !gSession) { ALog(@"❌ text 失败：会话未就绪"); return NO; }
     if (text.length == 0) return NO;
     @try {
+        /* 每笔重设确认间隔，防退回 5 秒（与 tap / gesture 同一套） */
+        AXEnsureCfmInterval("text");
+
+        /* ① 等上一条真正落地。轮询而不用 semaphore 阻塞：控制线程没有 runloop，
+           阻塞可能让 XPC 回调回不来。300ms 仍无确认就强制放行并打日志，绝不卡死。 */
+        if (g_textInFlight) {
+            double deadline = CACurrentMediaTime() + 0.30;
+            while (g_textInFlight && CACurrentMediaTime() < deadline) usleep(1000);
+            if (g_textInFlight) {
+                ALog(@"  ⚠️ text 上一条 300ms 未确认，强制放行");
+                g_textInFlight = 0;
+            }
+        }
+        /* ② 两次提交之间留 25ms 硬间隔，避免 daemon 把相邻 record 合并 */
+        double gap = 0.025 - (CACurrentMediaTime() - g_textLastSubmit);
+        if (gap > 0 && gap < 0.30) [NSThread sleepForTimeInterval:gap];
+
         Class pathCls = NSClassFromString(@"XCPointerEventPath");
         id rec = AXNewEventRecord();
         if (!pathCls || !rec) { ALog(@"❌ text: 类/record 构造失败"); return NO; }
@@ -1673,14 +1693,25 @@ extern "C" BOOL AXAgentTypeText(NSString *text) {
         ((void (*)(id, SEL, id))objc_msgSend)(rec,
             NSSelectorFromString(@"addPointerEventPath:"), path);
 
-        /* 只等事件落地，不等整段回放完（回放由 XCTest 依时间线自行完成）。 */
+        /* ③ 专用提交：completion 只把标志位清零，落地后才放行下一条。
+           不走 AXSubmitEventRecord（它用的是空 completion，且被手势/点击共用，不动）。 */
+        SEL syn = NSSelectorFromString(@"synthesizeEvent:completion:");
+        if (![gSession respondsToSelector:syn]) { ALog(@"❌ text: 无 synthesizeEvent:"); return NO; }
+        g_textLastSubmit = CACurrentMediaTime();
+        g_textInFlight = 1;
+        void (^completion)(id) = ^(id err) { g_textInFlight = 0; };
+        ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, syn, rec, completion);
+
+        /* ④ 只留事件落地的一小段余量（单字符约 0.05s，长文本封顶 0.20s）。
+           真正的串行保证在 ① 的确认等待里，不靠这段时间赌。 */
         double timeline = (double)text.length / (double)kAXTypeSpeed;
-        double wait = 0.05 + MIN(1.0, timeline + 0.08);
-        BOOL ok = AXSubmitEventRecord(rec, wait);
-        ALog(@"  ⌨️ 文本输入 %lu 字 speed=%lu wait=%.2fs ok=%d",
-             (unsigned long)text.length, kAXTypeSpeed, wait, ok);
-        return ok;
+        double wait = MIN(0.20, timeline + 0.02);
+        [NSThread sleepForTimeInterval:wait];
+        ALog(@"  ⌨️ 文本输入 %lu 字 speed=%lu wait=%.2fs 已确认=%d",
+             (unsigned long)text.length, kAXTypeSpeed, wait, g_textInFlight == 0);
+        return YES;
     } @catch (NSException *e) {
+        g_textInFlight = 0;
         ALog(@"❌ text 异常: %@ / %@", e.name, e.reason);
         return NO;
     }
@@ -2027,30 +2058,143 @@ static void AXDumpClass(NSString *name) {
     ALog(@"     成员(%u): %@", ivn, s2.length ? s2 : @"(无)");
 }
 
+/* 只打印跟「录屏 / 视频 / 分块 / 附件 / 帧」相关的方法名 —— 用来找
+   「边录边拿到编码数据」的回调入口，避免整份方法列表刷屏。 */
+static void AXDumpMatchingSelectors(id obj) {
+    if (!obj) return;
+    Class cls = object_getClass(obj);
+    NSString *cn = NSStringFromClass(cls);
+    NSArray *keys = @[@"recording", @"video", @"chunk", @"attachment",
+                      @"frame", @"stream", @"screenshot", @"data"];
+    for (int pass = 0; pass < 2; pass++) {
+        Class c = pass == 0 ? cls : object_getClass((id)cls);
+        unsigned int n = 0;
+        Method *ms = class_copyMethodList(c, &n);
+        NSMutableString *sb = [NSMutableString string];
+        int hit = 0;
+        for (unsigned i = 0; i < n && hit < 40; i++) {
+            NSString *s = NSStringFromSelector(method_getName(ms[i]));
+            NSString *low = [s lowercaseString];
+            BOOL m = NO;
+            for (NSString *k in keys) { if ([low containsString:k]) { m = YES; break; } }
+            if (m) { [sb appendFormat:@"%@%@ |", pass ? @"+" : @"-", s]; hit++; }
+        }
+        free(ms);
+        ALog(@"  [sel] %@ %@(%u) 命中%d: %@", cn, pass ? @"类方法" : @"实例方法",
+             n, hit, sb.length ? sb : @"(无)");
+    }
+}
+
+/* 从 start 的 reply 里找录制 UUID：先 KVC 常见键，再扫对象型 ivar */
+static NSUUID *AXFindRecordingUUID(id future) {
+    if (!future) return nil;
+    NSArray *keys = @[@"identifier", @"uuid", @"UUID", @"recordingUUID",
+                      @"recordingIdentifier", @"attachmentIdentifier", @"promiseIdentifier"];
+    for (NSString *k in keys) {
+        @try {
+            id v = [future valueForKey:k];
+            if ([v isKindOfClass:[NSUUID class]]) { ALog(@"  🔑 uuid ← KVC %@ = %@", k, v); return (NSUUID *)v; }
+            if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] >= 32) {
+                NSUUID *u = [[NSUUID alloc] initWithUUIDString:(NSString *)v];
+                if (u) { ALog(@"  🔑 uuid ← KVC %@ = %@", k, u); return u; }
+            }
+        } @catch (NSException *e) { }
+    }
+    Class cls = [future class];
+    while (cls && cls != [NSObject class]) {
+        unsigned int n = 0;
+        Ivar *iv = class_copyIvarList(cls, &n);
+        for (unsigned i = 0; i < n; i++) {
+            const char *tp = ivar_getTypeEncoding(iv[i]);
+            if (!tp || tp[0] != '@') continue;
+            @try {
+                id v = object_getIvar(future, iv[i]);
+                if ([v isKindOfClass:[NSUUID class]]) {
+                    ALog(@"  🔑 uuid ← ivar %s = %@", ivar_getName(iv[i]), v);
+                    free(iv); return (NSUUID *)v;
+                }
+                if ([v isKindOfClass:[NSString class]] && [(NSString *)v length] >= 32) {
+                    NSUUID *u = [[NSUUID alloc] initWithUUIDString:(NSString *)v];
+                    if (u) { ALog(@"  🔑 uuid ← ivar %s = %@", ivar_getName(iv[i]), u); free(iv); return u; }
+                }
+            } @catch (NSException *e) { }
+        }
+        free(iv);
+        cls = class_getSuperclass(cls);
+    }
+    ALog(@"  ⚠️ 未能从 start reply 里取出 uuid（stop 只能手动或重启 App）");
+    return nil;
+}
+
+/* 打印 App 临时目录里有没有落盘的影片，确认「录完的产物在哪、能不能读」 */
+static void AXLogTempFiles(NSString *tag) {
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSString *tmp = NSTemporaryDirectory();
+    NSArray *dirs = @[tmp, [tmp stringByAppendingPathComponent:@"Attachments"]];
+    for (NSString *d in dirs) {
+        NSArray *items = [fm contentsOfDirectoryAtPath:d error:nil];
+        ALog(@"  📁 %@ %@ → %lu 项", tag, d, (unsigned long)items.count);
+        NSUInteger cap = MIN((NSUInteger)8, items.count);
+        for (NSUInteger i = 0; i < cap; i++) {
+            NSDictionary *a = [fm attributesOfItemAtPath:[d stringByAppendingPathComponent:items[i]] error:nil];
+            ALog(@"      %@  %.1fKB", items[i], [[a objectForKey:NSFileSize] doubleValue] / 1024.0);
+        }
+    }
+}
+
+static NSUUID *g_recUUID = nil;
+
+/* 手动兜底停止：探针万一没自动停掉，可用 10010 {"cmd":"recstop"} 收尾 */
+extern "C" NSString *AXAgentStopRecording(void) {
+    if (!g_recUUID) { ALog(@"  🛑 没有进行中的录屏（uuid 为空）"); return @"no active recording"; }
+    SEL stop = NSSelectorFromString(@"stopScreenRecordingWithUUID:withReply:");
+    if (!gSession || ![gSession respondsToSelector:stop]) {
+        ALog(@"  ❌ stopScreenRecordingWithUUID:withReply: 不存在");
+        return @"stop selector missing";
+    }
+    __block NSString *result = @"ok";
+    dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+    @try {
+        void (^reply)(id) = ^(id err) {
+            result = err ? [NSString stringWithFormat:@"%@", err] : @"ok";
+            dispatch_semaphore_signal(sem);
+        };
+        ((void (*)(id, SEL, id, id))objc_msgSend)(gSession, stop, g_recUUID, reply);
+        dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+        ALog(@"  🛑 stop reply = %@", result);
+    } @catch (NSException *e) {
+        ALog(@"  ❌ stop 异常: %@", e.reason);
+        result = e.reason ?: @"exception";
+    }
+    g_recUUID = nil;
+    return result;
+}
+
+/* 安全探针：起录 → 录 2.5s → 自动停 → 打印文件位置/大小/readback。
+   主链路一行不动；无论成功失败都尽量把录屏停掉，避免一直录并落盘。 */
 extern "C" NSString *AXAgentProbeRecording(void) {
-    ALog(@"===== 录屏流探针开始 =====");
+    ALog(@"===== 录屏流探针开始（起→录→停） =====");
     if (!gReady || !gSession) { ALog(@"❌ 会话未就绪"); return @"not ready"; }
+    if (g_recUUID) { ALog(@"⚠️ 已有进行中的录屏，先停掉"); AXAgentStopRecording(); }
 
     SEL sSupp = NSSelectorFromString(@"supportsScreenRecording");
     SEL sActive = NSSelectorFromString(@"isScreenRecordingActive");
     SEL sPref = NSSelectorFromString(@"preferScreenshotsOverScreenRecording");
     ALog(@"会话 respondsToSelector:");
-    ALog(@"   supportsScreenRecording            = %d", (int)[gSession respondsToSelector:sSupp]);
-    ALog(@"   isScreenRecordingActive            = %d", (int)[gSession respondsToSelector:sActive]);
+    ALog(@"   supportsScreenRecording             = %d", (int)[gSession respondsToSelector:sSupp]);
+    ALog(@"   isScreenRecordingActive             = %d", (int)[gSession respondsToSelector:sActive]);
     ALog(@"   preferScreenshotsOverScreenRecording = %d", (int)[gSession respondsToSelector:sPref]);
+    ALog(@"   stopScreenRecordingWithUUID:withReply: = %d",
+         (int)[gSession respondsToSelector:NSSelectorFromString(@"stopScreenRecordingWithUUID:withReply:")]);
 
     if ([gSession respondsToSelector:sSupp]) {
-        @try {
-            BOOL b = ((BOOL (*)(id, SEL))objc_msgSend)(gSession, sSupp);
-            ALog(@"   supportsScreenRecording 返回值 = %d", (int)b);
-        } @catch (NSException *e) { ALog(@"   调用异常: %@", e.reason); }
+        @try { ALog(@"   supportsScreenRecording 返回值 = %d",
+                    (int)((BOOL (*)(id, SEL))objc_msgSend)(gSession, sSupp)); }
+        @catch (NSException *e) { ALog(@"   调用异常: %@", e.reason); }
     }
-    if ([gSession respondsToSelector:sActive]) {
-        @try {
-            BOOL b = ((BOOL (*)(id, SEL))objc_msgSend)(gSession, sActive);
-            ALog(@"   isScreenRecordingActive 返回值 = %d", (int)b);
-        } @catch (NSException *e) { ALog(@"   调用异常: %@", e.reason); }
-    }
+
+    ALog(@"--- 找分块/流回调入口（gSession 相关方法） ---");
+    AXDumpMatchingSelectors(gSession);
 
     ALog(@"--- 类结构 ---");
     AXDumpClass(@"XCTScreenRecordingRequest");
@@ -2058,57 +2202,72 @@ extern "C" NSString *AXAgentProbeRecording(void) {
     AXDumpClass(@"XCUILocalDeviceScreenRecordingIPCInterface");
     AXDumpClass(@"XCUILocalDeviceScreenDataSource");
 
-    // 试构造 request
     Class reqCls = NSClassFromString(@"XCTScreenRecordingRequest");
     id req = nil;
     if (reqCls) {
         @try {
             req = [[reqCls alloc] init];
             ALog(@"✅ [[XCTScreenRecordingRequest alloc] init] = %p", (__bridge void *)req);
-            // 打印所有可读属性值
             unsigned int pn = 0;
             objc_property_t *props = class_copyPropertyList(reqCls, &pn);
             for (unsigned i = 0; i < pn; i++) {
                 const char *nm = property_getName(props[i]);
-                @try {
-                    id v = [req valueForKey:[NSString stringWithUTF8String:nm]];
-                    ALog(@"     属性 %s = %@", nm, v);
-                } @catch (NSException *e) { ALog(@"     属性 %s → %@", nm, e.reason); }
+                @try { ALog(@"     属性 %s = %@", nm,
+                            [req valueForKey:[NSString stringWithUTF8String:nm]]); }
+                @catch (NSException *e) { ALog(@"     属性 %s → %@", nm, e.reason); }
             }
             free(props);
+            /* fps=24 / codec=0(H.264)，与 WDA 的默认值一致；属性不存在就跳过 */
+            for (NSString *k in @[@"fps", @"frameRate", @"codec", @"videoCodec"]) {
+                @try {
+                    id old = [req valueForKey:k];
+                    if (!old) continue;
+                    id nv = ([k isEqualToString:@"fps"] || [k isEqualToString:@"frameRate"]) ? @24 : @0;
+                    [req setValue:nv forKey:k];
+                    ALog(@"  ⚙️ 设置 %@: %@ → %@", k, old, [req valueForKey:k]);
+                } @catch (NSException *e) { }
+            }
         } @catch (NSException *e) {
             ALog(@"❌ request init 异常: %@ / %@", e.name, e.reason);
         }
     }
 
-    // 真调一次
     SEL start = NSSelectorFromString(@"startScreenRecordingWithRequest:withReply:");
     ALog(@"startScreenRecordingWithRequest:withReply: 存在 = %d", (int)[gSession respondsToSelector:start]);
     if (req && [gSession respondsToSelector:start]) {
         @try {
             void (^reply)(id, id) = ^(id future, id err) {
-                ALog(@"  📥 录屏 reply: future=%@(%@)  err=%@",
-                     future ? NSStringFromClass([future class]) : @"nil",
-                     future ?: @"",
-                     err ?: @"nil");
+                ALog(@"  📥 start reply: future=%@  err=%@",
+                     future ? NSStringFromClass([future class]) : @"nil", err ?: @"nil");
                 if (future) {
                     AXDumpClass(NSStringFromClass([future class]));
-                    @try {
-                        if ([future respondsToSelector:NSSelectorFromString(@"isFulfilled")]) {
-                            BOOL f = ((BOOL (*)(id, SEL))objc_msgSend)(future, NSSelectorFromString(@"isFulfilled"));
-                            ALog(@"     future.isFulfilled = %d", (int)f);
-                        }
-                    } @catch (NSException *e) { ALog(@"     future 探测异常: %@", e.reason); }
+                    AXDumpMatchingSelectors(future);
+                    g_recUUID = AXFindRecordingUUID(future);
                 }
             };
             void (*fp)(id, SEL, id, id) = (void (*)(id, SEL, id, id))objc_msgSend;
             fp(gSession, start, req, reply);
-            ALog(@"✅ 已发起 startScreenRecording（等 3 秒看回调）");
-            [NSThread sleepForTimeInterval:3.0];
+            ALog(@"✅ 已发起 startScreenRecording（等 reply 里的 uuid）");
+            /* reply 是异步的；最多等 2 秒，期间不阻塞 XPC 回调线程 */
+            for (int i = 0; i < 200 && !g_recUUID; i++) usleep(10000);
+            ALog(@"  uuid = %@", g_recUUID ?: @"(未取到)");
         } @catch (NSException *e) {
             ALog(@"❌ startScreenRecording 异常: %@ / %@", e.name, e.reason);
         }
     }
+
+    ALog(@"--- 录 2.5 秒 ---");
+    [NSThread sleepForTimeInterval:2.5];
+    if ([gSession respondsToSelector:sActive]) {
+        @try { ALog(@"  录制中 isScreenRecordingActive = %d",
+                    (int)((BOOL (*)(id, SEL))objc_msgSend)(gSession, sActive)); }
+        @catch (NSException *e) { }
+    }
+    AXLogTempFiles(@"录制中");
+
+    NSString *stopResult = AXAgentStopRecording();
+    AXLogTempFiles(@"停止后");
+    ALog(@"🛑 stop 结果 = %@", stopResult);
     ALog(@"===== 录屏流探针结束 =====");
     return @"probe done";
 }
