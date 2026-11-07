@@ -1646,7 +1646,13 @@ extern "C" BOOL AXAgentPinch(double cx, double cy, double startGap, double endGa
 /* 文本输入：XCPointerEventPath initForTextInput + typeText:atOffset:typingSpeed:shouldRedact:
    （反汇编确认签名 v44@0:8@16d24Q32B40）
    ★ typingSpeed 必须 >0：传 0 会抛 NSInternalInconsistencyException
-     (Invalid parameter not satisfying: keyEventsPerSecond > 0)，整条通道直接失效。 */
+     (Invalid parameter not satisfying: keyEventsPerSecond > 0)，整条通道直接失效。
+   ★ 2026-11-07：原来 30 键/秒，且提交后无条件硬睡 0.30+字数/30+0.5 秒
+     （单字符也接近 0.9 秒）。synthesizeEvent:completion: 是异步提交，事件按
+     record 自带的时间线自行回放，控制线程睡那么久只会把后面的按键/点击全堵住，
+     PC 逐字打字就变成排队。现在提高注入速度，只留事件落地的一点余量。 */
+static const unsigned long kAXTypeSpeed = 60;
+
 extern "C" BOOL AXAgentTypeText(NSString *text) {
     if (!gReady || !gSession) { ALog(@"❌ text 失败：会话未就绪"); return NO; }
     if (text.length == 0) return NO;
@@ -1662,13 +1668,17 @@ extern "C" BOOL AXAgentTypeText(NSString *text) {
         SEL tt = NSSelectorFromString(@"typeText:atOffset:typingSpeed:shouldRedact:");
         if (![path respondsToSelector:tt]) { ALog(@"❌ text: 无 typeText: 方法"); return NO; }
         ((void (*)(id, SEL, id, double, unsigned long, BOOL))objc_msgSend)(
-            path, tt, text, 0.0, (unsigned long)30, NO);   /* 30 键/秒，必须 >0 */
+            path, tt, text, 0.0, kAXTypeSpeed, NO);   /* >0 才不抛异常 */
 
         ((void (*)(id, SEL, id))objc_msgSend)(rec,
             NSSelectorFromString(@"addPointerEventPath:"), path);
 
-        BOOL ok = AXSubmitEventRecord(rec, 0.30 + MIN(4.0, (double)text.length / 30.0 + 0.5));
-        ALog(@"  ⌨️ 文本输入 %lu 字 speed=30 ok=%d", (unsigned long)text.length, ok);
+        /* 只等事件落地，不等整段回放完（回放由 XCTest 依时间线自行完成）。 */
+        double timeline = (double)text.length / (double)kAXTypeSpeed;
+        double wait = 0.05 + MIN(1.0, timeline + 0.08);
+        BOOL ok = AXSubmitEventRecord(rec, wait);
+        ALog(@"  ⌨️ 文本输入 %lu 字 speed=%lu wait=%.2fs ok=%d",
+             (unsigned long)text.length, kAXTypeSpeed, wait, ok);
         return ok;
     } @catch (NSException *e) {
         ALog(@"❌ text 异常: %@ / %@", e.name, e.reason);
